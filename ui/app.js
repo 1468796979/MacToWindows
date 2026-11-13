@@ -17,6 +17,7 @@ const state = {
 };
 const $ = (id) => document.getElementById(id);
 const ruleEditor = window.ruleEditorCore;
+const permissionSettingsPath = "请前往：系统设置 → 隐私与安全性 → 输入监控；系统设置 → 隐私与安全性 → 设备控制和数据访问。";
 const backendInvoke = (command, args) => {
   const invoke = window.__TAURI__?.core?.invoke || window.__TAURI_INTERNALS__?.invoke;
   return invoke ? invoke(command, args) : Promise.reject(new Error("Tauri bridge unavailable"));
@@ -44,7 +45,7 @@ function renderStatus() {
     ? "Windows 模式已降级"
     : (state.enabled ? "Windows 模式已启用" : "Windows 模式未启用");
   const statusCopy = state.permission === "Denied"
-    ? "权限未就绪：监听输入 " + (state.listenAccess ? "已授权" : "未授权") + "，注入事件 " + (state.postAccess ? "已授权" : "未授权") + "。请在系统设置中重新添加本应用后再次检查。"
+    ? "权限未就绪：监听输入 " + (state.listenAccess ? "已授权" : "未授权") + "，注入事件 " + (state.postAccess ? "已授权" : "未授权") + "。请在系统设置中重新添加本应用后再次检查。" + permissionSettingsPath
     : degraded
       ? "输入源或事件注入异常，已进入降级模式，原始键鼠输入继续透传。"
     : state.enabled
@@ -82,7 +83,9 @@ $("permission-button").addEventListener("click", async () => {
   try {
     await backendInvoke("reload_permissions");
     await syncRuntime();
-    state.permissionMessage = "权限与运行状态已刷新。";
+    state.permissionMessage = state.permission === "Denied" || !state.listenAccess || !state.postAccess
+      ? "权限检查未通过。" + permissionSettingsPath
+      : "权限与运行状态已刷新。";
     renderStatus();
   }
   catch (error) {

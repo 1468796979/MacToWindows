@@ -21,6 +21,10 @@ function applySnapshot(snapshot) {
   render();
 }
 
+async function refreshSnapshot() {
+  applySnapshot(await backendInvoke("clipboard_history"));
+}
+
 function render() {
   const list = $("clipboard-list");
   list.replaceChildren();
@@ -48,7 +52,10 @@ function render() {
     remove.textContent = "删除";
     remove.addEventListener("click", async (event) => {
       event.stopPropagation();
-      try { await backendInvoke("delete_clipboard_item", { id: entry.id }); }
+      try {
+        await backendInvoke("delete_clipboard_item", { id: entry.id });
+        await refreshSnapshot();
+      }
       catch (error) { state.error = error?.message || String(error); render(); }
     });
     item.append(content, remove);
@@ -59,6 +66,7 @@ function render() {
 async function selectEntry(id) {
   try {
     await backendInvoke("select_clipboard_item", { id });
+    await refreshSnapshot();
   } catch (error) {
     state.error = error?.message || String(error);
     render();
@@ -72,7 +80,10 @@ async function closePanel() {
 
 $("clipboard-close").addEventListener("click", closePanel);
 $("clipboard-clear").addEventListener("click", async () => {
-  try { await backendInvoke("clear_clipboard_history"); }
+  try {
+    await backendInvoke("clear_clipboard_history");
+    await refreshSnapshot();
+  }
   catch (error) { state.error = error?.message || String(error); render(); }
 });
 document.addEventListener("keydown", (event) => {
@@ -92,8 +103,10 @@ document.addEventListener("click", (event) => {
 });
 
 if (listen) {
-  listen("clipboard-show", (event) => { applySnapshot(event.payload); window.focus(); });
-  listen("clipboard-updated", (event) => applySnapshot(event.payload));
+  Promise.resolve(listen("clipboard-show", (event) => { applySnapshot(event.payload); window.focus(); }))
+    .catch((error) => { state.error = error?.message || String(error); render(); });
+  Promise.resolve(listen("clipboard-updated", (event) => applySnapshot(event.payload)))
+    .catch((error) => { state.error = error?.message || String(error); render(); });
 }
 backendInvoke("clipboard_history").then(applySnapshot).catch((error) => { state.error = error?.message || String(error); render(); });
 render();

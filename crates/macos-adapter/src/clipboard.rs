@@ -58,6 +58,14 @@ impl PasteboardService {
 
     pub fn poll(&mut self) -> Result<Option<PasteboardChange>, PasteboardError> {
         let change_count = self.backend.change_count()?;
+        if self.ignored_change_count == Some(change_count) {
+            self.ignored_change_count = None;
+            self.last_change_count = Some(change_count);
+            return Ok(None);
+        }
+        if self.ignored_change_count.is_some() {
+            self.ignored_change_count = None;
+        }
         if self.last_change_count.is_none() {
             self.last_change_count = Some(change_count);
             return Ok(None);
@@ -66,10 +74,6 @@ impl PasteboardService {
             return Ok(None);
         }
         self.last_change_count = Some(change_count);
-        if self.ignored_change_count == Some(change_count) {
-            self.ignored_change_count = None;
-            return Ok(None);
-        }
         Ok(Some(PasteboardChange {
             change_count,
             text: self.backend.read_text()?,
@@ -245,6 +249,28 @@ mod tests {
         assert!(service.poll().unwrap().is_none());
         service.write_text("owned").unwrap();
         assert!(service.poll().unwrap().is_none());
+    }
+
+    #[test]
+    fn own_write_marker_is_cleared_before_later_external_changes() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let backend = MockBackend {
+            state: Arc::clone(&state),
+        };
+        let mut service = PasteboardService::with_backend(Box::new(backend));
+        assert!(service.poll().unwrap().is_none());
+        service.write_text("owned").unwrap();
+        assert!(service.poll().unwrap().is_none());
+        {
+            let mut state = state.lock().unwrap();
+            state.change_count += 1;
+            state.text = Some("external".into());
+        }
+        let change = service
+            .poll()
+            .unwrap()
+            .expect("external change should be visible");
+        assert_eq!(change.text.as_deref(), Some("external"));
     }
 
     #[test]

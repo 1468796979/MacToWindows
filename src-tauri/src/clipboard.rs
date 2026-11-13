@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -175,6 +175,14 @@ impl ClipboardManager {
         app: AppHandle,
         history_path: PathBuf,
     ) -> Result<Arc<Self>, ClipboardManagerError> {
+        Self::start_with_marker(app, history_path, macos_adapter::next_marker())
+    }
+
+    pub fn start_with_marker(
+        app: AppHandle,
+        history_path: PathBuf,
+        marker: u64,
+    ) -> Result<Arc<Self>, ClipboardManagerError> {
         let (sender, receiver) = mpsc::sync_channel(32);
         let snapshot = Arc::new(Mutex::new(ClipboardSnapshot {
             entries: Vec::new(),
@@ -184,7 +192,7 @@ impl ClipboardManager {
         let worker_snapshot = Arc::clone(&snapshot);
         thread::Builder::new()
             .name("mac-to-windows-clipboard".into())
-            .spawn(move || worker_loop(app, history_path, receiver, worker_snapshot))
+            .spawn(move || worker_loop(app, history_path, receiver, worker_snapshot, marker))
             .map_err(|_| ClipboardManagerError::WorkerUnavailable)?;
         Ok(Arc::new(Self { sender, snapshot }))
     }
@@ -226,7 +234,7 @@ impl ClipboardManager {
     {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.sender
-            .send(build(reply_tx))
+            .try_send(build(reply_tx))
             .map_err(|_| ClipboardManagerError::WorkerUnavailable)?;
         reply_rx
             .recv_timeout(Duration::from_secs(2))
@@ -241,6 +249,7 @@ fn worker_loop(
     history_path: PathBuf,
     receiver: Receiver<WorkerCommand>,
     snapshot: Arc<Mutex<ClipboardSnapshot>>,
+    marker: u64,
 ) {
     let (mut history, mut last_error) = match ClipboardStore::load_or_recover(&history_path) {
         Ok(LoadOutcome::Loaded(history)) => (history, None),
@@ -281,6 +290,7 @@ fn worker_loop(
                     &mut panel_open,
                     &mut last_error,
                     &snapshot,
+                    marker,
                     command,
                 );
                 if should_stop {
@@ -336,6 +346,7 @@ fn handle_command(
     panel_open: &mut bool,
     last_error: &mut Option<String>,
     snapshot: &Arc<Mutex<ClipboardSnapshot>>,
+    marker: u64,
     command: WorkerCommand,
 ) -> bool {
     match command {
@@ -359,7 +370,7 @@ fn handle_command(
             show_window(app);
         }
         WorkerCommand::Select { id, reply } => {
-            let result = select_and_paste(app, core, history, panel_open, last_error, id);
+            let result = select_and_paste(app, core, panel_open, last_error, marker, id);
             let succeeded = result.is_ok();
             let _ = reply.send(result);
             if succeeded {
@@ -374,48 +385,69 @@ fn handle_command(
             }
         }
         WorkerCommand::Delete { id, reply } => {
-            let result = if history.remove(id) {
-                if let Some(core) = core.as_mut() {
-                    core.history = history.clone();
+            let result = if history.entries().iter().any(|entry| entry.id == id) {
+                let mut candidate = history.clone();
+                candidate.remove(id);
+                match ClipboardStore::save_atomic(history_path, &candidate) {
+                    Ok(()) => {
+                        *history = candidate;
+                        if let Some(core) = core.as_mut() {
+                            core.history = history.clone();
+                        }
+                        *last_error = None;
+                        Ok(())
+                    }
+                    Err(error) => {
+                        let message = format!("保存剪贴板历史失败：{error}");
+                        *last_error = Some(message.clone());
+                        Err(message)
+                    }
                 }
-                ClipboardStore::save_atomic(history_path, history)
-                    .map_err(|error| format!("保存剪贴板历史失败：{error}"))
             } else {
-                Err("剪贴板条目不存在".into())
+                let message = "剪贴板条目不存在".to_owned();
+                *last_error = Some(message.clone());
+                Err(message)
             };
-            if result.is_ok() {
-                publish_snapshot(
-                    app,
-                    snapshot,
-                    history,
-                    *panel_open,
-                    last_error.as_deref(),
-                    "clipboard-updated",
-                );
-            }
+            publish_snapshot(
+                app,
+                snapshot,
+                history,
+                *panel_open,
+                last_error.as_deref(),
+                "clipboard-updated",
+            );
             let _ = reply.send(result);
         }
         WorkerCommand::Clear { reply } => {
-            history.clear();
-            if let Some(core) = core.as_mut() {
-                core.history = history.clone();
-            }
-            let result = ClipboardStore::save_atomic(history_path, history)
-                .map_err(|error| format!("保存剪贴板历史失败：{error}"));
-            if result.is_ok() {
-                publish_snapshot(
-                    app,
-                    snapshot,
-                    history,
-                    *panel_open,
-                    last_error.as_deref(),
-                    "clipboard-updated",
-                );
-            }
+            let candidate = ClipboardHistory::default();
+            let result = match ClipboardStore::save_atomic(history_path, &candidate) {
+                Ok(()) => {
+                    *history = candidate;
+                    if let Some(core) = core.as_mut() {
+                        core.history = history.clone();
+                    }
+                    *last_error = None;
+                    Ok(())
+                }
+                Err(error) => {
+                    let message = format!("保存剪贴板历史失败：{error}");
+                    *last_error = Some(message.clone());
+                    Err(message)
+                }
+            };
+            publish_snapshot(
+                app,
+                snapshot,
+                history,
+                *panel_open,
+                last_error.as_deref(),
+                "clipboard-updated",
+            );
             let _ = reply.send(result);
         }
         WorkerCommand::Close { reply } => {
             dismiss_panel(core, panel_open);
+            *last_error = None;
             hide_window(app);
             publish_snapshot(
                 app,
@@ -441,9 +473,9 @@ fn dismiss_panel(core: &mut Option<ClipboardManagerCore>, panel_open: &mut bool)
 fn select_and_paste(
     app: &AppHandle,
     core: &mut Option<ClipboardManagerCore>,
-    _history: &ClipboardHistory,
     panel_open: &mut bool,
     last_error: &mut Option<String>,
+    marker: u64,
     id: u64,
 ) -> Result<(), String> {
     let Some(core) = core.as_mut() else {
@@ -462,7 +494,12 @@ fn select_and_paste(
         show_window(app);
         return Err(message);
     }
-    thread::sleep(Duration::from_millis(60));
+    if let Err(error) = wait_for_frontmost(core, &selection.target_bundle_id) {
+        *last_error = Some(error.clone());
+        *panel_open = true;
+        show_window(app);
+        return Err(error);
+    }
     let outputs = [
         event_model::OutputEvent::Key {
             code: event_model::PhysicalCode::key(9),
@@ -475,7 +512,7 @@ fn select_and_paste(
             modifiers: event_model::ModifierSet::LEFT_COMMAND,
         },
     ];
-    if let Err(error) = macos_adapter::inject_outputs(&outputs, macos_adapter::next_marker()) {
+    if let Err(error) = macos_adapter::inject_outputs(&outputs, marker) {
         let message = format!("自动粘贴失败：{error}");
         *last_error = Some(message.clone());
         *panel_open = true;
@@ -484,7 +521,26 @@ fn select_and_paste(
     }
     *panel_open = false;
     *last_error = None;
+    core.target_bundle_id = None;
     Ok(())
+}
+
+fn wait_for_frontmost(
+    core: &mut ClipboardManagerCore,
+    target_bundle_id: &str,
+) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_millis(800);
+    loop {
+        match core.pasteboard.frontmost_application() {
+            Ok(Some(application)) if application.bundle_id == target_bundle_id => return Ok(()),
+            Ok(_) => {}
+            Err(error) => return Err(format!("读取前台应用失败：{error}")),
+        }
+        if Instant::now() >= deadline {
+            return Err("目标应用未能成为前台应用".into());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn publish_snapshot(

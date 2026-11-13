@@ -135,6 +135,13 @@ impl AppState {
     pub fn clipboard(&self) -> Option<Arc<clipboard::ClipboardManager>> {
         self.clipboard.lock().ok().and_then(|slot| slot.clone())
     }
+
+    pub fn runtime_marker(&self) -> u64 {
+        self.runtime
+            .lock()
+            .map(|runtime| runtime.own_marker())
+            .unwrap_or_else(|_| macos_adapter::next_marker())
+    }
 }
 
 #[derive(Default)]
@@ -308,6 +315,10 @@ impl RuntimeController {
 
     pub fn diagnostics(&self) -> Arc<Diagnostics> {
         Arc::clone(&self.diagnostics)
+    }
+
+    pub fn own_marker(&self) -> u64 {
+        self.adapter.own_marker()
     }
 
     pub fn config(&self) -> Option<&AppConfig> {
@@ -615,10 +626,13 @@ pub fn run() {
                 .skip_taskbar(true)
                 .center()
                 .build()?;
-            let manager =
-                clipboard::ClipboardManager::start(app.handle().clone(), clipboard_history_path())
-                    .map_err(|error| error.to_string())?;
             let state = app.state::<AppState>();
+            let manager = clipboard::ClipboardManager::start_with_marker(
+                app.handle().clone(),
+                clipboard_history_path(),
+                state.runtime_marker(),
+            )
+            .map_err(|error| error.to_string())?;
             state.set_clipboard(Arc::clone(&manager));
             let _ = state
                 .event_runtime
