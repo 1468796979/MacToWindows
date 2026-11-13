@@ -6,6 +6,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 mod input_source;
+mod clipboard;
+pub use clipboard::{
+    ForegroundApplication, PasteboardChange, PasteboardError, PasteboardService,
+};
 pub use input_source::{
     InputSourceCommand, InputSourceError, InputSourceService, InputSourceSnapshot,
 };
