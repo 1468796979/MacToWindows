@@ -616,6 +616,15 @@ pub fn run() {
         .setup(|app| {
             use tauri::menu::{Menu, MenuItem};
             use tauri::tray::TrayIconBuilder;
+            if let Some(main_window) = app.get_webview_window("main") {
+                let close_target = main_window.clone();
+                main_window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = close_target.hide();
+                    }
+                });
+            }
             WebviewWindowBuilder::new(app, "clipboard", WebviewUrl::App("clipboard.html".into()))
                 .title("剪贴板历史")
                 .inner_size(420.0, 520.0)
