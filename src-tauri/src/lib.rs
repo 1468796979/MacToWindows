@@ -6,11 +6,14 @@ use macos_adapter::{
 };
 use rule_engine::{CompiledRules, Rule, RuleEngine};
 use serde::Serialize;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread::JoinHandle;
-use tauri::Manager;
+use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+
+mod clipboard;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum RuntimeStatus {
@@ -86,6 +89,7 @@ pub struct RuntimeController {
     engine: RuleEngine,
     adapter: SafeAdapter,
     input_source: Option<InputSourceService>,
+    clipboard: Option<Arc<clipboard::ClipboardManager>>,
     diagnostics: Arc<Diagnostics>,
     profile: String,
     config: Option<AppConfig>,
@@ -95,6 +99,7 @@ pub struct RuntimeController {
 pub struct AppState {
     pub runtime: Arc<Mutex<RuntimeController>>,
     pub event_runtime: EventRuntime,
+    clipboard: Arc<Mutex<Option<Arc<clipboard::ClipboardManager>>>>,
 }
 
 impl AppState {
@@ -102,6 +107,7 @@ impl AppState {
         Self {
             runtime: Arc::new(Mutex::new(RuntimeController::new(rules))),
             event_runtime: EventRuntime::default(),
+            clipboard: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -109,7 +115,21 @@ impl AppState {
         Ok(Self {
             runtime: Arc::new(Mutex::new(RuntimeController::from_config(config)?)),
             event_runtime: EventRuntime::default(),
+            clipboard: Arc::new(Mutex::new(None)),
         })
+    }
+
+    pub fn set_clipboard(&self, manager: Arc<clipboard::ClipboardManager>) {
+        if let Ok(mut slot) = self.clipboard.lock() {
+            *slot = Some(Arc::clone(&manager));
+        }
+        if let Ok(mut runtime) = self.runtime.lock() {
+            runtime.set_clipboard(manager);
+        }
+    }
+
+    pub fn clipboard(&self) -> Option<Arc<clipboard::ClipboardManager>> {
+        self.clipboard.lock().ok().and_then(|slot| slot.clone())
     }
 }
 
@@ -124,7 +144,11 @@ impl EventRuntime {
         self.started.load(Ordering::Acquire)
     }
 
-    pub fn start(&self, runtime: Arc<Mutex<RuntimeController>>) -> Result<(), String> {
+    pub fn start(
+        &self,
+        runtime: Arc<Mutex<RuntimeController>>,
+        clipboard: Option<Arc<clipboard::ClipboardManager>>,
+    ) -> Result<(), String> {
         if self.started.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
@@ -135,6 +159,7 @@ impl EventRuntime {
                 .name("mac-to-windows-event-tap".into())
                 .spawn(move || {
                     let mask = event_mask();
+                    let mut clipboard_hotkey = ClipboardHotkeyLatch::default();
                     let tap = macos_adapter::EventTap::create(mask, move |raw| {
                         if raw.is_tap_disabled() {
                             return macos_adapter::EventTapAction::Pass;
@@ -143,6 +168,14 @@ impl EventRuntime {
                         let Some(event) = macos_adapter::normalize_event(raw) else {
                             return macos_adapter::EventTapAction::Pass;
                         };
+                        if let Some(action) = clipboard_hotkey.handle(&event) {
+                            if matches!(action, ClipboardHotkeyAction::Show) {
+                                if let Some(manager) = &clipboard {
+                                    let _ = manager.try_show();
+                                }
+                            }
+                            return macos_adapter::EventTapAction::Suppress;
+                        }
                         let decision = runtime
                             .lock()
                             .map(|mut controller| {
@@ -193,7 +226,7 @@ impl EventRuntime {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = runtime;
+            let _ = (runtime, clipboard);
             self.started.store(false, Ordering::Release);
             Err("Event Tap 仅支持 macOS".into())
         }
@@ -219,6 +252,7 @@ pub struct RuntimeView {
     pub post_access: bool,
     pub event_runtime_started: bool,
     pub input_source: String,
+    pub clipboard_status: String,
 }
 
 impl RuntimeController {
@@ -233,6 +267,7 @@ impl RuntimeController {
             engine: RuleEngine::new(rules),
             adapter,
             input_source,
+            clipboard: None,
             diagnostics,
             profile: "windows_physical".into(),
             config: None,
@@ -267,6 +302,10 @@ impl RuntimeController {
 
     pub fn config(&self) -> Option<&AppConfig> {
         self.config.as_ref()
+    }
+
+    pub fn set_clipboard(&mut self, manager: Arc<clipboard::ClipboardManager>) {
+        self.clipboard = Some(manager);
     }
 
     pub fn apply(&mut self, command: RuntimeCommand) -> Result<Vec<OutputEvent>, RuntimeError> {
@@ -460,6 +499,15 @@ impl RuntimeController {
                         input_source_error = Some(InjectionError::Unavailable);
                     }
                 }
+                OutputEvent::SystemShortcut(SystemShortcut::ShowClipboard) => {
+                    if let Some(manager) = &self.clipboard {
+                        if !manager.try_show() {
+                            input_source_error = Some(InjectionError::Unavailable);
+                        }
+                    } else {
+                        input_source_error = Some(InjectionError::Unavailable);
+                    }
+                }
                 other => regular.push(other.clone()),
             }
         }
@@ -513,6 +561,13 @@ fn append_keyboard_rule(
     Ok(())
 }
 
+fn clipboard_history_path() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Library/Application Support/MacToWindows/clipboard-history.json")
+}
+
 pub fn run() {
     let config = AppConfig::default();
     let app_state = AppState::from_config(config).unwrap_or_else(|_| {
@@ -530,11 +585,34 @@ pub fn run() {
             commands::export_config,
             commands::import_config,
             commands::reload_permissions,
-            commands::open_privacy_settings
+            commands::open_privacy_settings,
+            commands::clipboard_history,
+            commands::select_clipboard_item,
+            commands::delete_clipboard_item,
+            commands::clear_clipboard_history,
+            commands::close_clipboard_panel
         ])
         .setup(|app| {
             use tauri::menu::{Menu, MenuItem};
             use tauri::tray::TrayIconBuilder;
+            WebviewWindowBuilder::new(app, "clipboard", WebviewUrl::App("clipboard.html".into()))
+                .title("剪贴板历史")
+                .inner_size(420.0, 520.0)
+                .visible(false)
+                .decorations(false)
+                .resizable(false)
+                .always_on_top(true)
+                .skip_taskbar(true)
+                .center()
+                .build()?;
+            let manager =
+                clipboard::ClipboardManager::start(app.handle().clone(), clipboard_history_path())
+                    .map_err(|error| error.to_string())?;
+            let state = app.state::<AppState>();
+            state.set_clipboard(Arc::clone(&manager));
+            let _ = state
+                .event_runtime
+                .start(Arc::clone(&state.runtime), Some(manager));
             let open = MenuItem::with_id(app, "open", "打开设置", true, None::<&str>)?;
             let toggle = MenuItem::with_id(app, "toggle", "启用 Windows 模式", true, None::<&str>)?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
@@ -585,7 +663,10 @@ pub mod commands {
                     .apply(RuntimeCommand::Enable)
                     .map_err(|error| format!("{error:?}"))?;
                 drop(runtime);
-                if let Err(error) = state.event_runtime.start(Arc::clone(&state.runtime)) {
+                if let Err(error) = state
+                    .event_runtime
+                    .start(Arc::clone(&state.runtime), state.clipboard())
+                {
                     let mut runtime = state
                         .runtime
                         .lock()
@@ -612,6 +693,10 @@ pub mod commands {
             .as_ref()
             .and_then(|service| service.snapshot().current_id)
             .unwrap_or_else(|| "未知".into());
+        let clipboard_status = state
+            .clipboard()
+            .and_then(|manager| manager.snapshot().last_error)
+            .unwrap_or_else(|| "正常".into());
         Ok(RuntimeView {
             status: runtime.status().clone(),
             profile: runtime.profile().to_owned(),
@@ -623,6 +708,7 @@ pub mod commands {
             post_access,
             event_runtime_started: state.event_runtime.is_started(),
             input_source,
+            clipboard_status,
         })
     }
 
@@ -708,6 +794,52 @@ pub mod commands {
             .apply(RuntimeCommand::ReloadPermissions)
             .map_err(|error| format!("{error:?}"))?;
         Ok(runtime.status().clone())
+    }
+
+    #[tauri::command]
+    pub fn clipboard_history(
+        state: tauri::State<'_, AppState>,
+    ) -> Result<clipboard::ClipboardSnapshot, String> {
+        state
+            .clipboard()
+            .map(|manager| manager.snapshot())
+            .ok_or_else(|| "剪贴板服务尚未启动".to_owned())
+    }
+
+    #[tauri::command]
+    pub fn select_clipboard_item(state: tauri::State<'_, AppState>, id: u64) -> Result<(), String> {
+        state
+            .clipboard()
+            .ok_or_else(|| "剪贴板服务尚未启动".to_owned())?
+            .select(id)
+            .map_err(|error| error.to_string())
+    }
+
+    #[tauri::command]
+    pub fn delete_clipboard_item(state: tauri::State<'_, AppState>, id: u64) -> Result<(), String> {
+        state
+            .clipboard()
+            .ok_or_else(|| "剪贴板服务尚未启动".to_owned())?
+            .delete(id)
+            .map_err(|error| error.to_string())
+    }
+
+    #[tauri::command]
+    pub fn clear_clipboard_history(state: tauri::State<'_, AppState>) -> Result<(), String> {
+        state
+            .clipboard()
+            .ok_or_else(|| "剪贴板服务尚未启动".to_owned())?
+            .clear()
+            .map_err(|error| error.to_string())
+    }
+
+    #[tauri::command]
+    pub fn close_clipboard_panel(state: tauri::State<'_, AppState>) -> Result<(), String> {
+        state
+            .clipboard()
+            .ok_or_else(|| "剪贴板服务尚未启动".to_owned())?
+            .close_panel()
+            .map_err(|error| error.to_string())
     }
 
     #[tauri::command]
@@ -1004,7 +1136,7 @@ mod tests {
         let state = AppState::from_config(AppConfig::default()).unwrap();
         state
             .event_runtime
-            .start(Arc::clone(&state.runtime))
+            .start(Arc::clone(&state.runtime), None)
             .expect("Event Tap should start with macOS input permissions");
         assert!(state.event_runtime.is_started());
     }

@@ -7,7 +7,9 @@ use std::sync::Arc;
 
 mod clipboard;
 mod input_source;
-pub use clipboard::{ForegroundApplication, PasteboardChange, PasteboardError, PasteboardService};
+pub use clipboard::{
+    ForegroundApplication, PasteboardBackend, PasteboardChange, PasteboardError, PasteboardService,
+};
 pub use input_source::{
     InputSourceCommand, InputSourceError, InputSourceService, InputSourceSnapshot,
 };
