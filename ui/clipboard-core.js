@@ -18,7 +18,9 @@
 
   function moveSelection(index, delta, count) {
     if (!Number.isInteger(count) || count <= 0) return -1;
-    const current = Number.isInteger(index) ? index : 0;
+    const current = Number.isInteger(index) && index >= 0 && index < count
+      ? index
+      : (delta > 0 ? -1 : 0);
     return (current + delta + count) % count;
   }
 

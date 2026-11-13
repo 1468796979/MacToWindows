@@ -203,15 +203,14 @@ mod platform {
         let options = NSApplicationActivationOptions::ActivateAllWindows
             | NSApplicationActivationOptions::ActivateIgnoringOtherApps;
         if application.activateWithOptions(options) || application.isActive() {
-            Ok(())
-        } else {
-            let _ = application.unhide();
-            if application.activateWithOptions(options) || application.isActive() {
-                Ok(())
-            } else {
-                Err(PasteboardError::ApplicationUnavailable)
-            }
+            return Ok(());
         }
+        let _ = application.unhide();
+        let _ = application.activateWithOptions(options);
+        // Activation can complete asynchronously. The caller polls the
+        // frontmost application before injecting Cmd+V, so a false return
+        // here is not by itself an unavailable-application error.
+        Ok(())
     }
 }
 

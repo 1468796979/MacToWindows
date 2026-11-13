@@ -52,26 +52,55 @@ pub enum ClipboardHotkeyAction {
 #[derive(Debug, Default)]
 pub struct ClipboardHotkeyLatch {
     active: bool,
+    left_option_down: bool,
+    right_option_down: bool,
+    option_state_seen: bool,
 }
 
 impl ClipboardHotkeyLatch {
     pub fn reset(&mut self) {
         self.active = false;
+        self.left_option_down = false;
+        self.right_option_down = false;
+        self.option_state_seen = false;
     }
 
     pub fn handle(&mut self, event: &NormalizedEvent) -> Option<ClipboardHotkeyAction> {
+        if event.kind == event_model::EventKind::FlagsChanged
+            && event.source == event_model::DeviceSource::Keyboard
+            && matches!(event.origin, event_model::EventOrigin::Hardware)
+            && matches!(event.code, event_model::PhysicalCode::Key(58 | 61))
+        {
+            self.option_state_seen = true;
+            match event.code {
+                event_model::PhysicalCode::Key(58) => {
+                    self.left_option_down = !self.left_option_down;
+                }
+                event_model::PhysicalCode::Key(61) => {
+                    self.right_option_down = !self.right_option_down;
+                }
+                _ => {}
+            }
+            return None;
+        }
         if event.source != event_model::DeviceSource::Keyboard
             || event.code != event_model::PhysicalCode::key(9)
             || !matches!(event.origin, event_model::EventOrigin::Hardware)
         {
             return None;
         }
-        match event.phase {
-            event_model::EventPhase::Down
-                if event
+        let left_option_active = if self.option_state_seen {
+            self.left_option_down && !self.right_option_down
+        } else {
+            event
+                .modifiers
+                .contains(event_model::ModifierSet::LEFT_OPTION)
+                && !event
                     .modifiers
-                    .contains(event_model::ModifierSet::LEFT_OPTION) =>
-            {
+                    .contains(event_model::ModifierSet::RIGHT_OPTION)
+        };
+        match event.phase {
+            event_model::EventPhase::Down if left_option_active => {
                 if self.active {
                     Some(ClipboardHotkeyAction::Suppress)
                 } else {
@@ -173,6 +202,7 @@ impl EventRuntime {
                     let mut clipboard_hotkey = ClipboardHotkeyLatch::default();
                     let tap = macos_adapter::EventTap::create(mask, move |raw| {
                         if raw.is_tap_disabled() {
+                            clipboard_hotkey.reset();
                             return macos_adapter::EventTapAction::Pass;
                         }
                         let proxy = raw.proxy();
@@ -182,13 +212,7 @@ impl EventRuntime {
                         if let Some(action) = clipboard_hotkey.handle(&event) {
                             if matches!(action, ClipboardHotkeyAction::Show) {
                                 if let Some(manager) = &clipboard {
-                                    if !manager.try_show() {
-                                        clipboard_hotkey.reset();
-                                        return macos_adapter::EventTapAction::Pass;
-                                    }
-                                } else {
-                                    clipboard_hotkey.reset();
-                                    return macos_adapter::EventTapAction::Pass;
+                                    let _ = manager.try_show();
                                 }
                             }
                             return macos_adapter::EventTapAction::Suppress;
@@ -672,11 +696,7 @@ pub fn run() {
         .expect("error while building MacToWindows")
         .run(|app, event| {
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen {
-                has_visible_windows: false,
-                ..
-            } = event
-            {
+            if let tauri::RunEvent::Reopen { .. } = event {
                 // The clipboard panel intentionally hides the settings
                 // window while it is active. A Dock click must still reopen
                 // the settings window when the app has no visible windows.
@@ -873,39 +893,66 @@ pub mod commands {
     }
 
     #[tauri::command]
-    pub fn select_clipboard_item(state: tauri::State<'_, AppState>, id: u64) -> Result<(), String> {
-        state
+    pub async fn select_clipboard_item(
+        state: tauri::State<'_, AppState>,
+        id: u64,
+    ) -> Result<(), String> {
+        let manager = state
             .clipboard()
-            .ok_or_else(|| "剪贴板服务尚未启动".to_owned())?
-            .select(id)
-            .map_err(|error| error.to_string())
+            .ok_or_else(|| "剪贴板服务尚未启动".to_owned())?;
+        tauri::async_runtime::spawn_blocking(move || {
+            manager.select(id).map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| format!("剪贴板操作线程失败：{error}"))?
     }
 
     #[tauri::command]
-    pub fn delete_clipboard_item(state: tauri::State<'_, AppState>, id: u64) -> Result<(), String> {
-        state
+    pub async fn delete_clipboard_item(
+        state: tauri::State<'_, AppState>,
+        id: u64,
+    ) -> Result<(), String> {
+        let manager = state
             .clipboard()
-            .ok_or_else(|| "剪贴板服务尚未启动".to_owned())?
-            .delete(id)
-            .map_err(|error| error.to_string())
+            .ok_or_else(|| "剪贴板服务尚未启动".to_owned())?;
+        tauri::async_runtime::spawn_blocking(move || {
+            manager.delete(id).map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| format!("剪贴板操作线程失败：{error}"))?
     }
 
     #[tauri::command]
-    pub fn clear_clipboard_history(state: tauri::State<'_, AppState>) -> Result<(), String> {
-        state
+    pub async fn clear_clipboard_history(state: tauri::State<'_, AppState>) -> Result<(), String> {
+        let manager = state
             .clipboard()
-            .ok_or_else(|| "剪贴板服务尚未启动".to_owned())?
-            .clear()
-            .map_err(|error| error.to_string())
+            .ok_or_else(|| "剪贴板服务尚未启动".to_owned())?;
+        tauri::async_runtime::spawn_blocking(move || {
+            manager.clear().map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| format!("剪贴板操作线程失败：{error}"))?
     }
 
     #[tauri::command]
-    pub fn close_clipboard_panel(state: tauri::State<'_, AppState>) -> Result<(), String> {
-        state
+    pub async fn close_clipboard_panel(
+        app: tauri::AppHandle,
+        state: tauri::State<'_, AppState>,
+    ) -> Result<(), String> {
+        let handle = app.clone();
+        let _ = app.run_on_main_thread(move || {
+            if let Some(window) = handle.get_webview_window("clipboard") {
+                let _ = window.hide();
+            }
+        });
+        let manager = state
             .clipboard()
-            .ok_or_else(|| "剪贴板服务尚未启动".to_owned())?
-            .close_panel()
-            .map_err(|error| error.to_string())
+            .ok_or_else(|| "剪贴板服务尚未启动".to_owned())?;
+        tauri::async_runtime::spawn_blocking(move || {
+            manager.close_panel().map_err(|error| error.to_string())
+        })
+        .await
+        .map_err(|error| format!("剪贴板操作线程失败：{error}"))?
     }
 
     #[tauri::command]
@@ -1193,6 +1240,61 @@ mod tests {
         };
         assert_eq!(latch.handle(&right), None);
         assert_eq!(latch.handle(&plain), None);
+    }
+
+    #[test]
+    fn clipboard_hotkey_uses_flags_changed_to_distinguish_right_option() {
+        let mut latch = ClipboardHotkeyLatch::default();
+        let left_down = NormalizedEvent {
+            kind: EventKind::FlagsChanged,
+            code: PhysicalCode::key(58),
+            modifiers: ModifierSet::LEFT_OPTION,
+            ..key()
+        };
+        let right_down = NormalizedEvent {
+            kind: EventKind::FlagsChanged,
+            code: PhysicalCode::key(61),
+            modifiers: ModifierSet::RIGHT_OPTION,
+            ..key()
+        };
+        let right_up = NormalizedEvent {
+            kind: EventKind::FlagsChanged,
+            code: PhysicalCode::key(61),
+            modifiers: ModifierSet::NONE,
+            ..key()
+        };
+        let left_up = NormalizedEvent {
+            kind: EventKind::FlagsChanged,
+            code: PhysicalCode::key(58),
+            modifiers: ModifierSet::NONE,
+            ..key()
+        };
+        let v = NormalizedEvent {
+            code: PhysicalCode::key(9),
+            modifiers: ModifierSet::LEFT_OPTION | ModifierSet::RIGHT_OPTION,
+            ..key()
+        };
+        assert_eq!(latch.handle(&left_down), None);
+        assert_eq!(latch.handle(&right_down), None);
+        assert_eq!(latch.handle(&v), None);
+        assert_eq!(latch.handle(&right_up), None);
+        assert_eq!(latch.handle(&v), Some(ClipboardHotkeyAction::Show));
+        assert_eq!(latch.handle(&left_up), None);
+        let plain = NormalizedEvent {
+            code: PhysicalCode::key(9),
+            modifiers: ModifierSet::NONE,
+            ..key()
+        };
+        assert_eq!(latch.handle(&plain), None);
+        latch.reset();
+        assert_eq!(latch.handle(&right_down), None);
+        let right_v = NormalizedEvent {
+            code: PhysicalCode::key(9),
+            modifiers: ModifierSet::LEFT_OPTION,
+            ..key()
+        };
+        assert_eq!(latch.handle(&right_v), None);
+        assert_eq!(latch.handle(&right_up), None);
     }
 
     #[cfg(target_os = "macos")]

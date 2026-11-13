@@ -14,6 +14,8 @@ test("previewText collapses whitespace and clips long content", () => {
 test("moveSelection wraps around the history", () => {
   assert.equal(moveSelection(0, -1, 3), 2);
   assert.equal(moveSelection(2, 1, 3), 0);
+  assert.equal(moveSelection(-1, -1, 3), 2);
+  assert.equal(moveSelection(-1, 1, 3), 0);
   assert.equal(moveSelection(-1, 1, 0), -1);
 });
 

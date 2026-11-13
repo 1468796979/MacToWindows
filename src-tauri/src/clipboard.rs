@@ -4,6 +4,7 @@ use clipboard_core::{
 use macos_adapter::{ForegroundApplication, PasteboardError, PasteboardService};
 use serde::Serialize;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -162,6 +163,7 @@ enum WorkerCommand {
     Show,
     Select {
         id: u64,
+        generation: u64,
         reply: Sender<Result<(), String>>,
     },
     Delete {
@@ -179,6 +181,7 @@ enum WorkerCommand {
 pub struct ClipboardManager {
     sender: SyncSender<WorkerCommand>,
     snapshot: Arc<Mutex<ClipboardSnapshot>>,
+    select_generation: Arc<AtomicU64>,
 }
 
 impl ClipboardManager {
@@ -201,11 +204,26 @@ impl ClipboardManager {
             last_error: None,
         }));
         let worker_snapshot = Arc::clone(&snapshot);
+        let select_generation = Arc::new(AtomicU64::new(0));
+        let worker_select_generation = Arc::clone(&select_generation);
         thread::Builder::new()
             .name("mac-to-windows-clipboard".into())
-            .spawn(move || worker_loop(app, history_path, receiver, worker_snapshot, marker))
+            .spawn(move || {
+                worker_loop(
+                    app,
+                    history_path,
+                    receiver,
+                    worker_snapshot,
+                    worker_select_generation,
+                    marker,
+                )
+            })
             .map_err(|_| ClipboardManagerError::WorkerUnavailable)?;
-        Ok(Arc::new(Self { sender, snapshot }))
+        Ok(Arc::new(Self {
+            sender,
+            snapshot,
+            select_generation,
+        }))
     }
 
     pub fn snapshot(&self) -> ClipboardSnapshot {
@@ -224,7 +242,16 @@ impl ClipboardManager {
     }
 
     pub fn select(&self, id: u64) -> Result<(), ClipboardManagerError> {
-        self.request(|reply| WorkerCommand::Select { id, reply })
+        let generation = self.select_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        let result = self.request(|reply| WorkerCommand::Select {
+            id,
+            generation,
+            reply,
+        });
+        if result.is_err() {
+            self.select_generation.fetch_add(1, Ordering::AcqRel);
+        }
+        result
     }
 
     pub fn delete(&self, id: u64) -> Result<(), ClipboardManagerError> {
@@ -236,7 +263,11 @@ impl ClipboardManager {
     }
 
     pub fn close_panel(&self) -> Result<(), ClipboardManagerError> {
-        self.request(|reply| WorkerCommand::Close { reply })
+        self.select_generation.fetch_add(1, Ordering::AcqRel);
+        let (reply, _response) = mpsc::channel();
+        self.sender
+            .try_send(WorkerCommand::Close { reply })
+            .map_err(|_| ClipboardManagerError::WorkerUnavailable)
     }
 
     fn request<F>(&self, build: F) -> Result<(), ClipboardManagerError>
@@ -260,6 +291,7 @@ fn worker_loop(
     history_path: PathBuf,
     receiver: Receiver<WorkerCommand>,
     snapshot: Arc<Mutex<ClipboardSnapshot>>,
+    select_generation: Arc<AtomicU64>,
     marker: u64,
 ) {
     let (mut history, mut last_error) = match ClipboardStore::load_or_recover(&history_path) {
@@ -308,6 +340,7 @@ fn worker_loop(
                     &mut panel_open,
                     &mut last_error,
                     &snapshot,
+                    &select_generation,
                     marker,
                     command,
                 );
@@ -344,15 +377,19 @@ fn worker_loop(
                 Ok(Some(IngestOutcome::IgnoredEmpty | IngestOutcome::IgnoredTooLarge))
                 | Ok(None) => {}
                 Err(error) => {
-                    last_error = Some(format!("读取系统剪贴板失败：{error}"));
-                    publish_snapshot(
-                        &app,
-                        &snapshot,
-                        &history,
-                        panel_open,
-                        last_error.as_deref(),
-                        "clipboard-updated",
-                    );
+                    let message = format!("读取系统剪贴板失败：{error}");
+                    let changed = last_error.as_deref() != Some(message.as_str());
+                    last_error = Some(message);
+                    if changed {
+                        publish_snapshot(
+                            &app,
+                            &snapshot,
+                            &history,
+                            panel_open,
+                            last_error.as_deref(),
+                            "clipboard-updated",
+                        );
+                    }
                 }
             }
         }
@@ -368,12 +405,14 @@ fn handle_command(
     panel_open: &mut bool,
     last_error: &mut Option<String>,
     snapshot: &Arc<Mutex<ClipboardSnapshot>>,
+    select_generation: &Arc<AtomicU64>,
     marker: u64,
     command: WorkerCommand,
 ) -> bool {
     match command {
         WorkerCommand::Show => {
             if !*panel_open {
+                *last_error = None;
                 if let Some(core) = core.as_mut() {
                     core.target_bundle_id = None;
                     let result = frontmost_application_on_main_thread(app)
@@ -398,20 +437,37 @@ fn handle_command(
             );
             show_window(app);
         }
-        WorkerCommand::Select { id, reply } => {
-            let result = select_and_paste(app, core, panel_open, last_error, marker, id);
-            let succeeded = result.is_ok();
-            let _ = reply.send(result);
-            if succeeded {
-                publish_snapshot(
-                    app,
-                    snapshot,
-                    history,
-                    *panel_open,
-                    last_error.as_deref(),
-                    "clipboard-updated",
-                );
+        WorkerCommand::Select {
+            id,
+            generation,
+            reply,
+        } => {
+            let result = select_and_paste(
+                app,
+                core,
+                panel_open,
+                last_error,
+                select_generation,
+                generation,
+                marker,
+                id,
+            );
+            if let Err(error) = result.as_ref() {
+                if error == "操作已取消" {
+                    *last_error = None;
+                } else {
+                    *last_error = Some(error.clone());
+                }
             }
+            publish_snapshot(
+                app,
+                snapshot,
+                history,
+                *panel_open,
+                last_error.as_deref(),
+                "clipboard-updated",
+            );
+            let _ = reply.send(result);
         }
         WorkerCommand::Delete { id, reply } => {
             let result = if history.entries().iter().any(|entry| entry.id == id) {
@@ -476,8 +532,12 @@ fn handle_command(
         }
         WorkerCommand::Close { reply } => {
             dismiss_panel(core, panel_open);
-            *last_error = None;
-            hide_window(app);
+            let result = hide_window_and_wait(app);
+            if let Err(error) = &result {
+                *last_error = Some(error.clone());
+            } else {
+                *last_error = None;
+            }
             publish_snapshot(
                 app,
                 snapshot,
@@ -486,7 +546,7 @@ fn handle_command(
                 last_error.as_deref(),
                 "clipboard-updated",
             );
-            let _ = reply.send(Ok(()));
+            let _ = reply.send(result);
         }
     }
     false
@@ -499,14 +559,21 @@ fn dismiss_panel(core: &mut Option<ClipboardManagerCore>, panel_open: &mut bool)
     *panel_open = false;
 }
 
+#[allow(clippy::too_many_arguments)]
 fn select_and_paste(
     app: &AppHandle,
     core: &mut Option<ClipboardManagerCore>,
     panel_open: &mut bool,
     last_error: &mut Option<String>,
+    select_generation: &Arc<AtomicU64>,
+    generation: u64,
     marker: u64,
     id: u64,
 ) -> Result<(), String> {
+    if select_generation.load(Ordering::Acquire) != generation {
+        *panel_open = false;
+        return Err("操作已取消".into());
+    }
     let Some(core) = core.as_mut() else {
         let error = "系统剪贴板服务不可用".to_owned();
         *last_error = Some(error.clone());
@@ -515,19 +582,62 @@ fn select_and_paste(
     let selection = core.select(id)?;
     core.write_text(&selection.text)
         .map_err(|error| format!("写入系统剪贴板失败：{error}"))?;
-    if let Err(message) = activate_application_on_main_thread(app, &selection.target_bundle_id) {
+    if select_generation.load(Ordering::Acquire) != generation {
+        *panel_open = false;
+        return Err("操作已取消".into());
+    }
+    if let Err(message) = activate_application_on_main_thread(
+        app,
+        &selection.target_bundle_id,
+        Arc::clone(select_generation),
+        generation,
+    ) {
+        if select_generation.load(Ordering::Acquire) != generation {
+            *panel_open = false;
+            return Err("操作已取消".into());
+        }
         *last_error = Some(message.clone());
         show_window(app);
         return Err(message);
     }
-    hide_window_and_wait(app);
-    if let Err(error) = wait_for_frontmost(app, &selection.target_bundle_id) {
+    if select_generation.load(Ordering::Acquire) != generation {
+        *panel_open = false;
+        return Err("操作已取消".into());
+    }
+    if let Err(error) = hide_window_and_wait(app) {
+        if select_generation.load(Ordering::Acquire) != generation {
+            *panel_open = false;
+            return Err("操作已取消".into());
+        }
         *last_error = Some(error.clone());
         *panel_open = true;
         show_window(app);
         return Err(error);
     }
+    if let Err(error) = wait_for_frontmost(
+        app,
+        &selection.target_bundle_id,
+        select_generation,
+        generation,
+    ) {
+        if select_generation.load(Ordering::Acquire) != generation {
+            *panel_open = false;
+            return Err("操作已取消".into());
+        }
+        *last_error = Some(error.clone());
+        *panel_open = true;
+        show_window(app);
+        return Err(error);
+    }
+    if select_generation.load(Ordering::Acquire) != generation {
+        *panel_open = false;
+        return Err("操作已取消".into());
+    }
     thread::sleep(Duration::from_millis(10));
+    if select_generation.load(Ordering::Acquire) != generation {
+        *panel_open = false;
+        return Err("操作已取消".into());
+    }
     let outputs = [
         event_model::OutputEvent::Key {
             code: event_model::PhysicalCode::key(9),
@@ -541,6 +651,10 @@ fn select_and_paste(
         },
     ];
     if let Err(error) = macos_adapter::inject_outputs(&outputs, marker) {
+        if select_generation.load(Ordering::Acquire) != generation {
+            *panel_open = false;
+            return Err("操作已取消".into());
+        }
         let message = format!("自动粘贴失败：{error}");
         *last_error = Some(message.clone());
         *panel_open = true;
@@ -559,13 +673,22 @@ where
     F: FnOnce() -> T + Send + 'static,
 {
     let (result_tx, result_rx) = mpsc::sync_channel(1);
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let closure_cancelled = Arc::clone(&cancelled);
     app.run_on_main_thread(move || {
+        if closure_cancelled.load(Ordering::Acquire) {
+            return;
+        }
         let _ = result_tx.send(operation());
     })
     .map_err(|error| format!("主线程操作失败：{error}"))?;
-    result_rx
-        .recv_timeout(Duration::from_millis(200))
-        .map_err(|error| format!("主线程操作超时：{error}"))
+    match result_rx.recv_timeout(Duration::from_millis(500)) {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            cancelled.store(true, Ordering::Release);
+            Err(format!("主线程操作超时：{error}"))
+        }
+    }
 }
 
 fn frontmost_application_on_main_thread(
@@ -575,15 +698,33 @@ fn frontmost_application_on_main_thread(
         .map_err(|error| format!("读取前台应用失败：{error}"))
 }
 
-fn activate_application_on_main_thread(app: &AppHandle, bundle_id: &str) -> Result<(), String> {
+fn activate_application_on_main_thread(
+    app: &AppHandle,
+    bundle_id: &str,
+    select_generation: Arc<AtomicU64>,
+    generation: u64,
+) -> Result<(), String> {
     let bundle_id = bundle_id.to_owned();
-    run_on_main_thread_result(app, move || macos_adapter::activate_application(&bundle_id))?
-        .map_err(|error| format!("恢复前台应用失败：{error}"))
+    run_on_main_thread_result(app, move || {
+        if select_generation.load(Ordering::Acquire) != generation {
+            return Err(PasteboardError::ApplicationUnavailable);
+        }
+        macos_adapter::activate_application(&bundle_id)
+    })?
+    .map_err(|error| format!("恢复前台应用失败：{error}"))
 }
 
-fn wait_for_frontmost(app: &AppHandle, target_bundle_id: &str) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_millis(800);
+fn wait_for_frontmost(
+    app: &AppHandle,
+    target_bundle_id: &str,
+    select_generation: &Arc<AtomicU64>,
+    generation: u64,
+) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_millis(1_000);
     loop {
+        if select_generation.load(Ordering::Acquire) != generation {
+            return Err("操作已取消".into());
+        }
         match frontmost_application_on_main_thread(app)? {
             Some(application) if application.bundle_id == target_bundle_id => return Ok(()),
             Some(_) | None => {}
@@ -628,31 +769,21 @@ fn show_window(app: &AppHandle) {
     });
 }
 
-fn hide_window(app: &AppHandle) {
-    let handle = app.clone();
-    let closure_handle = handle.clone();
-    let _ = handle.run_on_main_thread(move || {
-        if let Some(window) = closure_handle.get_webview_window("clipboard") {
-            let _ = window.hide();
-        }
-    });
-}
-
-fn hide_window_and_wait(app: &AppHandle) {
+fn hide_window_and_wait(app: &AppHandle) -> Result<(), String> {
     let handle = app.clone();
     let closure_handle = handle.clone();
     let (done_tx, done_rx) = mpsc::sync_channel(1);
-    if handle
+    handle
         .run_on_main_thread(move || {
             if let Some(window) = closure_handle.get_webview_window("clipboard") {
                 let _ = window.hide();
             }
             let _ = done_tx.send(());
         })
-        .is_ok()
-    {
-        let _ = done_rx.recv_timeout(Duration::from_millis(100));
-    }
+        .map_err(|error| format!("主线程隐藏剪贴板窗口失败：{error}"))?;
+    done_rx
+        .recv_timeout(Duration::from_millis(200))
+        .map_err(|error| format!("主线程隐藏剪贴板窗口超时：{error}"))
 }
 
 #[cfg(test)]

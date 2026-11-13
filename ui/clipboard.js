@@ -1,5 +1,5 @@
 const core = window.clipboardCore;
-const state = { entries: [], selectedIndex: -1, error: "" };
+const state = { entries: [], selectedIndex: -1, error: "", selecting: false };
 const $ = (id) => document.getElementById(id);
 const backendInvoke = (command, args) => {
   const invoke = window.__TAURI__?.core?.invoke || window.__TAURI_INTERNALS__?.invoke;
@@ -16,8 +16,11 @@ function applySnapshot(snapshot) {
   const normalized = core.normalizeSnapshot(snapshot);
   state.entries = normalized.entries;
   state.error = normalized.lastError || "";
+  if (!normalized.panelOpen || normalized.lastError) state.selecting = false;
   if (state.entries.length === 0) state.selectedIndex = -1;
-  else state.selectedIndex = Math.max(0, Math.min(state.selectedIndex, state.entries.length - 1));
+  else if (state.selectedIndex >= 0) {
+    state.selectedIndex = Math.min(state.selectedIndex, state.entries.length - 1);
+  }
   render();
 }
 
@@ -28,6 +31,8 @@ async function refreshSnapshot() {
 function render() {
   const list = $("clipboard-list");
   list.replaceChildren();
+  $("clipboard-close").disabled = false;
+  $("clipboard-clear").disabled = state.selecting;
   $("clipboard-empty").hidden = state.entries.length > 0;
   $("clipboard-error").textContent = state.error;
   state.entries.forEach((entry, index) => {
@@ -36,6 +41,7 @@ function render() {
     item.setAttribute("role", "option");
     item.setAttribute("aria-selected", String(index === state.selectedIndex));
     item.addEventListener("click", () => {
+      if (state.selecting) return;
       state.selectedIndex = index;
       render();
       selectEntry(entry.id);
@@ -54,6 +60,7 @@ function render() {
     remove.className = "clipboard-delete";
     remove.type = "button";
     remove.textContent = "删除";
+    remove.disabled = state.selecting;
     remove.addEventListener("click", async (event) => {
       event.stopPropagation();
       try {
@@ -68,10 +75,13 @@ function render() {
 }
 
 async function selectEntry(id) {
+  if (state.selecting) return;
+  state.selecting = true;
+  render();
   try {
     await backendInvoke("select_clipboard_item", { id });
-    await refreshSnapshot();
   } catch (error) {
+    state.selecting = false;
     state.error = error?.message || String(error);
     render();
   }
@@ -84,6 +94,7 @@ async function closePanel() {
 
 $("clipboard-close").addEventListener("click", closePanel);
 $("clipboard-clear").addEventListener("click", async () => {
+  if (state.selecting) return;
   try {
     await backendInvoke("clear_clipboard_history");
     await refreshSnapshot();
@@ -103,17 +114,22 @@ document.addEventListener("keydown", (event) => {
   }
 });
 document.addEventListener("click", (event) => {
-  if (event.target === document.body) closePanel();
+  if (event.target === document.body || event.target === $("clipboard-panel")) closePanel();
 });
 
 if (listen) {
   Promise.resolve(listen("clipboard-show", (event) => {
+    state.selecting = false;
     state.selectedIndex = core.resetSelection();
     applySnapshot(event.payload);
     window.focus();
   }))
     .catch((error) => { state.error = error?.message || String(error); render(); });
-  Promise.resolve(listen("clipboard-updated", (event) => applySnapshot(event.payload)))
+  Promise.resolve(listen("clipboard-updated", (event) => {
+    const snapshot = core.normalizeSnapshot(event.payload);
+    if (!snapshot.panelOpen || snapshot.lastError) state.selecting = false;
+    applySnapshot(event.payload);
+  }))
     .catch((error) => { state.error = error?.message || String(error); render(); });
 }
 backendInvoke("clipboard_history").then(applySnapshot).catch((error) => { state.error = error?.message || String(error); render(); });
