@@ -338,6 +338,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "clipboard-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "combine"
 version = "4.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
