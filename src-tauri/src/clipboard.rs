@@ -415,33 +415,8 @@ fn handle_command(
             let _ = reply.send(result);
         }
         WorkerCommand::Close { reply } => {
-            let result = if let Some(core) = core.as_mut() {
-                if let Some(target) = core.target_bundle_id.clone() {
-                    match core.activate_application(&target) {
-                        Ok(()) => {
-                            core.target_bundle_id = None;
-                            *panel_open = false;
-                            hide_window(app);
-                            Ok(())
-                        }
-                        Err(error) => {
-                            let message = format!("恢复前台应用失败：{error}");
-                            *last_error = Some(message.clone());
-                            *panel_open = true;
-                            show_window(app);
-                            Err(message)
-                        }
-                    }
-                } else {
-                    *panel_open = false;
-                    hide_window(app);
-                    Ok(())
-                }
-            } else {
-                *panel_open = false;
-                hide_window(app);
-                Ok(())
-            };
+            dismiss_panel(core, panel_open);
+            hide_window(app);
             publish_snapshot(
                 app,
                 snapshot,
@@ -450,10 +425,17 @@ fn handle_command(
                 last_error.as_deref(),
                 "clipboard-updated",
             );
-            let _ = reply.send(result);
+            let _ = reply.send(Ok(()));
         }
     }
     false
+}
+
+fn dismiss_panel(core: &mut Option<ClipboardManagerCore>, panel_open: &mut bool) {
+    if let Some(core) = core.as_mut() {
+        core.target_bundle_id = None;
+    }
+    *panel_open = false;
 }
 
 fn select_and_paste(
@@ -544,7 +526,7 @@ fn hide_window(app: &AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{ClipboardManagerCore, ClipboardSelection};
+    use super::{dismiss_panel, ClipboardManagerCore, ClipboardSelection};
     use clipboard_core::IngestOutcome;
     use macos_adapter::{PasteboardBackend, PasteboardError, PasteboardService};
     use std::sync::{Arc, Mutex};
@@ -636,6 +618,21 @@ mod tests {
 
         assert!(core.capture_target().is_err());
         assert!(core.select(id).is_err());
+    }
+
+    #[test]
+    fn dismissing_panel_only_closes_and_drops_target_application() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let service = PasteboardService::with_backend(Box::new(MockBackend { state }));
+        let mut core = ClipboardManagerCore::new_for_test(service);
+        core.set_target_for_test(Some("com.example.editor".into()));
+        let mut panel_open = true;
+
+        let mut core = Some(core);
+        dismiss_panel(&mut core, &mut panel_open);
+
+        assert!(!panel_open);
+        assert!(core.as_ref().unwrap().target_bundle_id.is_none());
     }
 
     impl PasteboardBackend for MockBackend {
