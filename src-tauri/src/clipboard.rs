@@ -58,12 +58,18 @@ impl ClipboardManagerCore {
         Ok(Some(outcome))
     }
 
+    #[cfg(test)]
     pub fn capture_target(&mut self) -> Result<ForegroundApplication, PasteboardError> {
+        let target = self.pasteboard.frontmost_application()?;
+        self.capture_target_value(target)
+    }
+
+    fn capture_target_value(
+        &mut self,
+        target: Option<ForegroundApplication>,
+    ) -> Result<ForegroundApplication, PasteboardError> {
         self.target_bundle_id = None;
-        let target = self
-            .pasteboard
-            .frontmost_application()?
-            .ok_or(PasteboardError::ApplicationUnavailable)?;
+        let target = target.ok_or(PasteboardError::ApplicationUnavailable)?;
         if self.own_bundle_id.as_deref() == Some(target.bundle_id.as_str()) {
             return Err(PasteboardError::ApplicationUnavailable);
         }
@@ -90,10 +96,6 @@ impl ClipboardManagerCore {
 
     fn write_text(&mut self, text: &str) -> Result<(), PasteboardError> {
         self.pasteboard.write_text(text).map(|_| ())
-    }
-
-    fn activate_application(&mut self, bundle_id: &str) -> Result<(), PasteboardError> {
-        self.pasteboard.activate_application(bundle_id)
     }
 
     fn history_clone(&self) -> ClipboardHistory {
@@ -373,7 +375,14 @@ fn handle_command(
         WorkerCommand::Show => {
             if !*panel_open {
                 if let Some(core) = core.as_mut() {
-                    if let Err(error) = core.capture_target() {
+                    core.target_bundle_id = None;
+                    let result = frontmost_application_on_main_thread(app)
+                        .map_err(|error| error.to_owned())
+                        .and_then(|target| {
+                            core.capture_target_value(target)
+                                .map_err(|error| error.to_string())
+                        });
+                    if let Err(error) = result {
                         *last_error = Some(format!("无法记录前台应用：{error}"));
                     }
                 }
@@ -506,14 +515,13 @@ fn select_and_paste(
     let selection = core.select(id)?;
     core.write_text(&selection.text)
         .map_err(|error| format!("写入系统剪贴板失败：{error}"))?;
-    hide_window_and_wait(app);
-    if let Err(error) = core.activate_application(&selection.target_bundle_id) {
-        let message = format!("恢复前台应用失败：{error}");
+    if let Err(message) = activate_application_on_main_thread(app, &selection.target_bundle_id) {
         *last_error = Some(message.clone());
         show_window(app);
         return Err(message);
     }
-    if let Err(error) = wait_for_frontmost(core, &selection.target_bundle_id) {
+    hide_window_and_wait(app);
+    if let Err(error) = wait_for_frontmost(app, &selection.target_bundle_id) {
         *last_error = Some(error.clone());
         *panel_open = true;
         show_window(app);
@@ -545,16 +553,40 @@ fn select_and_paste(
     Ok(())
 }
 
-fn wait_for_frontmost(
-    core: &mut ClipboardManagerCore,
-    target_bundle_id: &str,
-) -> Result<(), String> {
+fn run_on_main_thread_result<T, F>(app: &AppHandle, operation: F) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    let (result_tx, result_rx) = mpsc::sync_channel(1);
+    app.run_on_main_thread(move || {
+        let _ = result_tx.send(operation());
+    })
+    .map_err(|error| format!("主线程操作失败：{error}"))?;
+    result_rx
+        .recv_timeout(Duration::from_millis(200))
+        .map_err(|error| format!("主线程操作超时：{error}"))
+}
+
+fn frontmost_application_on_main_thread(
+    app: &AppHandle,
+) -> Result<Option<ForegroundApplication>, String> {
+    run_on_main_thread_result(app, macos_adapter::frontmost_application)?
+        .map_err(|error| format!("读取前台应用失败：{error}"))
+}
+
+fn activate_application_on_main_thread(app: &AppHandle, bundle_id: &str) -> Result<(), String> {
+    let bundle_id = bundle_id.to_owned();
+    run_on_main_thread_result(app, move || macos_adapter::activate_application(&bundle_id))?
+        .map_err(|error| format!("恢复前台应用失败：{error}"))
+}
+
+fn wait_for_frontmost(app: &AppHandle, target_bundle_id: &str) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_millis(800);
     loop {
-        match core.pasteboard.frontmost_application() {
-            Ok(Some(application)) if application.bundle_id == target_bundle_id => return Ok(()),
-            Ok(_) => {}
-            Err(error) => return Err(format!("读取前台应用失败：{error}")),
+        match frontmost_application_on_main_thread(app)? {
+            Some(application) if application.bundle_id == target_bundle_id => return Ok(()),
+            Some(_) | None => {}
         }
         if Instant::now() >= deadline {
             return Err("目标应用未能成为前台应用".into());

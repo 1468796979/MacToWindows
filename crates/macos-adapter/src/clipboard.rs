@@ -27,6 +27,20 @@ pub struct ForegroundApplication {
     pub bundle_id: String,
 }
 
+/// Reads the frontmost application using the platform's application APIs.
+/// Callers that need AppKit thread affinity should invoke this on the main
+/// thread.
+pub fn frontmost_application() -> Result<Option<ForegroundApplication>, PasteboardError> {
+    platform::frontmost_application()
+}
+
+/// Activates an application using the platform's application APIs.
+/// Callers that need AppKit thread affinity should invoke this on the main
+/// thread.
+pub fn activate_application(bundle_id: &str) -> Result<(), PasteboardError> {
+    platform::activate_application(bundle_id)
+}
+
 pub trait PasteboardBackend {
     fn change_count(&mut self) -> Result<i64, PasteboardError>;
     fn read_text(&mut self) -> Result<Option<String>, PasteboardError>;
@@ -104,9 +118,10 @@ impl PasteboardService {
 #[cfg(target_os = "macos")]
 mod platform {
     use super::{PasteboardBackend, PasteboardError};
+    use objc2::MainThreadMarker;
     use objc2_app_kit::{
-        NSApplicationActivationOptions, NSPasteboard, NSPasteboardType, NSPasteboardTypeString,
-        NSRunningApplication, NSWorkspace,
+        NSApplication, NSApplicationActivationOptions, NSPasteboard, NSPasteboardType,
+        NSPasteboardTypeString, NSRunningApplication, NSWorkspace,
     };
     use objc2_foundation::NSString;
 
@@ -151,23 +166,47 @@ mod platform {
         }
 
         fn frontmost_bundle_id(&mut self) -> Result<Option<String>, PasteboardError> {
-            Ok(NSWorkspace::sharedWorkspace()
-                .frontmostApplication()
-                .and_then(|application| application.bundleIdentifier())
-                .map(|bundle_id| bundle_id.to_string()))
+            Ok(frontmost_application()?.map(|application| application.bundle_id))
         }
 
         fn activate_bundle_id(&mut self, bundle_id: &str) -> Result<(), PasteboardError> {
-            let bundle_id = NSString::from_str(bundle_id);
-            let applications =
-                NSRunningApplication::runningApplicationsWithBundleIdentifier(&bundle_id);
-            let Some(application) = applications.firstObject() else {
-                return Err(PasteboardError::ApplicationUnavailable);
-            };
-            #[allow(deprecated)]
-            let options = NSApplicationActivationOptions::ActivateAllWindows
-                | NSApplicationActivationOptions::ActivateIgnoringOtherApps;
-            if application.activateWithOptions(options) {
+            activate_application(bundle_id)
+        }
+    }
+
+    pub fn frontmost_application() -> Result<Option<super::ForegroundApplication>, PasteboardError>
+    {
+        Ok(NSWorkspace::sharedWorkspace()
+            .frontmostApplication()
+            .and_then(|application| application.bundleIdentifier())
+            .map(|bundle_id| super::ForegroundApplication {
+                bundle_id: bundle_id.to_string(),
+            }))
+    }
+
+    pub fn activate_application(bundle_id: &str) -> Result<(), PasteboardError> {
+        let bundle_id = NSString::from_str(bundle_id);
+        let applications =
+            NSRunningApplication::runningApplicationsWithBundleIdentifier(&bundle_id);
+        let Some(application) = applications.firstObject() else {
+            return Err(PasteboardError::ApplicationUnavailable);
+        };
+        if application.isTerminated() {
+            return Err(PasteboardError::ApplicationUnavailable);
+        }
+        let Some(mtm) = MainThreadMarker::new() else {
+            return Err(PasteboardError::ApplicationUnavailable);
+        };
+        NSApplication::sharedApplication(mtm).yieldActivationToApplication(&application);
+        let _ = application.unhide();
+        #[allow(deprecated)]
+        let options = NSApplicationActivationOptions::ActivateAllWindows
+            | NSApplicationActivationOptions::ActivateIgnoringOtherApps;
+        if application.activateWithOptions(options) || application.isActive() {
+            Ok(())
+        } else {
+            let _ = application.unhide();
+            if application.activateWithOptions(options) || application.isActive() {
                 Ok(())
             } else {
                 Err(PasteboardError::ApplicationUnavailable)
@@ -199,11 +238,20 @@ mod platform {
             Err(PasteboardError::Unsupported)
         }
         fn frontmost_bundle_id(&mut self) -> Result<Option<String>, PasteboardError> {
-            Err(PasteboardError::Unsupported)
+            frontmost_application().map(|application| application.map(|value| value.bundle_id))
         }
         fn activate_bundle_id(&mut self, _bundle_id: &str) -> Result<(), PasteboardError> {
-            Err(PasteboardError::Unsupported)
+            activate_application(_bundle_id)
         }
+    }
+
+    pub fn frontmost_application() -> Result<Option<super::ForegroundApplication>, PasteboardError>
+    {
+        Err(PasteboardError::Unsupported)
+    }
+
+    pub fn activate_application(_bundle_id: &str) -> Result<(), PasteboardError> {
+        Err(PasteboardError::Unsupported)
     }
 }
 
