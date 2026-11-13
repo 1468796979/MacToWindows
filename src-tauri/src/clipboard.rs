@@ -572,7 +572,12 @@ fn show_window(app: &AppHandle) {
     let handle = app.clone();
     let closure_handle = handle.clone();
     let _ = handle.run_on_main_thread(move || {
-        let _ = closure_handle.show();
+        // Keep the settings window out of the clipboard flow. The clipboard
+        // service remains alive in its worker thread; only its own window is
+        // shown for the duration of the interaction.
+        if let Some(main_window) = closure_handle.get_webview_window("main") {
+            let _ = main_window.hide();
+        }
         if let Some(window) = closure_handle.get_webview_window("clipboard") {
             let _ = window.show();
             let _ = window.center();
@@ -588,7 +593,6 @@ fn hide_window(app: &AppHandle) {
         if let Some(window) = closure_handle.get_webview_window("clipboard") {
             let _ = window.hide();
         }
-        let _ = closure_handle.hide();
     });
 }
 
