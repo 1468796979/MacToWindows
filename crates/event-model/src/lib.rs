@@ -211,6 +211,7 @@ pub enum SystemShortcut {
     HardRefresh,
     SwitchInputSource,
     TogglePinyinEnglish,
+    ShowClipboard,
 }
 
 /// Returns the default Windows physical-key semantic conversion for modifiers.
@@ -302,6 +303,7 @@ mod tests {
         for shortcut in [
             SystemShortcut::SwitchInputSource,
             SystemShortcut::TogglePinyinEnglish,
+            SystemShortcut::ShowClipboard,
         ] {
             let encoded = serde_json::to_string(&OutputEvent::SystemShortcut(shortcut)).unwrap();
             let decoded: OutputEvent = serde_json::from_str(&encoded).unwrap();

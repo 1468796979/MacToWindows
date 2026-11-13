@@ -5,11 +5,9 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-mod input_source;
 mod clipboard;
-pub use clipboard::{
-    ForegroundApplication, PasteboardChange, PasteboardError, PasteboardService,
-};
+mod input_source;
+pub use clipboard::{ForegroundApplication, PasteboardChange, PasteboardError, PasteboardService};
 pub use input_source::{
     InputSourceCommand, InputSourceError, InputSourceService, InputSourceSnapshot,
 };
@@ -835,7 +833,8 @@ pub mod platform {
             | event_model::SystemShortcut::ShowDesktop
             | event_model::SystemShortcut::CloseWindow
             | event_model::SystemShortcut::SwitchInputSource
-            | event_model::SystemShortcut::TogglePinyinEnglish => Err(InjectionError::InvalidEvent),
+            | event_model::SystemShortcut::TogglePinyinEnglish
+            | event_model::SystemShortcut::ShowClipboard => Err(InjectionError::InvalidEvent),
         }
     }
 

@@ -40,6 +40,48 @@ pub enum RuntimeError {
     Injection(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardHotkeyAction {
+    Show,
+    Suppress,
+}
+
+#[derive(Debug, Default)]
+pub struct ClipboardHotkeyLatch {
+    active: bool,
+}
+
+impl ClipboardHotkeyLatch {
+    pub fn handle(&mut self, event: &NormalizedEvent) -> Option<ClipboardHotkeyAction> {
+        if event.source != event_model::DeviceSource::Keyboard
+            || event.code != event_model::PhysicalCode::key(9)
+            || !matches!(event.origin, event_model::EventOrigin::Hardware)
+        {
+            return None;
+        }
+        match event.phase {
+            event_model::EventPhase::Down
+                if event
+                    .modifiers
+                    .contains(event_model::ModifierSet::LEFT_OPTION) =>
+            {
+                if self.active {
+                    Some(ClipboardHotkeyAction::Suppress)
+                } else {
+                    self.active = true;
+                    Some(ClipboardHotkeyAction::Show)
+                }
+            }
+            event_model::EventPhase::Repeat if self.active => Some(ClipboardHotkeyAction::Suppress),
+            event_model::EventPhase::Up if self.active => {
+                self.active = false;
+                Some(ClipboardHotkeyAction::Suppress)
+            }
+            _ => None,
+        }
+    }
+}
+
 pub struct RuntimeController {
     engine: RuleEngine,
     adapter: SafeAdapter,
@@ -912,6 +954,47 @@ mod tests {
         let config = AppConfig::default();
         let state = AppState::from_config(config).unwrap();
         assert!(!state.event_runtime.is_started());
+    }
+
+    #[test]
+    fn clipboard_hotkey_suppresses_left_option_v_down_up_and_repeat() {
+        let mut latch = ClipboardHotkeyLatch::default();
+        let down = NormalizedEvent {
+            code: PhysicalCode::key(9),
+            phase: EventPhase::Down,
+            modifiers: ModifierSet::LEFT_OPTION,
+            ..key()
+        };
+        let repeat = NormalizedEvent {
+            phase: EventPhase::Repeat,
+            ..down.clone()
+        };
+        let up = NormalizedEvent {
+            phase: EventPhase::Up,
+            ..down.clone()
+        };
+        assert_eq!(latch.handle(&down), Some(ClipboardHotkeyAction::Show));
+        assert_eq!(latch.handle(&repeat), Some(ClipboardHotkeyAction::Suppress));
+        assert_eq!(latch.handle(&up), Some(ClipboardHotkeyAction::Suppress));
+    }
+
+    #[test]
+    fn clipboard_hotkey_ignores_right_option_v_and_plain_option() {
+        let mut latch = ClipboardHotkeyLatch::default();
+        let right = NormalizedEvent {
+            code: PhysicalCode::key(9),
+            phase: EventPhase::Down,
+            modifiers: ModifierSet::RIGHT_OPTION,
+            ..key()
+        };
+        let plain = NormalizedEvent {
+            code: PhysicalCode::key(9),
+            phase: EventPhase::Down,
+            modifiers: ModifierSet::NONE,
+            ..key()
+        };
+        assert_eq!(latch.handle(&right), None);
+        assert_eq!(latch.handle(&plain), None);
     }
 
     #[cfg(target_os = "macos")]

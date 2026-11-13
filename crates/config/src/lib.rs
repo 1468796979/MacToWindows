@@ -371,6 +371,7 @@ fn parse_system_shortcut(value: &str) -> Option<SystemShortcut> {
         "hard_refresh" => SystemShortcut::HardRefresh,
         "switch_input_source" => SystemShortcut::SwitchInputSource,
         "toggle_pinyin_english" => SystemShortcut::TogglePinyinEnglish,
+        "show_clipboard" => SystemShortcut::ShowClipboard,
         _ => return None,
     })
 }
@@ -787,6 +788,30 @@ mod tests {
                 rule.action,
                 Action::Replace(ref outputs)
                     if outputs.contains(&OutputEvent::SystemShortcut(SystemShortcut::SwitchInputSource))
+            )
+        }));
+    }
+
+    #[test]
+    fn parses_show_clipboard_shortcut() {
+        let mut config = default_config();
+        config.active_profile = "custom".into();
+        config
+            .profiles
+            .get_mut("custom")
+            .unwrap()
+            .keyboard_rules
+            .push(Rule {
+                trigger: "chord:left_option+key:9".into(),
+                action: "shortcut:show_clipboard".into(),
+                ..Rule::default()
+            });
+        let compiled = config.compile_active_profile().unwrap();
+        assert!(compiled.rules().iter().any(|rule| {
+            matches!(
+                rule.action,
+                Action::Replace(ref outputs)
+                    if outputs.contains(&OutputEvent::SystemShortcut(SystemShortcut::ShowClipboard))
             )
         }));
     }
