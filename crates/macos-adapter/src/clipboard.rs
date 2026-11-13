@@ -164,7 +164,10 @@ mod platform {
             let Some(application) = applications.firstObject() else {
                 return Err(PasteboardError::ApplicationUnavailable);
             };
-            if application.activateWithOptions(NSApplicationActivationOptions::ActivateAllWindows) {
+            #[allow(deprecated)]
+            let options = NSApplicationActivationOptions::ActivateAllWindows
+                | NSApplicationActivationOptions::ActivateIgnoringOtherApps;
+            if application.activateWithOptions(options) {
                 Ok(())
             } else {
                 Err(PasteboardError::ApplicationUnavailable)

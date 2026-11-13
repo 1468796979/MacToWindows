@@ -289,8 +289,14 @@ fn worker_loop(
         "clipboard-updated",
     );
 
+    let poll_interval = Duration::from_millis(100);
+    let command_wakeup = Duration::from_millis(20);
+    let mut next_poll = Instant::now();
     loop {
-        match receiver.recv_timeout(Duration::from_millis(100)) {
+        let wait = next_poll
+            .saturating_duration_since(Instant::now())
+            .min(command_wakeup);
+        match receiver.recv_timeout(wait) {
             Ok(command) => {
                 let should_stop = handle_command(
                     &app,
@@ -311,6 +317,10 @@ fn worker_loop(
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
 
+        if Instant::now() < next_poll {
+            continue;
+        }
+        next_poll = Instant::now() + poll_interval;
         if let Some(core) = core.as_mut() {
             match core.poll_once() {
                 Ok(Some(IngestOutcome::Added(_) | IngestOutcome::Moved(_))) => {
@@ -496,8 +506,7 @@ fn select_and_paste(
     let selection = core.select(id)?;
     core.write_text(&selection.text)
         .map_err(|error| format!("写入系统剪贴板失败：{error}"))?;
-    hide_window(app);
-    thread::sleep(Duration::from_millis(15));
+    hide_window_and_wait(app);
     if let Err(error) = core.activate_application(&selection.target_bundle_id) {
         let message = format!("恢复前台应用失败：{error}");
         *last_error = Some(message.clone());
@@ -510,6 +519,7 @@ fn select_and_paste(
         show_window(app);
         return Err(error);
     }
+    thread::sleep(Duration::from_millis(10));
     let outputs = [
         event_model::OutputEvent::Key {
             code: event_model::PhysicalCode::key(9),
@@ -594,6 +604,23 @@ fn hide_window(app: &AppHandle) {
             let _ = window.hide();
         }
     });
+}
+
+fn hide_window_and_wait(app: &AppHandle) {
+    let handle = app.clone();
+    let closure_handle = handle.clone();
+    let (done_tx, done_rx) = mpsc::sync_channel(1);
+    if handle
+        .run_on_main_thread(move || {
+            if let Some(window) = closure_handle.get_webview_window("clipboard") {
+                let _ = window.hide();
+            }
+            let _ = done_tx.send(());
+        })
+        .is_ok()
+    {
+        let _ = done_rx.recv_timeout(Duration::from_millis(100));
+    }
 }
 
 #[cfg(test)]

@@ -659,8 +659,26 @@ pub fn run() {
                 .build(app)?;
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running MacToWindows");
+        .build(tauri::generate_context!())
+        .expect("error while building MacToWindows")
+        .run(|app, event| {
+            #[cfg(target_os = "macos")]
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows: false,
+                ..
+            } = event
+            {
+                // The clipboard panel intentionally hides the settings
+                // window while it is active. A Dock click must still reopen
+                // the settings window when the app has no visible windows.
+                if let Some(window) = app.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            let _ = (app, event);
+        });
 }
 
 pub mod commands {
