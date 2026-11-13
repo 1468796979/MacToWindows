@@ -22,5 +22,9 @@
     return (current + delta + count) % count;
   }
 
-  return { normalizeSnapshot, previewText, moveSelection };
+  function resetSelection() {
+    return -1;
+  }
+
+  return { normalizeSnapshot, previewText, moveSelection, resetSelection };
 });

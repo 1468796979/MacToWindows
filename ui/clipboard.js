@@ -35,7 +35,11 @@ function render() {
     item.className = "clipboard-item" + (index === state.selectedIndex ? " selected" : "");
     item.setAttribute("role", "option");
     item.setAttribute("aria-selected", String(index === state.selectedIndex));
-    item.addEventListener("click", () => selectEntry(entry.id));
+    item.addEventListener("click", () => {
+      state.selectedIndex = index;
+      render();
+      selectEntry(entry.id);
+    });
 
     const content = document.createElement("div");
     const text = document.createElement("div");
@@ -103,7 +107,11 @@ document.addEventListener("click", (event) => {
 });
 
 if (listen) {
-  Promise.resolve(listen("clipboard-show", (event) => { applySnapshot(event.payload); window.focus(); }))
+  Promise.resolve(listen("clipboard-show", (event) => {
+    state.selectedIndex = core.resetSelection();
+    applySnapshot(event.payload);
+    window.focus();
+  }))
     .catch((error) => { state.error = error?.message || String(error); render(); });
   Promise.resolve(listen("clipboard-updated", (event) => applySnapshot(event.payload)))
     .catch((error) => { state.error = error?.message || String(error); render(); });
