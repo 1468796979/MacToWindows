@@ -51,7 +51,9 @@ impl PasteboardService {
     }
 
     pub fn start() -> Result<Self, PasteboardError> {
-        Ok(Self::with_backend(Box::new(platform::PlatformPasteboard::new()?)))
+        Ok(Self::with_backend(Box::new(
+            platform::PlatformPasteboard::new()?,
+        )))
     }
 
     pub fn poll(&mut self) -> Result<Option<PasteboardChange>, PasteboardError> {
@@ -99,8 +101,8 @@ impl PasteboardService {
 mod platform {
     use super::{PasteboardBackend, PasteboardError};
     use objc2_app_kit::{
-        NSApplicationActivationOptions, NSRunningApplication, NSPasteboard, NSPasteboardType,
-        NSWorkspace, NSPasteboardTypeString,
+        NSApplicationActivationOptions, NSPasteboard, NSPasteboardType, NSPasteboardTypeString,
+        NSRunningApplication, NSWorkspace,
     };
     use objc2_foundation::NSString;
 
@@ -219,7 +221,9 @@ mod tests {
             change_count: 1,
             text: Some("alpha".into()),
         }));
-        let backend = MockBackend { state: Arc::clone(&state) };
+        let backend = MockBackend {
+            state: Arc::clone(&state),
+        };
         let mut service = PasteboardService::with_backend(Box::new(backend));
         assert!(service.poll().unwrap().is_none());
         {
@@ -287,6 +291,5 @@ mod tests {
         fn activate_bundle_id(&mut self, _bundle_id: &str) -> Result<(), PasteboardError> {
             Ok(())
         }
-
     }
 }

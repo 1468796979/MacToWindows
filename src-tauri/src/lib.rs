@@ -55,6 +55,10 @@ pub struct ClipboardHotkeyLatch {
 }
 
 impl ClipboardHotkeyLatch {
+    pub fn reset(&mut self) {
+        self.active = false;
+    }
+
     pub fn handle(&mut self, event: &NormalizedEvent) -> Option<ClipboardHotkeyAction> {
         if event.source != event_model::DeviceSource::Keyboard
             || event.code != event_model::PhysicalCode::key(9)
@@ -171,7 +175,13 @@ impl EventRuntime {
                         if let Some(action) = clipboard_hotkey.handle(&event) {
                             if matches!(action, ClipboardHotkeyAction::Show) {
                                 if let Some(manager) = &clipboard {
-                                    let _ = manager.try_show();
+                                    if !manager.try_show() {
+                                        clipboard_hotkey.reset();
+                                        return macos_adapter::EventTapAction::Pass;
+                                    }
+                                } else {
+                                    clipboard_hotkey.reset();
+                                    return macos_adapter::EventTapAction::Pass;
                                 }
                             }
                             return macos_adapter::EventTapAction::Suppress;
