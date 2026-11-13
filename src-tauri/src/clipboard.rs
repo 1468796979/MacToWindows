@@ -20,20 +20,26 @@ pub struct ClipboardManagerCore {
     history: ClipboardHistory,
     pasteboard: PasteboardService,
     target_bundle_id: Option<String>,
+    own_bundle_id: Option<String>,
 }
 
 impl ClipboardManagerCore {
-    fn new(history: ClipboardHistory, pasteboard: PasteboardService) -> Self {
+    fn new_with_own_bundle(
+        history: ClipboardHistory,
+        pasteboard: PasteboardService,
+        own_bundle_id: Option<String>,
+    ) -> Self {
         Self {
             history,
             pasteboard,
             target_bundle_id: None,
+            own_bundle_id,
         }
     }
 
     #[cfg(test)]
     pub fn new_for_test(pasteboard: PasteboardService) -> Self {
-        Self::new(ClipboardHistory::default(), pasteboard)
+        Self::new_with_own_bundle(ClipboardHistory::default(), pasteboard, None)
     }
 
     #[cfg(test)]
@@ -58,6 +64,9 @@ impl ClipboardManagerCore {
             .pasteboard
             .frontmost_application()?
             .ok_or(PasteboardError::ApplicationUnavailable)?;
+        if self.own_bundle_id.as_deref() == Some(target.bundle_id.as_str()) {
+            return Err(PasteboardError::ApplicationUnavailable);
+        }
         self.target_bundle_id = Some(target.bundle_id.clone());
         Ok(target)
     }
@@ -266,9 +275,10 @@ fn worker_loop(
     if pasteboard.is_none() && last_error.is_none() {
         last_error = Some("macOS 剪贴板服务不可用".into());
     }
-    let mut core = pasteboard
-        .take()
-        .map(|service| ClipboardManagerCore::new(history.clone(), service));
+    let own_bundle_id = app.config().identifier.clone();
+    let mut core = pasteboard.take().map(|service| {
+        ClipboardManagerCore::new_with_own_bundle(history.clone(), service, Some(own_bundle_id))
+    });
     let mut panel_open = false;
     publish_snapshot(
         &app,
@@ -487,7 +497,7 @@ fn select_and_paste(
     core.write_text(&selection.text)
         .map_err(|error| format!("写入系统剪贴板失败：{error}"))?;
     hide_window(app);
-    thread::sleep(Duration::from_millis(60));
+    thread::sleep(Duration::from_millis(15));
     if let Err(error) = core.activate_application(&selection.target_bundle_id) {
         let message = format!("恢复前台应用失败：{error}");
         *last_error = Some(message.clone());
@@ -583,7 +593,7 @@ fn hide_window(app: &AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::{dismiss_panel, ClipboardManagerCore, ClipboardSelection};
-    use clipboard_core::IngestOutcome;
+    use clipboard_core::{ClipboardHistory, IngestOutcome};
     use macos_adapter::{PasteboardBackend, PasteboardError, PasteboardService};
     use std::sync::{Arc, Mutex};
 
@@ -674,6 +684,25 @@ mod tests {
 
         assert!(core.capture_target().is_err());
         assert!(core.select(id).is_err());
+    }
+
+    #[test]
+    fn own_application_is_never_captured_as_paste_target() {
+        let state = Arc::new(Mutex::new(MockState {
+            frontmost: Some("com.mactowindows.desktop".into()),
+            ..Default::default()
+        }));
+        let service = PasteboardService::with_backend(Box::new(MockBackend { state }));
+        let mut core = ClipboardManagerCore::new_with_own_bundle(
+            ClipboardHistory::default(),
+            service,
+            Some("com.mactowindows.desktop".into()),
+        );
+
+        assert_eq!(
+            core.capture_target().unwrap_err(),
+            PasteboardError::ApplicationUnavailable
+        );
     }
 
     #[test]
