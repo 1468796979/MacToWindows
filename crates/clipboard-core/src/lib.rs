@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -89,6 +90,24 @@ impl ClipboardHistory {
     pub fn clear(&mut self) {
         self.entries.clear();
     }
+
+    fn sanitize(mut self) -> Self {
+        let mut ids = HashSet::new();
+        let mut texts = HashSet::new();
+        self.entries.retain(|entry| {
+            entry.id > 0
+                && !entry.text.is_empty()
+                && entry.text.chars().count() <= MAX_CHARS
+                && ids.insert(entry.id)
+                && texts.insert(entry.text.clone())
+        });
+        self.entries.truncate(MAX_ENTRIES);
+        let max_id = self.entries.iter().map(|entry| entry.id).max().unwrap_or(0);
+        if self.next_id == 0 || self.next_id <= max_id {
+            self.next_id = max_id.saturating_add(1);
+        }
+        self
+    }
 }
 
 #[derive(Debug)]
@@ -153,7 +172,7 @@ impl ClipboardStore {
         };
         match serde_json::from_str::<ClipboardHistory>(&contents) {
             Ok(history) if history.schema_version == SCHEMA_VERSION => {
-                Ok(LoadOutcome::Loaded(history))
+                Ok(LoadOutcome::Loaded(history.sanitize()))
             }
             Ok(history) => Err(StoreError::UnsupportedSchema(history.schema_version)),
             Err(_) => {
@@ -307,5 +326,72 @@ mod tests {
         assert_eq!(loaded.entries(), history.entries());
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(path.with_extension("toml.bak"));
+    }
+
+    #[test]
+    fn load_sanitizes_semantically_invalid_history() {
+        let path = temp_path("sanitize");
+        let _ = fs::remove_file(&path);
+        let mut entries = Vec::new();
+        entries.push(serde_json::json!({
+            "id": 0,
+            "text": "zero-id",
+            "copied_at_unix_ms": 1
+        }));
+        entries.push(serde_json::json!({
+            "id": 1,
+            "text": "",
+            "copied_at_unix_ms": 2
+        }));
+        entries.push(serde_json::json!({
+            "id": 2,
+            "text": "duplicate",
+            "copied_at_unix_ms": 3
+        }));
+        entries.push(serde_json::json!({
+            "id": 3,
+            "text": "duplicate",
+            "copied_at_unix_ms": 4
+        }));
+        entries.push(serde_json::json!({
+            "id": 4,
+            "text": "x".repeat(MAX_CHARS + 1),
+            "copied_at_unix_ms": 5
+        }));
+        for id in 5..=(MAX_ENTRIES as u64 + 10) {
+            entries.push(serde_json::json!({
+                "id": id,
+                "text": format!("item-{id}"),
+                "copied_at_unix_ms": id
+            }));
+        }
+        fs::write(
+            &path,
+            serde_json::json!({
+                "schema_version": 1,
+                "next_id": 1,
+                "entries": entries,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let history = ClipboardStore::load_or_recover(&path).unwrap().history();
+        assert!(history.entries().len() <= MAX_ENTRIES);
+        assert!(history.entries().iter().all(|entry| {
+            entry.id > 0 && !entry.text.is_empty() && entry.text.chars().count() <= MAX_CHARS
+        }));
+        assert!(history
+            .entries()
+            .windows(2)
+            .all(|pair| pair[0].id != pair[1].id && pair[0].text != pair[1].text));
+        let max_id = history
+            .entries()
+            .iter()
+            .map(|entry| entry.id)
+            .max()
+            .unwrap_or(0);
+        assert!(history.next_id > max_id);
+        let _ = fs::remove_file(&path);
     }
 }

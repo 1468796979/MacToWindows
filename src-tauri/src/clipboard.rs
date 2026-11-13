@@ -53,6 +53,7 @@ impl ClipboardManagerCore {
     }
 
     pub fn capture_target(&mut self) -> Result<ForegroundApplication, PasteboardError> {
+        self.target_bundle_id = None;
         let target = self
             .pasteboard
             .frontmost_application()?
@@ -414,18 +415,41 @@ fn handle_command(
             let _ = reply.send(result);
         }
         WorkerCommand::Close { reply } => {
-            *panel_open = false;
-            hide_window(app);
             let result = if let Some(core) = core.as_mut() {
                 if let Some(target) = core.target_bundle_id.clone() {
-                    core.activate_application(&target)
-                        .map_err(|error| format!("恢复前台应用失败：{error}"))
+                    match core.activate_application(&target) {
+                        Ok(()) => {
+                            core.target_bundle_id = None;
+                            *panel_open = false;
+                            hide_window(app);
+                            Ok(())
+                        }
+                        Err(error) => {
+                            let message = format!("恢复前台应用失败：{error}");
+                            *last_error = Some(message.clone());
+                            *panel_open = true;
+                            show_window(app);
+                            Err(message)
+                        }
+                    }
                 } else {
+                    *panel_open = false;
+                    hide_window(app);
                     Ok(())
                 }
             } else {
+                *panel_open = false;
+                hide_window(app);
                 Ok(())
             };
+            publish_snapshot(
+                app,
+                snapshot,
+                history,
+                *panel_open,
+                last_error.as_deref(),
+                "clipboard-updated",
+            );
             let _ = reply.send(result);
         }
     }
@@ -593,6 +617,25 @@ mod tests {
         }));
         let core = ClipboardManagerCore::new_for_test(service);
         assert!(core.select(99).is_err());
+    }
+
+    #[test]
+    fn failed_target_capture_invalidates_previous_target() {
+        let state = Arc::new(Mutex::new(MockState {
+            frontmost: Some("com.example.editor".into()),
+            ..Default::default()
+        }));
+        let service = PasteboardService::with_backend(Box::new(MockBackend {
+            state: Arc::clone(&state),
+        }));
+        let mut core = ClipboardManagerCore::new_for_test(service);
+        core.ingest_for_test("alpha");
+        let id = core.history().entries()[0].id;
+        assert!(core.capture_target().is_ok());
+        state.lock().unwrap().frontmost = None;
+
+        assert!(core.capture_target().is_err());
+        assert!(core.select(id).is_err());
     }
 
     impl PasteboardBackend for MockBackend {

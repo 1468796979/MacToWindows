@@ -87,6 +87,9 @@ document.addEventListener("keydown", (event) => {
     event.preventDefault(); selectEntry(state.entries[state.selectedIndex].id);
   }
 });
+document.addEventListener("click", (event) => {
+  if (event.target === document.body) closePanel();
+});
 
 if (listen) {
   listen("clipboard-show", (event) => { applySnapshot(event.payload); window.focus(); });
