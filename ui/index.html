@@ -60,6 +60,25 @@
 
       <footer><span>隐私：默认不记录字符、文本内容或完整按键序列。</span><span>配置保存在本机。</span></footer>
     </main>
+    <div id="rule-dialog" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="rule-dialog-title">
+      <div class="modal-backdrop" data-close-rule-dialog></div>
+      <section class="modal-panel">
+        <div class="section-heading compact">
+          <div><p class="eyebrow">自定义映射</p><h2 id="rule-dialog-title">新增规则</h2></div>
+          <button id="rule-dialog-close" class="text-button" type="button" aria-label="关闭">关闭</button>
+        </div>
+        <form id="rule-form">
+          <label class="form-field">规则名称<input id="rule-name" name="name" placeholder="例如：Ctrl + B" /></label>
+          <label class="form-field">触发键<input id="rule-trigger" name="trigger" required placeholder="例如：chord:left_control+key:11" /></label>
+          <div class="form-actions"><button id="record-trigger" class="secondary" type="button">录制按键</button><span id="recording-state" class="muted" aria-live="polite"></span></div>
+          <label class="form-field">动作<input id="rule-action" name="action" required placeholder="例如：command:key:11 或 shortcut:hard_refresh" /></label>
+          <p class="muted form-hint">可用格式：key:keycode、chord:修饰键+key:keycode、command:keycode、shortcut:动作名、pass、suppress。</p>
+          <p id="rule-feedback" class="form-feedback" aria-live="polite"></p>
+          <div class="modal-actions"><button id="rule-cancel" class="secondary" type="button">取消</button><button class="primary" type="submit">添加规则</button></div>
+        </form>
+      </section>
+    </div>
+    <script src="./rule-editor-core.js"></script>
     <script src="./app.js"></script>
   </body>
 </html>

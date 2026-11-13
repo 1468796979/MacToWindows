@@ -453,6 +453,24 @@ fn is_emergency_hotkey(event: &NormalizedEvent) -> bool {
         )
 }
 
+fn append_keyboard_rule(
+    config: &mut AppConfig,
+    rule: mac_to_windows_config::Rule,
+) -> Result<(), String> {
+    let mut candidate = config.clone();
+    let profile_name = candidate.active_profile.clone();
+    let profile = candidate
+        .profiles
+        .get_mut(&profile_name)
+        .ok_or_else(|| format!("active profile does not exist: {profile_name}"))?;
+    profile.keyboard_rules.push(rule);
+    candidate
+        .compile_active_profile()
+        .map_err(|error| error.to_string())?;
+    *config = candidate;
+    Ok(())
+}
+
 pub fn run() {
     let config = AppConfig::default();
     let app_state = AppState::from_config(config).unwrap_or_else(|_| {
@@ -466,6 +484,7 @@ pub fn run() {
             commands::set_profile,
             commands::release_all,
             commands::emergency_disable,
+            commands::add_rule,
             commands::export_config,
             commands::import_config,
             commands::reload_permissions,
@@ -599,6 +618,39 @@ pub mod commands {
             .map_err(|_| "runtime lock poisoned".to_owned())?;
         let outputs = runtime
             .apply(RuntimeCommand::Disable)
+            .map_err(|error| format!("{error:?}"))?;
+        flush_outputs(&runtime, &outputs).map_err(|error| format!("{error:?}"))?;
+        Ok(())
+    }
+
+    #[tauri::command]
+    pub fn add_rule(
+        state: tauri::State<'_, AppState>,
+        trigger: String,
+        action: String,
+        enabled: bool,
+        priority: i32,
+    ) -> Result<(), String> {
+        let mut runtime = state
+            .runtime
+            .lock()
+            .map_err(|_| "runtime lock poisoned".to_owned())?;
+        let mut config = runtime
+            .config()
+            .cloned()
+            .ok_or_else(|| "运行时没有可编辑的配置".to_owned())?;
+        append_keyboard_rule(
+            &mut config,
+            mac_to_windows_config::Rule {
+                trigger,
+                action,
+                enabled,
+                priority,
+                ..mac_to_windows_config::Rule::default()
+            },
+        )?;
+        let outputs = runtime
+            .apply(RuntimeCommand::ReplaceConfig(config))
             .map_err(|error| format!("{error:?}"))?;
         flush_outputs(&runtime, &outputs).map_err(|error| format!("{error:?}"))?;
         Ok(())
@@ -832,6 +884,27 @@ mod tests {
             .unwrap_err();
         assert!(matches!(error, RuntimeError::Configuration(_)));
         assert_eq!(controller.profile(), "windows_physical");
+    }
+
+    #[test]
+    fn adding_a_custom_rule_updates_the_active_profile() {
+        let mut config = AppConfig::default();
+        append_keyboard_rule(
+            &mut config,
+            mac_to_windows_config::Rule {
+                trigger: "chord:left_control+key:8".into(),
+                action: "command:key:8".into(),
+                ..mac_to_windows_config::Rule::default()
+            },
+        )
+        .unwrap();
+
+        let profile = config.profiles.get(&config.active_profile).unwrap();
+        assert!(profile
+            .keyboard_rules
+            .iter()
+            .any(|rule| rule.trigger == "chord:left_control+key:8"));
+        assert!(config.compile_active_profile().is_ok());
     }
 
     #[test]

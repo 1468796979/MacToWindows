@@ -15,6 +15,7 @@ const state = {
   , permission: "Unknown", listenAccess: false, postAccess: false, permissionMessage: ""
 };
 const $ = (id) => document.getElementById(id);
+const ruleEditor = window.ruleEditorCore;
 const backendInvoke = (command, args) => {
   const invoke = window.__TAURI__?.core?.invoke || window.__TAURI_INTERNALS__?.invoke;
   return invoke ? invoke(command, args) : Promise.reject(new Error("Tauri bridge unavailable"));
@@ -103,7 +104,72 @@ $("panic-test").addEventListener("click", async () => {
 $("refresh-diagnostics").addEventListener("click", async () => {
   try { await syncRuntime(); } catch (_) { state.diagnostics.seen += 1; state.diagnostics.latency = "本地预览"; renderDiagnostics(); }
 });
-$("add-rule").addEventListener("click", () => alert("录制按键后即可创建一条自定义规则。"));
+let recordingRuleTrigger = false;
+function closeRuleDialog() {
+  recordingRuleTrigger = false;
+  $("recording-state").textContent = "";
+  $("rule-dialog").hidden = true;
+}
+function openRuleDialog() {
+  $("rule-form").reset();
+  $("rule-feedback").textContent = "";
+  $("recording-state").textContent = "";
+  $("rule-dialog").hidden = false;
+  $("rule-name").focus();
+}
+$("add-rule").addEventListener("click", openRuleDialog);
+$("rule-dialog-close").addEventListener("click", closeRuleDialog);
+$("rule-cancel").addEventListener("click", closeRuleDialog);
+document.querySelector("[data-close-rule-dialog]").addEventListener("click", closeRuleDialog);
+$("record-trigger").addEventListener("click", () => {
+  recordingRuleTrigger = true;
+  $("recording-state").textContent = "请按下触发键组合…（Esc 取消）";
+  $("rule-trigger").focus();
+});
+window.addEventListener("keydown", (event) => {
+  if (!recordingRuleTrigger) {
+    if (event.key === "Escape" && !$("rule-dialog").hidden) closeRuleDialog();
+    return;
+  }
+  event.preventDefault();
+  if (event.key === "Escape") {
+    recordingRuleTrigger = false;
+    $("recording-state").textContent = "已取消录制";
+    return;
+  }
+  if (["ControlLeft", "ControlRight", "AltLeft", "AltRight", "ShiftLeft", "ShiftRight", "MetaLeft", "MetaRight"].includes(event.code)) return;
+  try {
+    $("rule-trigger").value = ruleEditor.recordedTrigger(event);
+    recordingRuleTrigger = false;
+    $("recording-state").textContent = "已录制";
+  } catch (error) {
+    recordingRuleTrigger = false;
+    $("recording-state").textContent = error?.message || String(error);
+  }
+});
+$("rule-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  $("rule-feedback").textContent = "";
+  let rule;
+  try {
+    rule = ruleEditor.normalizeRule({
+      name: $("rule-name").value,
+      trigger: $("rule-trigger").value,
+      action: $("rule-action").value,
+      enabled: true,
+    });
+    const invoke = window.__TAURI__?.core?.invoke || window.__TAURI_INTERNALS__?.invoke;
+    if (invoke) {
+      await backendInvoke("add_rule", { trigger: rule.trigger, action: rule.action, enabled: true, priority: 100 });
+    }
+    state.rules.push({ name: rule.name, detail: "自定义规则", key: rule.trigger, enabled: rule.enabled });
+    renderRules();
+    closeRuleDialog();
+    $("status-copy").textContent = "规则已添加并立即生效；可通过导出配置保存。";
+  } catch (error) {
+    $("rule-feedback").textContent = error?.message || String(error);
+  }
+});
 $("export-config").addEventListener("click", async () => {
   let contents;
   try { contents = await backendInvoke("export_config"); }
