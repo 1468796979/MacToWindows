@@ -31,7 +31,7 @@
         <article class="card profile-card">
           <div class="card-heading"><span>当前预设</span><span class="pill accent-pill">推荐</span></div>
           <select id="profile-select"><option value="windows_physical">Windows 物理键位</option><option value="shortcut">快捷键习惯</option><option value="custom">自定义</option></select>
-          <p class="muted">左 Option → Windows，左 Command → Alt，Ctrl+A/C/V/X/Z、Ctrl+F5 和 Ctrl+Shift 使用 Windows 习惯。</p>
+          <p class="muted">左 Option → Windows，左 Command → Alt，Ctrl+A/C/V/X/Z、Ctrl+F5、Ctrl+Shift 和 Win+V 使用 Windows 习惯。</p>
           <p class="muted input-source-note">首次使用请在“键盘 → 文本输入 → 编辑”中关闭“使用 Caps Lock 键切换到和切换自 ABC”；Caps Lock 将保留为大小写锁定，Apple Pinyin 的单独 Shift 负责中英文切换。</p>
         </article>
       </section>
@@ -54,6 +54,7 @@
         <article class="card">
           <div class="section-heading compact"><div><p class="eyebrow">诊断</p><h2>运行健康</h2></div><span id="latency" class="metric">—</span></div>
           <div class="metrics"><div><span>已处理事件</span><strong id="events-seen">0</strong></div><div><span>注入失败</span><strong id="injection-failures">0</strong></div><div><span>Event Tap</span><strong id="tap-state">未启动</strong></div><div><span>输入源</span><strong id="input-source">未知</strong></div></div>
+          <p id="clipboard-status" class="muted">剪贴板服务：未知</p>
           <button class="text-button" id="refresh-diagnostics">刷新诊断</button>
         </article>
       </section>

@@ -7,11 +7,12 @@ const state = {
     { name: "Ctrl + A / C / V / X / Z", detail: "常用编辑快捷键", key: "⌃ A", enabled: true },
     { name: "Ctrl + F5", detail: "网页强制刷新", key: "⌃ F5", enabled: true },
     { name: "Ctrl + Shift", detail: "切换输入法", key: "⌃ ⇧", enabled: true },
+    { name: "Win + V", detail: "打开剪贴板历史", key: "⌥ V", enabled: true },
     { name: "Caps Lock", detail: "大小写锁定（原生）", key: "⇪", enabled: true },
     { name: "Shift（Apple Pinyin）", detail: "中英文输入切换", key: "⇧", enabled: true },
     { name: "自然滚动", detail: "垂直滚轮方向", key: "↕", enabled: false }
   ],
-  diagnostics: { seen: 0, failures: 0, tap: "未启动", inputSource: "未知", latency: "—" }
+  diagnostics: { seen: 0, failures: 0, tap: "未启动", inputSource: "未知", clipboard: "未知", latency: "—" }
   , permission: "Unknown", listenAccess: false, postAccess: false, permissionMessage: ""
 };
 const $ = (id) => document.getElementById(id);
@@ -53,6 +54,7 @@ function renderStatus() {
   $("permission-feedback").textContent = state.permissionMessage;
   $("tap-state").textContent = state.diagnostics.latency;
   $("input-source").textContent = state.diagnostics.inputSource;
+  if ($("clipboard-status")) $("clipboard-status").textContent = "剪贴板服务：" + state.diagnostics.clipboard;
 }
 function renderDiagnostics() {
   $("events-seen").textContent = state.diagnostics.seen;
@@ -192,6 +194,7 @@ async function syncRuntime() {
   state.diagnostics.failures = view.injection_failures;
   state.diagnostics.latency = view.tap_state;
   state.diagnostics.inputSource = view.input_source || "未知";
+  state.diagnostics.clipboard = view.clipboard_status || "正常";
   state.permission = view.permission || "Unknown";
   state.listenAccess = Boolean(view.listen_access);
   state.postAccess = Boolean(view.post_access);
