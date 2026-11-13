@@ -1,0 +1,3 @@
+[workspace]
+members = ["crates/event-model", "crates/rule-engine", "crates/diagnostics", "crates/macos-adapter", "crates/config", "src-tauri"]
+resolver = "2"

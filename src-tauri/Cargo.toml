@@ -1,0 +1,18 @@
+[package]
+name = "mac-to-windows"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+event-model = { path = "../crates/event-model" }
+rule-engine = { path = "../crates/rule-engine" }
+diagnostics = { path = "../crates/diagnostics" }
+macos-adapter = { path = "../crates/macos-adapter" }
+mac-to-windows-config = { path = "../crates/config" }
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2", features = ["tray-icon"] }
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+

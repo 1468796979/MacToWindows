@@ -1,0 +1,32 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "MacToWindows",
+  "version": "0.1.0",
+  "identifier": "com.mactowindows.desktop",
+  "build": {
+    "frontendDist": "../ui"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "MacToWindows",
+        "width": 1040,
+        "height": 760,
+        "minWidth": 720,
+        "minHeight": 560,
+        "visible": true,
+        "resizable": true
+      }
+    ],
+    "withGlobalTauri": true
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "resources": ["../ui"],
+    "macOS": {
+      "infoPlist": "Info.plist"
+    }
+  }
+}

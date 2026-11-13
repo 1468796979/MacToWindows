@@ -1,0 +1,65 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MacToWindows</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">MacToWindows</p>
+          <h1>把熟悉的 Windows 键位带回 Mac</h1>
+          <p class="muted">菜单栏常驻 · 本地处理 · 随时恢复原生输入</p>
+        </div>
+        <button id="toggle-mode" class="toggle" aria-pressed="false"><span class="dot"></span><span id="toggle-label">已暂停</span></button>
+      </header>
+
+      <section class="status-grid">
+        <article class="card status-card">
+          <div class="card-heading"><span>当前状态</span><span id="health-pill" class="pill muted-pill">已暂停</span></div>
+          <strong id="status-title">Windows 模式未启用</strong>
+          <p id="status-copy" class="muted">原生键鼠输入正常透传。启用后会按当前预设处理全局事件。</p>
+          <div class="permission-actions">
+            <button id="permission-button" class="text-button">检查权限</button>
+            <button id="open-settings-button" class="text-button">打开系统设置</button>
+          </div>
+          <p id="permission-feedback" class="muted" aria-live="polite"></p>
+        </article>
+        <article class="card profile-card">
+          <div class="card-heading"><span>当前预设</span><span class="pill accent-pill">推荐</span></div>
+          <select id="profile-select"><option value="windows_physical">Windows 物理键位</option><option value="shortcut">快捷键习惯</option><option value="custom">自定义</option></select>
+          <p class="muted">左 Option → Windows，左 Command → Alt，Ctrl+A/C/V/X/Z、Ctrl+F5 和 Ctrl+Shift 使用 Windows 习惯。</p>
+          <p class="muted input-source-note">首次使用请在“键盘 → 文本输入 → 编辑”中关闭“使用 Caps Lock 键切换到和切换自 ABC”；Caps Lock 将保留为大小写锁定，Apple Pinyin 的单独 Shift 负责中英文切换。</p>
+        </article>
+      </section>
+
+      <section class="card rules-card">
+        <div class="section-heading">
+          <div><p class="eyebrow">映射规则</p><h2>键盘和鼠标</h2></div>
+          <div class="actions"><button id="add-rule" class="secondary">新增规则</button><button id="import-config" class="secondary">导入配置</button><button id="export-config" class="primary">导出配置</button><input id="config-file" type="file" accept=".toml,text/plain" hidden /></div>
+        </div>
+        <label class="search"><span>⌕</span><input id="search" placeholder="搜索触发键、动作或规则名称" /></label>
+        <div id="rules" class="rules"></div>
+      </section>
+
+      <section class="bottom-grid">
+        <article class="card">
+          <div class="section-heading compact"><div><p class="eyebrow">安全开关</p><h2>紧急停用</h2></div><span class="keycap">⌃ ⌥ ⌘ Esc</span></div>
+          <p class="muted">任何时候按下固定组合键，立即停止映射并释放所有逻辑按键。</p>
+          <button class="secondary" id="panic-test">测试紧急停用</button>
+        </article>
+        <article class="card">
+          <div class="section-heading compact"><div><p class="eyebrow">诊断</p><h2>运行健康</h2></div><span id="latency" class="metric">—</span></div>
+          <div class="metrics"><div><span>已处理事件</span><strong id="events-seen">0</strong></div><div><span>注入失败</span><strong id="injection-failures">0</strong></div><div><span>Event Tap</span><strong id="tap-state">未启动</strong></div><div><span>输入源</span><strong id="input-source">未知</strong></div></div>
+          <button class="text-button" id="refresh-diagnostics">刷新诊断</button>
+        </article>
+      </section>
+
+      <footer><span>隐私：默认不记录字符、文本内容或完整按键序列。</span><span>配置保存在本机。</span></footer>
+    </main>
+    <script src="./app.js"></script>
+  </body>
+</html>
