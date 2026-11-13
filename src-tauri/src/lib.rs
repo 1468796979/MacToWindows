@@ -707,12 +707,19 @@ pub mod commands {
             .clipboard()
             .and_then(|manager| manager.snapshot().last_error)
             .unwrap_or_else(|| "正常".into());
+        let tap_state = if state.event_runtime.is_started()
+            && matches!(snapshot.tap_state, TapState::Stopped)
+        {
+            "Running".to_owned()
+        } else {
+            format!("{:?}", snapshot.tap_state)
+        };
         Ok(RuntimeView {
             status: runtime.status().clone(),
             profile: runtime.profile().to_owned(),
             events_seen: snapshot.events_seen,
             injection_failures: snapshot.injection_failures,
-            tap_state: format!("{:?}", snapshot.tap_state),
+            tap_state,
             permission: format!("{:?}", snapshot.permission),
             listen_access,
             post_access,
@@ -796,14 +803,22 @@ pub mod commands {
 
     #[tauri::command]
     pub fn reload_permissions(state: tauri::State<'_, AppState>) -> Result<RuntimeStatus, String> {
-        let mut runtime = state
-            .runtime
-            .lock()
-            .map_err(|_| "runtime lock poisoned".to_owned())?;
-        runtime
-            .apply(RuntimeCommand::ReloadPermissions)
-            .map_err(|error| format!("{error:?}"))?;
-        Ok(runtime.status().clone())
+        let status = {
+            let mut runtime = state
+                .runtime
+                .lock()
+                .map_err(|_| "runtime lock poisoned".to_owned())?;
+            runtime
+                .apply(RuntimeCommand::ReloadPermissions)
+                .map_err(|error| format!("{error:?}"))?;
+            runtime.status().clone()
+        };
+        if !state.event_runtime.is_started() {
+            let _ = state
+                .event_runtime
+                .start(Arc::clone(&state.runtime), state.clipboard());
+        }
+        Ok(status)
     }
 
     #[tauri::command]
