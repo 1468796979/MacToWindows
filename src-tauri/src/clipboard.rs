@@ -824,7 +824,6 @@ fn show_window(app: &AppHandle) {
         }
         if let Some(window) = closure_handle.get_webview_window("clipboard") {
             let _ = window.show();
-            let _ = window.center();
             let _ = window.set_focus();
         }
     });

@@ -7,6 +7,23 @@ const backendInvoke = (command, args) => {
   return invoke ? invoke(command, args) : Promise.reject(new Error("Tauri bridge unavailable"));
 };
 const listen = window.__TAURI__?.event?.listen || window.__TAURI_INTERNALS__?.listen;
+const currentWindow = window.__TAURI__?.window?.getCurrentWindow?.();
+const dragRegion = $("clipboard-drag-region");
+if (dragRegion) {
+  dragRegion.addEventListener("mousedown", (event) => {
+    if (event.button !== 0) return;
+    const target = event.target instanceof Element ? event.target : null;
+    if (target?.closest("button, a, input, select, textarea, [role=button]")) return;
+    event.preventDefault();
+    const dragPromise = currentWindow?.startDragging
+      ? currentWindow.startDragging()
+      : Promise.reject(new Error("Tauri window API unavailable"));
+    dragPromise.catch((error) => {
+      state.error = error?.message || String(error);
+      render();
+    });
+  });
+}
 
 function formatTime(timestamp) {
   if (!timestamp) return "刚刚";

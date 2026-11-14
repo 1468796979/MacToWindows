@@ -655,10 +655,11 @@ pub fn run() {
             }
             WebviewWindowBuilder::new(app, "clipboard", WebviewUrl::App("clipboard.html".into()))
                 .title("剪贴板历史")
-                .inner_size(420.0, 520.0)
+                .inner_size(360.0, 460.0)
+                .min_inner_size(320.0, 360.0)
                 .visible(false)
                 .decorations(false)
-                .resizable(false)
+                .resizable(true)
                 .always_on_top(true)
                 .skip_taskbar(true)
                 .center()
