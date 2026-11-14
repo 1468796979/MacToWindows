@@ -148,6 +148,7 @@ if (listen) {
     applySnapshot(event.payload);
     $("clipboard-list").scrollTop = 0;
     window.focus();
+    refreshSnapshot().catch(() => {});
   }))
     .catch((error) => { state.error = error?.message || String(error); render(); });
   Promise.resolve(listen("clipboard-updated", (event) => {
@@ -159,6 +160,14 @@ if (listen) {
 }
 backendInvoke("clipboard_history").then(applySnapshot).catch((error) => { state.error = error?.message || String(error); render(); });
 render();
+const refreshVisiblePanel = () => {
+  state.panelOpen = true;
+  refreshSnapshot().catch(() => {});
+};
+window.addEventListener("focus", refreshVisiblePanel);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) refreshVisiblePanel();
+});
 setInterval(() => {
   if (state.panelOpen) refreshSnapshot().catch(() => {});
 }, 100);

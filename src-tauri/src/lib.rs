@@ -887,13 +887,18 @@ pub mod commands {
     }
 
     #[tauri::command]
-    pub fn clipboard_history(
+    pub async fn clipboard_history(
         state: tauri::State<'_, AppState>,
     ) -> Result<clipboard::ClipboardSnapshot, String> {
-        state
+        let manager = state
             .clipboard()
-            .map(|manager| manager.snapshot())
-            .ok_or_else(|| "剪贴板服务尚未启动".to_owned())
+            .ok_or_else(|| "剪贴板服务尚未启动".to_owned())?;
+        tauri::async_runtime::spawn_blocking(move || {
+            manager.refresh().map_err(|error| error.to_string())?;
+            Ok(manager.snapshot())
+        })
+        .await
+        .map_err(|error| format!("剪贴板刷新线程失败：{error}"))?
     }
 
     #[tauri::command]

@@ -161,6 +161,9 @@ impl std::error::Error for ClipboardManagerError {}
 
 enum WorkerCommand {
     Show,
+    Refresh {
+        reply: Sender<Result<(), String>>,
+    },
     Select {
         id: u64,
         generation: u64,
@@ -239,6 +242,10 @@ impl ClipboardManager {
 
     pub fn try_show(&self) -> bool {
         self.sender.try_send(WorkerCommand::Show).is_ok()
+    }
+
+    pub fn refresh(&self) -> Result<(), ClipboardManagerError> {
+        self.request(|reply| WorkerCommand::Refresh { reply })
     }
 
     pub fn select(&self, id: u64) -> Result<(), ClipboardManagerError> {
@@ -413,6 +420,7 @@ fn handle_command(
 ) -> bool {
     match command {
         WorkerCommand::Show => {
+            let _ = reload_history_from_store(history_path, core, history, last_error);
             let _ = poll_clipboard_once(core, history_path, history, last_error);
             if !*panel_open {
                 *last_error = None;
@@ -439,6 +447,18 @@ fn handle_command(
                 "clipboard-show",
             );
             show_window(app);
+        }
+        WorkerCommand::Refresh { reply } => {
+            let result = reload_history_from_store(history_path, core, history, last_error);
+            publish_snapshot(
+                app,
+                snapshot,
+                history,
+                *panel_open,
+                last_error.as_deref(),
+                "clipboard-updated",
+            );
+            let _ = reply.send(result);
         }
         WorkerCommand::Select {
             id,
@@ -553,6 +573,40 @@ fn handle_command(
         }
     }
     false
+}
+
+fn reload_history_from_store(
+    history_path: &PathBuf,
+    core: &mut Option<ClipboardManagerCore>,
+    history: &mut ClipboardHistory,
+    last_error: &mut Option<String>,
+) -> Result<(), String> {
+    match ClipboardStore::load_or_recover(history_path) {
+        Ok(LoadOutcome::Loaded(loaded)) => {
+            *history = loaded.clone();
+            if let Some(core) = core.as_mut() {
+                core.history = loaded;
+            }
+            Ok(())
+        }
+        Ok(LoadOutcome::RecoveredCorrupt {
+            history: recovered,
+            path,
+        }) => {
+            *history = recovered.clone();
+            if let Some(core) = core.as_mut() {
+                core.history = recovered;
+            }
+            let message = format!("历史文件损坏，已备份到 {}", path.display());
+            *last_error = Some(message.clone());
+            Err(message)
+        }
+        Err(error) => {
+            let message = format!("加载剪贴板历史失败：{error}");
+            *last_error = Some(message.clone());
+            Err(message)
+        }
+    }
 }
 
 fn dismiss_panel(core: &mut Option<ClipboardManagerCore>, panel_open: &mut bool) {
@@ -795,9 +849,12 @@ fn hide_window_and_wait(app: &AppHandle) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dismiss_panel, ClipboardManagerCore, ClipboardSelection};
-    use clipboard_core::{ClipboardHistory, IngestOutcome};
+    use super::{
+        dismiss_panel, reload_history_from_store, ClipboardManagerCore, ClipboardSelection,
+    };
+    use clipboard_core::{ClipboardHistory, ClipboardStore, IngestOutcome};
     use macos_adapter::{PasteboardBackend, PasteboardError, PasteboardService};
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
@@ -921,6 +978,40 @@ mod tests {
 
         assert!(!panel_open);
         assert!(core.as_ref().unwrap().target_bundle_id.is_none());
+    }
+
+    #[test]
+    fn reload_history_syncs_worker_core_from_persisted_store() {
+        let path = std::env::temp_dir().join(format!(
+            "mactowindows-clipboard-refresh-{}.json",
+            std::process::id()
+        ));
+        let mut persisted = ClipboardHistory::default();
+        persisted.ingest("persisted-entry".into(), 1);
+        ClipboardStore::save_atomic(&path, &persisted).unwrap();
+
+        let service = PasteboardService::with_backend(Box::new(MockBackend {
+            state: Arc::new(Mutex::new(MockState::default())),
+        }));
+        let mut core = Some(ClipboardManagerCore::new_for_test(service));
+        let mut history = ClipboardHistory::default();
+        let mut last_error = None;
+        reload_history_from_store(
+            &PathBuf::from(&path),
+            &mut core,
+            &mut history,
+            &mut last_error,
+        )
+        .unwrap();
+
+        assert_eq!(history.entries()[0].text, "persisted-entry");
+        assert_eq!(
+            core.as_ref().unwrap().history().entries()[0].text,
+            "persisted-entry"
+        );
+        assert!(last_error.is_none());
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(path.with_extension("bak"));
     }
 
     impl PasteboardBackend for MockBackend {
