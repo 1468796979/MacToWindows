@@ -112,6 +112,9 @@ jobs:
             --wait
           xcrun stapler staple "$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/bundle/macos/MacToWindows.app"
           xcrun stapler validate "$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/bundle/macos/MacToWindows.app"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/bundle/macos/MacToWindows.app" \
+            "$RUNNER_TEMP/MacToWindows-arm64.zip"
 
       - name: Create, sign, notarize and staple DMG
         run: |
