@@ -96,11 +96,11 @@ async function selectEntry(id) {
 }
 
 async function closePanel() {
+  state.selecting = false;
+  state.selectedIndex = core.resetSelection();
+  render();
   try {
     await backendInvoke("close_clipboard_panel");
-    state.selecting = false;
-    state.selectedIndex = core.resetSelection();
-    render();
   }
   catch (error) { state.error = error?.message || String(error); render(); }
 }
