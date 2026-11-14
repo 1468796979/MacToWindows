@@ -34,6 +34,7 @@ jobs:
 
       - name: Install arm64 target and Tauri CLI
         run: |
+          set -euo pipefail
           rustup target add aarch64-apple-darwin
           npm install --global @tauri-apps/cli@2.12.4
 
@@ -41,6 +42,7 @@ jobs:
         env:
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD }}
         run: |
+          set -euo pipefail
           KEYCHAIN_PATH="$RUNNER_TEMP/mactowindows-build.keychain-db"
           KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
           CERTIFICATE_PATH="$RUNNER_TEMP/developer-id-application.p12"
@@ -75,6 +77,7 @@ jobs:
 
       - name: Import App Store Connect API key
         run: |
+          set -euo pipefail
           python3 - <<'PY' > "$RUNNER_TEMP/AuthKey.p8"
           import base64
           import os
@@ -86,10 +89,13 @@ jobs:
           APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
 
       - name: Build unsigned arm64 app bundle
-        run: tauri build --target aarch64-apple-darwin --bundles app --no-sign --ci
+        run: |
+          set -euo pipefail
+          tauri build --target aarch64-apple-darwin --bundles app --no-sign --ci
 
       - name: Sign app bundle
         run: |
+          set -euo pipefail
           APP_PATH="$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/bundle/macos/MacToWindows.app"
           codesign --force --deep --options runtime --timestamp \
             --sign "$DEVELOPER_ID_APPLICATION" "$APP_PATH"
@@ -98,15 +104,18 @@ jobs:
 
       - name: Notarize and staple app archive
         run: |
+          set -euo pipefail
           xcrun notarytool submit "$RUNNER_TEMP/MacToWindows-arm64.zip" \
             --key "$APPLE_API_KEY_PATH" \
             --key-id "$APPLE_API_KEY_ID" \
             --issuer "$APPLE_API_ISSUER_ID" \
             --wait
           xcrun stapler staple "$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/bundle/macos/MacToWindows.app"
+          xcrun stapler validate "$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/bundle/macos/MacToWindows.app"
 
       - name: Create, sign, notarize and staple DMG
         run: |
+          set -euo pipefail
           APP_PATH="$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/bundle/macos/MacToWindows.app"
           DMG_PATH="$RUNNER_TEMP/MacToWindows-arm64.dmg"
           hdiutil create -volname MacToWindows \
@@ -119,7 +128,8 @@ jobs:
             --issuer "$APPLE_API_ISSUER_ID" \
             --wait
           xcrun stapler staple "$DMG_PATH"
-          spctl --assess --type open --context context:primary-signature "$APP_PATH"
+          xcrun stapler validate "$DMG_PATH"
+          spctl --assess --type execute --verbose=4 "$APP_PATH"
           shasum -a 256 "$DMG_PATH" "$RUNNER_TEMP/MacToWindows-arm64.zip" > "$RUNNER_TEMP/SHA256SUMS.txt"
 
       - name: Publish GitHub Release
