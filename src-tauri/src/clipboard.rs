@@ -433,7 +433,14 @@ fn handle_command(
                                 .map_err(|error| error.to_string())
                         });
                     if let Err(error) = result {
-                        *last_error = Some(format!("无法记录前台应用：{error}"));
+                        // Opening the panel while MacToWindows itself is
+                        // frontmost (or while macOS is between applications)
+                        // legitimately has no paste target. Keep history
+                        // usable and let selection report the missing target
+                        // only when the user actually chooses an item.
+                        if should_report_show_capture_error(&error) {
+                            *last_error = Some(format!("无法记录前台应用：{error}"));
+                        }
                     }
                 }
                 *panel_open = true;
@@ -573,6 +580,10 @@ fn handle_command(
         }
     }
     false
+}
+
+fn should_report_show_capture_error(error: &str) -> bool {
+    error != PasteboardError::ApplicationUnavailable.to_string()
 }
 
 fn reload_history_from_store(
@@ -962,6 +973,16 @@ mod tests {
             core.capture_target().unwrap_err(),
             PasteboardError::ApplicationUnavailable
         );
+    }
+
+    #[test]
+    fn showing_without_external_frontmost_application_does_not_report_error() {
+        assert!(!super::should_report_show_capture_error(
+            "ApplicationUnavailable"
+        ));
+        assert!(super::should_report_show_capture_error(
+            "读取前台应用失败：主线程操作超时"
+        ));
     }
 
     #[test]

@@ -185,6 +185,3 @@ window.addEventListener("focus", refreshVisiblePanel);
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) refreshVisiblePanel();
 });
-setInterval(() => {
-  if (state.panelOpen) refreshSnapshot().catch(() => {});
-}, 100);
