@@ -53,7 +53,11 @@ pub struct PasteboardService {
     backend: Box<dyn PasteboardBackend>,
     last_change_count: Option<i64>,
     ignored_change_count: Option<i64>,
+    pending_change_count: Option<i64>,
+    pending_read_attempts: u8,
 }
+
+const MAX_PENDING_READ_ATTEMPTS: u8 = 40;
 
 impl PasteboardService {
     pub fn with_backend(backend: Box<dyn PasteboardBackend>) -> Self {
@@ -61,6 +65,8 @@ impl PasteboardService {
             backend,
             last_change_count: None,
             ignored_change_count: None,
+            pending_change_count: None,
+            pending_read_attempts: 0,
         }
     }
 
@@ -74,6 +80,8 @@ impl PasteboardService {
         let change_count = self.backend.change_count()?;
         if self.ignored_change_count == Some(change_count) {
             self.ignored_change_count = None;
+            self.pending_change_count = None;
+            self.pending_read_attempts = 0;
             self.last_change_count = Some(change_count);
             return Ok(None);
         }
@@ -84,13 +92,23 @@ impl PasteboardService {
             self.last_change_count = Some(change_count);
             return Ok(None);
         }
-        if self.last_change_count == Some(change_count) {
+        if self.pending_change_count.is_none() && self.last_change_count == Some(change_count) {
             return Ok(None);
         }
-        self.last_change_count = Some(change_count);
-        Ok(Some(PasteboardChange {
+        if self.pending_change_count != Some(change_count) {
+            self.pending_change_count = Some(change_count);
+            self.pending_read_attempts = 0;
+        }
+        self.pending_read_attempts = self.pending_read_attempts.saturating_add(1);
+        let text = self.backend.read_text()?;
+        if text.is_some() || self.pending_read_attempts >= MAX_PENDING_READ_ATTEMPTS {
+            self.last_change_count = Some(change_count);
+            self.pending_change_count = None;
+            self.pending_read_attempts = 0;
+        }
+        Ok(text.map(|text| PasteboardChange {
             change_count,
-            text: self.backend.read_text()?,
+            text: Some(text),
         }))
     }
 
@@ -98,6 +116,8 @@ impl PasteboardService {
         let change_count = self.backend.write_text(text)?;
         self.last_change_count = Some(change_count);
         self.ignored_change_count = Some(change_count);
+        self.pending_change_count = None;
+        self.pending_read_attempts = 0;
         Ok(change_count)
     }
 
@@ -268,6 +288,7 @@ mod tests {
     struct MockState {
         change_count: i64,
         text: Option<String>,
+        read_none_count: usize,
     }
 
     struct MockBackend {
@@ -279,6 +300,7 @@ mod tests {
         let state = Arc::new(Mutex::new(MockState {
             change_count: 1,
             text: Some("alpha".into()),
+            read_none_count: 0,
         }));
         let backend = MockBackend {
             state: Arc::clone(&state),
@@ -292,6 +314,32 @@ mod tests {
         }
         let change = service.poll().unwrap().unwrap();
         assert_eq!(change.change_count, 2);
+        assert_eq!(change.text.as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn delayed_text_representation_is_retried_for_the_same_change_count() {
+        let state = Arc::new(Mutex::new(MockState {
+            change_count: 1,
+            text: Some("alpha".into()),
+            read_none_count: 0,
+        }));
+        let backend = MockBackend {
+            state: Arc::clone(&state),
+        };
+        let mut service = PasteboardService::with_backend(Box::new(backend));
+        assert!(service.poll().unwrap().is_none());
+        {
+            let mut state = state.lock().unwrap();
+            state.change_count = 2;
+            state.text = Some("beta".into());
+            state.read_none_count = 1;
+        }
+        assert!(service.poll().unwrap().is_none());
+        let change = service
+            .poll()
+            .unwrap()
+            .expect("text should be retried after the representation is ready");
         assert_eq!(change.text.as_deref(), Some("beta"));
     }
 
@@ -334,6 +382,7 @@ mod tests {
             state: Arc::new(Mutex::new(MockState {
                 change_count: -1,
                 text: None,
+                read_none_count: 0,
             })),
         }));
         assert_eq!(service.poll().unwrap_err(), PasteboardError::ReadFailed);
@@ -350,9 +399,12 @@ mod tests {
         }
 
         fn read_text(&mut self) -> Result<Option<String>, PasteboardError> {
-            let state = self.state.lock().unwrap();
+            let mut state = self.state.lock().unwrap();
             if state.change_count < 0 {
                 Err(PasteboardError::ReadFailed)
+            } else if state.read_none_count > 0 {
+                state.read_none_count -= 1;
+                Ok(None)
             } else {
                 Ok(state.text.clone())
             }

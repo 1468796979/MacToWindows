@@ -323,7 +323,7 @@ fn worker_loop(
         "clipboard-updated",
     );
 
-    let poll_interval = Duration::from_millis(100);
+    let poll_interval = Duration::from_millis(25);
     let command_wakeup = Duration::from_millis(20);
     let mut next_poll = Instant::now();
     loop {
@@ -356,42 +356,44 @@ fn worker_loop(
             continue;
         }
         next_poll = Instant::now() + poll_interval;
-        if let Some(core) = core.as_mut() {
-            match core.poll_once() {
-                Ok(Some(IngestOutcome::Added(_) | IngestOutcome::Moved(_))) => {
-                    history = core.history_clone();
-                    if let Err(error) = ClipboardStore::save_atomic(&history_path, &history) {
-                        last_error = Some(format!("保存剪贴板历史失败：{error}"));
-                    } else {
-                        last_error = None;
-                    }
-                    publish_snapshot(
-                        &app,
-                        &snapshot,
-                        &history,
-                        panel_open,
-                        last_error.as_deref(),
-                        "clipboard-updated",
-                    );
-                }
-                Ok(Some(IngestOutcome::IgnoredEmpty | IngestOutcome::IgnoredTooLarge))
-                | Ok(None) => {}
-                Err(error) => {
-                    let message = format!("读取系统剪贴板失败：{error}");
-                    let changed = last_error.as_deref() != Some(message.as_str());
-                    last_error = Some(message);
-                    if changed {
-                        publish_snapshot(
-                            &app,
-                            &snapshot,
-                            &history,
-                            panel_open,
-                            last_error.as_deref(),
-                            "clipboard-updated",
-                        );
-                    }
-                }
+        if poll_clipboard_once(&mut core, &history_path, &mut history, &mut last_error) {
+            publish_snapshot(
+                &app,
+                &snapshot,
+                &history,
+                panel_open,
+                last_error.as_deref(),
+                "clipboard-updated",
+            );
+        }
+    }
+}
+
+fn poll_clipboard_once(
+    core: &mut Option<ClipboardManagerCore>,
+    history_path: &PathBuf,
+    history: &mut ClipboardHistory,
+    last_error: &mut Option<String>,
+) -> bool {
+    let Some(core) = core.as_mut() else {
+        return false;
+    };
+    match core.poll_once() {
+        Ok(Some(IngestOutcome::Added(_) | IngestOutcome::Moved(_))) => {
+            *history = core.history_clone();
+            if let Err(error) = ClipboardStore::save_atomic(history_path, history) {
+                *last_error = Some(format!("保存剪贴板历史失败：{error}"));
+            } else {
+                *last_error = None;
             }
+            true
+        }
+        Ok(Some(IngestOutcome::IgnoredEmpty | IngestOutcome::IgnoredTooLarge)) | Ok(None) => false,
+        Err(error) => {
+            let message = format!("读取系统剪贴板失败：{error}");
+            let changed = last_error.as_deref() != Some(message.as_str());
+            *last_error = Some(message);
+            changed
         }
     }
 }
@@ -411,6 +413,7 @@ fn handle_command(
 ) -> bool {
     match command {
         WorkerCommand::Show => {
+            let _ = poll_clipboard_once(core, history_path, history, last_error);
             if !*panel_open {
                 *last_error = None;
                 if let Some(core) = core.as_mut() {
