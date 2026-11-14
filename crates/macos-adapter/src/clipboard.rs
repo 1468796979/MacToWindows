@@ -54,10 +54,7 @@ pub struct PasteboardService {
     last_change_count: Option<i64>,
     ignored_change_count: Option<i64>,
     pending_change_count: Option<i64>,
-    pending_read_attempts: u8,
 }
-
-const MAX_PENDING_READ_ATTEMPTS: u8 = 40;
 
 impl PasteboardService {
     pub fn with_backend(backend: Box<dyn PasteboardBackend>) -> Self {
@@ -66,7 +63,6 @@ impl PasteboardService {
             last_change_count: None,
             ignored_change_count: None,
             pending_change_count: None,
-            pending_read_attempts: 0,
         }
     }
 
@@ -81,7 +77,6 @@ impl PasteboardService {
         if self.ignored_change_count == Some(change_count) {
             self.ignored_change_count = None;
             self.pending_change_count = None;
-            self.pending_read_attempts = 0;
             self.last_change_count = Some(change_count);
             return Ok(None);
         }
@@ -97,14 +92,15 @@ impl PasteboardService {
         }
         if self.pending_change_count != Some(change_count) {
             self.pending_change_count = Some(change_count);
-            self.pending_read_attempts = 0;
         }
-        self.pending_read_attempts = self.pending_read_attempts.saturating_add(1);
         let text = self.backend.read_text()?;
-        if text.is_some() || self.pending_read_attempts >= MAX_PENDING_READ_ATTEMPTS {
+        // A pasteboard change can be published before its string
+        // representation is ready. Keep the change pending until the text
+        // becomes readable; retiring it after a fixed number of attempts
+        // would permanently lose a slow copy operation.
+        if text.is_some() {
             self.last_change_count = Some(change_count);
             self.pending_change_count = None;
-            self.pending_read_attempts = 0;
         }
         Ok(text.map(|text| PasteboardChange {
             change_count,
@@ -117,7 +113,6 @@ impl PasteboardService {
         self.last_change_count = Some(change_count);
         self.ignored_change_count = Some(change_count);
         self.pending_change_count = None;
-        self.pending_read_attempts = 0;
         Ok(change_count)
     }
 
@@ -333,9 +328,11 @@ mod tests {
             let mut state = state.lock().unwrap();
             state.change_count = 2;
             state.text = Some("beta".into());
-            state.read_none_count = 1;
+            state.read_none_count = 41;
         }
-        assert!(service.poll().unwrap().is_none());
+        for _ in 0..41 {
+            assert!(service.poll().unwrap().is_none());
+        }
         let change = service
             .poll()
             .unwrap()

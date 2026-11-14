@@ -19,3 +19,16 @@ MacToWindows 是一个面向 Windows 用户的 macOS 全局键鼠语义层。工
     node --check ui/app.js
 
 真实 macOS 权限矩阵、Event Tap 硬件回归、Universal Binary、签名和 notarization 需要在 macOS 13+ 真机阶段执行。
+
+## 本地 macOS 构建与权限复用
+
+辅助功能、输入监控和注入事件权限绑定在 Bundle ID、entitlements 和代码签名身份的组合上。当前应用标识固定为 `com.mactowindows.desktop`，本地验证时必须重复使用同一个 Apple Development、Developer ID 或固定的本地代码签名身份；`codesign --sign -` 是临时 adhoc 签名，每次构建都会产生新的 CDHash，macOS 会把它当作新的客户端并再次要求授权。
+
+先用 Tauri 构建 arm64 App，再用固定身份签名：
+
+```bash
+cargo tauri build --target aarch64-apple-darwin --bundles app
+CODESIGN_IDENTITY="你的固定签名身份" scripts/sign-local-macos-app.sh
+```
+
+脚本会拒绝在没有稳定身份时继续签名，并在签名后验证 Bundle ID、Team ID 和 CDHash。这样只要 Bundle ID、entitlements 和签名身份不变，后续重新构建通常可以直接验证功能，不需要重复授予 TCC 权限。发布包仍应使用 Apple Developer 证书完成正式签名和 notarization。

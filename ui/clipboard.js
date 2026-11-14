@@ -1,5 +1,6 @@
 const core = window.clipboardCore;
-const state = { entries: [], selectedIndex: -1, error: "", selecting: false };
+const state = { entries: [], selectedIndex: -1, error: "", selecting: false, panelOpen: false };
+let refreshInFlight = null;
 const $ = (id) => document.getElementById(id);
 const backendInvoke = (command, args) => {
   const invoke = window.__TAURI__?.core?.invoke || window.__TAURI_INTERNALS__?.invoke;
@@ -16,6 +17,7 @@ function applySnapshot(snapshot) {
   const normalized = core.normalizeSnapshot(snapshot);
   state.entries = normalized.entries;
   state.error = normalized.lastError || "";
+  state.panelOpen = normalized.panelOpen;
   if (!normalized.panelOpen) {
     state.selecting = false;
     state.selectedIndex = -1;
@@ -30,7 +32,12 @@ function applySnapshot(snapshot) {
 }
 
 async function refreshSnapshot() {
-  applySnapshot(await backendInvoke("clipboard_history"));
+  if (!refreshInFlight) {
+    refreshInFlight = backendInvoke("clipboard_history")
+      .then(applySnapshot)
+      .finally(() => { refreshInFlight = null; });
+  }
+  return refreshInFlight;
 }
 
 function render() {
@@ -147,3 +154,6 @@ if (listen) {
 }
 backendInvoke("clipboard_history").then(applySnapshot).catch((error) => { state.error = error?.message || String(error); render(); });
 render();
+setInterval(() => {
+  if (state.panelOpen) refreshSnapshot().catch(() => {});
+}, 100);

@@ -1025,6 +1025,26 @@ mod tests {
         }
     }
 
+    fn keyboard_event(
+        code: u16,
+        phase: EventPhase,
+        modifiers: ModifierSet,
+        kind: EventKind,
+    ) -> NormalizedEvent {
+        NormalizedEvent {
+            source: DeviceSource::Keyboard,
+            kind,
+            phase,
+            code: PhysicalCode::key(code),
+            modifiers,
+            location: None,
+            scroll: None,
+            timestamp_ns: 1,
+            app_context: None,
+            origin: EventOrigin::Hardware,
+        }
+    }
+
     fn controller_with_rule() -> RuntimeController {
         let rule = Rule {
             id: "a".into(),
@@ -1057,6 +1077,89 @@ mod tests {
         assert_eq!(controller.status(), &RuntimeStatus::Disabled);
         controller.apply(RuntimeCommand::Shutdown).unwrap();
         assert_eq!(controller.status(), &RuntimeStatus::Stopped);
+    }
+
+    #[test]
+    fn default_control_copy_mapping_injects_only_command_copy() {
+        let mut controller = RuntimeController::from_config(AppConfig::default()).unwrap();
+        controller.apply(RuntimeCommand::Enable).unwrap();
+        let mut injected = Vec::new();
+
+        assert_eq!(
+            controller.process_event(
+                &keyboard_event(
+                    59,
+                    EventPhase::Changed,
+                    ModifierSet::LEFT_CONTROL,
+                    EventKind::FlagsChanged,
+                ),
+                |outputs| {
+                    injected.extend_from_slice(outputs);
+                    Ok(())
+                },
+            ),
+            Decision::Pass
+        );
+        assert_eq!(
+            controller.process_event(
+                &keyboard_event(
+                    8,
+                    EventPhase::Down,
+                    ModifierSet::LEFT_CONTROL,
+                    EventKind::Keyboard,
+                ),
+                |outputs| {
+                    injected.extend_from_slice(outputs);
+                    Ok(())
+                },
+            ),
+            Decision::Suppress
+        );
+        assert_eq!(
+            controller.process_event(
+                &keyboard_event(
+                    8,
+                    EventPhase::Up,
+                    ModifierSet::LEFT_CONTROL,
+                    EventKind::Keyboard,
+                ),
+                |outputs| {
+                    injected.extend_from_slice(outputs);
+                    Ok(())
+                },
+            ),
+            Decision::Suppress
+        );
+        assert_eq!(
+            controller.process_event(
+                &keyboard_event(
+                    59,
+                    EventPhase::Changed,
+                    ModifierSet::NONE,
+                    EventKind::FlagsChanged,
+                ),
+                |outputs| {
+                    injected.extend_from_slice(outputs);
+                    Ok(())
+                },
+            ),
+            Decision::Pass
+        );
+        assert_eq!(
+            injected,
+            vec![
+                OutputEvent::Key {
+                    code: PhysicalCode::key(8),
+                    phase: EventPhase::Down,
+                    modifiers: ModifierSet::LEFT_COMMAND,
+                },
+                OutputEvent::Key {
+                    code: PhysicalCode::key(8),
+                    phase: EventPhase::Up,
+                    modifiers: ModifierSet::LEFT_COMMAND,
+                },
+            ]
+        );
     }
 
     #[test]
