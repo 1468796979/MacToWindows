@@ -617,6 +617,10 @@ fn clipboard_history_path() -> PathBuf {
         .join("Library/Application Support/MacToWindows/clipboard-history.json")
 }
 
+fn should_restore_main_window(has_visible_windows: bool) -> bool {
+    !has_visible_windows
+}
+
 pub fn run() {
     let config = AppConfig::default();
     let app_state = AppState::from_config(config).unwrap_or_else(|_| {
@@ -701,13 +705,19 @@ pub fn run() {
         .expect("error while building MacToWindows")
         .run(|app, event| {
             #[cfg(target_os = "macos")]
-            if let tauri::RunEvent::Reopen { .. } = event {
+            if let tauri::RunEvent::Reopen {
+                has_visible_windows,
+                ..
+            } = event
+            {
                 // The clipboard panel intentionally hides the settings
                 // window while it is active. A Dock click must still reopen
                 // the settings window when the app has no visible windows.
-                if let Some(window) = app.get_webview_window("main") {
-                    let _ = window.show();
-                    let _ = window.set_focus();
+                if should_restore_main_window(has_visible_windows) {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
                 }
             }
             #[cfg(not(target_os = "macos"))]
@@ -954,6 +964,12 @@ pub mod commands {
             if let Some(window) = handle.get_webview_window("clipboard") {
                 let _ = window.hide();
             }
+            // Hiding the last window alone leaves the Tauri application
+            // active. macOS can then keep MacToWindows as the frontmost app,
+            // which makes the next clipboard capture lose its real target.
+            // Hide the application as well so the previous app remains
+            // frontmost after dismissing the panel.
+            let _ = handle.hide();
         });
         let manager = state
             .clipboard()
@@ -1019,6 +1035,12 @@ mod tests {
         DeviceSource, EventKind, EventOrigin, EventPhase, ModifierSet, PhysicalCode,
     };
     use rule_engine::{Action, ModifierMatcher, RuleScope, Trigger};
+
+    #[test]
+    fn reopen_only_restores_main_window_when_no_window_is_visible() {
+        assert!(should_restore_main_window(false));
+        assert!(!should_restore_main_window(true));
+    }
 
     fn key() -> NormalizedEvent {
         NormalizedEvent {
