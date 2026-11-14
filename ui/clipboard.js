@@ -17,8 +17,9 @@ function applySnapshot(snapshot) {
   const normalized = core.normalizeSnapshot(snapshot);
   state.entries = normalized.entries;
   state.error = normalized.lastError || "";
-  state.panelOpen = normalized.panelOpen;
-  if (!normalized.panelOpen) {
+  const staleClosedSnapshot = state.panelOpen && !normalized.panelOpen;
+  if (!staleClosedSnapshot) state.panelOpen = normalized.panelOpen;
+  if (!normalized.panelOpen && !staleClosedSnapshot) {
     state.selecting = false;
     state.selectedIndex = -1;
   } else if (normalized.lastError) {
@@ -93,6 +94,7 @@ async function selectEntry(id) {
   try {
     await backendInvoke("select_clipboard_item", { id });
     state.selecting = false;
+    state.panelOpen = false;
     state.selectedIndex = core.resetSelection();
     render();
   } catch (error) {
@@ -104,12 +106,13 @@ async function selectEntry(id) {
 
 async function closePanel() {
   state.selecting = false;
+  state.panelOpen = false;
   state.selectedIndex = core.resetSelection();
   render();
   try {
     await backendInvoke("close_clipboard_panel");
   }
-  catch (error) { state.error = error?.message || String(error); render(); }
+  catch (error) { state.panelOpen = true; state.error = error?.message || String(error); render(); }
 }
 
 $("clipboard-close").addEventListener("click", closePanel);
@@ -140,8 +143,10 @@ document.addEventListener("click", (event) => {
 if (listen) {
   Promise.resolve(listen("clipboard-show", (event) => {
     state.selecting = false;
+    state.panelOpen = true;
     state.selectedIndex = core.resetSelection();
     applySnapshot(event.payload);
+    $("clipboard-list").scrollTop = 0;
     window.focus();
   }))
     .catch((error) => { state.error = error?.message || String(error); render(); });

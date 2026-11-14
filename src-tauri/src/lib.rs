@@ -74,10 +74,14 @@ impl ClipboardHotkeyLatch {
             self.option_state_seen = true;
             match event.code {
                 event_model::PhysicalCode::Key(58) => {
-                    self.left_option_down = !self.left_option_down;
+                    self.left_option_down = event
+                        .modifiers
+                        .contains(event_model::ModifierSet::LEFT_OPTION);
                 }
                 event_model::PhysicalCode::Key(61) => {
-                    self.right_option_down = !self.right_option_down;
+                    self.right_option_down = event
+                        .modifiers
+                        .contains(event_model::ModifierSet::RIGHT_OPTION);
                 }
                 _ => {}
             }
@@ -1398,6 +1402,26 @@ mod tests {
         };
         assert_eq!(latch.handle(&right_v), None);
         assert_eq!(latch.handle(&right_up), None);
+    }
+
+    #[test]
+    fn clipboard_hotkey_repeated_option_flags_do_not_flip_state() {
+        let mut latch = ClipboardHotkeyLatch::default();
+        let left_down = NormalizedEvent {
+            kind: EventKind::FlagsChanged,
+            code: PhysicalCode::key(58),
+            modifiers: ModifierSet::LEFT_OPTION,
+            ..key()
+        };
+        let v = NormalizedEvent {
+            code: PhysicalCode::key(9),
+            modifiers: ModifierSet::LEFT_OPTION,
+            ..key()
+        };
+
+        assert_eq!(latch.handle(&left_down), None);
+        assert_eq!(latch.handle(&left_down), None);
+        assert_eq!(latch.handle(&v), Some(ClipboardHotkeyAction::Show));
     }
 
     #[cfg(target_os = "macos")]
