@@ -969,6 +969,7 @@ pub mod commands {
             // which makes the next clipboard capture lose its real target.
             // Hide the application as well so the previous app remains
             // frontmost after dismissing the panel.
+            #[cfg(target_os = "macos")]
             let _ = handle.hide();
         });
         let manager = state
