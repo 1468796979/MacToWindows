@@ -16,7 +16,12 @@ function applySnapshot(snapshot) {
   const normalized = core.normalizeSnapshot(snapshot);
   state.entries = normalized.entries;
   state.error = normalized.lastError || "";
-  if (!normalized.panelOpen || normalized.lastError) state.selecting = false;
+  if (!normalized.panelOpen) {
+    state.selecting = false;
+    state.selectedIndex = -1;
+  } else if (normalized.lastError) {
+    state.selecting = false;
+  }
   if (state.entries.length === 0) state.selectedIndex = -1;
   else if (state.selectedIndex >= 0) {
     state.selectedIndex = Math.min(state.selectedIndex, state.entries.length - 1);
@@ -80,6 +85,9 @@ async function selectEntry(id) {
   render();
   try {
     await backendInvoke("select_clipboard_item", { id });
+    state.selecting = false;
+    state.selectedIndex = core.resetSelection();
+    render();
   } catch (error) {
     state.selecting = false;
     state.error = error?.message || String(error);
@@ -88,7 +96,12 @@ async function selectEntry(id) {
 }
 
 async function closePanel() {
-  try { await backendInvoke("close_clipboard_panel"); }
+  try {
+    await backendInvoke("close_clipboard_panel");
+    state.selecting = false;
+    state.selectedIndex = core.resetSelection();
+    render();
+  }
   catch (error) { state.error = error?.message || String(error); render(); }
 }
 
