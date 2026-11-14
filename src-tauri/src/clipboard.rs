@@ -586,6 +586,20 @@ fn select_and_paste(
         *panel_open = false;
         return Err("操作已取消".into());
     }
+    if let Err(error) = hide_window_and_wait(app) {
+        if select_generation.load(Ordering::Acquire) != generation {
+            *panel_open = false;
+            return Err("操作已取消".into());
+        }
+        *last_error = Some(error.clone());
+        *panel_open = true;
+        show_window(app);
+        return Err(error);
+    }
+    if select_generation.load(Ordering::Acquire) != generation {
+        *panel_open = false;
+        return Err("操作已取消".into());
+    }
     if let Err(message) = activate_application_on_main_thread(
         app,
         &selection.target_bundle_id,
@@ -603,16 +617,6 @@ fn select_and_paste(
     if select_generation.load(Ordering::Acquire) != generation {
         *panel_open = false;
         return Err("操作已取消".into());
-    }
-    if let Err(error) = hide_window_and_wait(app) {
-        if select_generation.load(Ordering::Acquire) != generation {
-            *panel_open = false;
-            return Err("操作已取消".into());
-        }
-        *last_error = Some(error.clone());
-        *panel_open = true;
-        show_window(app);
-        return Err(error);
     }
     if let Err(error) = wait_for_frontmost(
         app,
@@ -633,7 +637,7 @@ fn select_and_paste(
         *panel_open = false;
         return Err("操作已取消".into());
     }
-    thread::sleep(Duration::from_millis(10));
+    thread::sleep(Duration::from_millis(50));
     if select_generation.load(Ordering::Acquire) != generation {
         *panel_open = false;
         return Err("操作已取消".into());

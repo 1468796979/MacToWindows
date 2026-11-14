@@ -197,15 +197,20 @@ mod platform {
         let Some(mtm) = MainThreadMarker::new() else {
             return Err(PasteboardError::ApplicationUnavailable);
         };
+        let current = NSRunningApplication::currentApplication();
         NSApplication::sharedApplication(mtm).yieldActivationToApplication(&application);
         let _ = application.unhide();
         #[allow(deprecated)]
         let options = NSApplicationActivationOptions::ActivateAllWindows
             | NSApplicationActivationOptions::ActivateIgnoringOtherApps;
-        if application.activateWithOptions(options) || application.isActive() {
+        if application.activateFromApplication_options(&current, options)
+            || application.activateWithOptions(options)
+            || application.isActive()
+        {
             return Ok(());
         }
         let _ = application.unhide();
+        let _ = application.activateFromApplication_options(&current, options);
         let _ = application.activateWithOptions(options);
         // Activation can complete asynchronously. The caller polls the
         // frontmost application before injecting Cmd+V, so a false return

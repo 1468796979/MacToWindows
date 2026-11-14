@@ -54,7 +54,7 @@ function render() {
     const time = document.createElement("div");
     time.className = "clipboard-time";
     time.textContent = formatTime(entry.copied_at_unix_ms);
-    content.append(text, time);
+    content.append(time, text);
 
     const remove = document.createElement("button");
     remove.className = "clipboard-delete";
