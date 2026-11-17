@@ -86,6 +86,8 @@ pub enum EngineError {
         count: usize,
         max: usize,
     },
+    #[error("rule {id}: a release-only modifier chord requires exactly one system shortcut")]
+    InvalidModifierChord { id: String },
 }
 
 #[derive(Clone, Debug)]
@@ -97,6 +99,17 @@ impl CompiledRules {
     pub fn compile(input: Vec<Rule>) -> Result<Self, EngineError> {
         let mut rules: Vec<Rule> = Vec::new();
         for rule in input.into_iter().filter(|rule| rule.enabled) {
+            if matches!(rule.trigger, Trigger::ModifierChord { .. })
+                && (!matches!(
+                    rule.trigger,
+                    Trigger::ModifierChord {
+                        phase: EventPhase::Up,
+                        ..
+                    }
+                ) || !matches!(&rule.action, Action::Replace(outputs) if matches!(outputs.as_slice(), [OutputEvent::SystemShortcut(_)])))
+            {
+                return Err(EngineError::InvalidModifierChord { id: rule.id });
+            }
             if let Action::Replace(outputs) = &rule.action {
                 if outputs.len() > MAX_OUTPUT_EVENTS {
                     return Err(EngineError::TooManyOutputs {
@@ -149,15 +162,20 @@ impl CompiledRules {
         })
     }
 
-    fn find_modifier_chord(&self, modifiers: ModifierSet) -> Option<&Rule> {
+    fn find_modifier_chord(
+        &self,
+        modifiers: ModifierSet,
+        app: Option<&AppContext>,
+    ) -> Option<&Rule> {
         self.rules.iter().find(|rule| {
-            matches!(
-                rule.trigger,
-                Trigger::ModifierChord {
-                    modifiers: required,
-                    phase: EventPhase::Up,
-                } if required == modifiers
-            )
+            scope_matches(&rule.scope, app)
+                && matches!(
+                    rule.trigger,
+                    Trigger::ModifierChord {
+                        modifiers: required,
+                        phase: EventPhase::Up,
+                    } if required == modifiers
+                )
         })
     }
 }
@@ -265,13 +283,21 @@ fn trigger_matches(trigger: &Trigger, event: &NormalizedEvent) -> bool {
 
 #[derive(Clone, Debug, Default)]
 pub struct RuntimeState {
-    bindings: HashMap<PhysicalCode, Vec<OutputEvent>>,
+    bindings: HashMap<PhysicalCode, SourceBinding>,
     logical_down: HashMap<PhysicalCode, u32>,
     physical_down: HashSet<PhysicalCode>,
     active_modifiers: ModifierSet,
     modifier_chord_interrupted: bool,
     modifier_chord_fired: bool,
     shift_taps: HashMap<PhysicalCode, ShiftTapState>,
+}
+
+#[derive(Clone, Debug)]
+struct SourceBinding {
+    outputs: Vec<OutputEvent>,
+    passthrough: bool,
+    // The target is still the physical source; only its flags may need rewriting.
+    follow_modifiers: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -292,11 +318,45 @@ impl RuntimeState {
     pub fn release_all(&mut self) -> Vec<OutputEvent> {
         let mut output = Vec::new();
         let mut released = HashSet::new();
-        for events in self.bindings.values() {
-            for event in events {
+        let native_targets: HashSet<_> = self
+            .bindings
+            .values()
+            .filter(|binding| binding.follow_modifiers)
+            .flat_map(|binding| binding.outputs.iter().filter_map(output_code))
+            .collect();
+        let mut native_modifiers = self.active_modifiers;
+        for (source, binding) in &self.bindings {
+            if !binding.follow_modifiers {
+                if let Some(modifier) = modifier_for_code(*source) {
+                    native_modifiers.remove(modifier);
+                }
+            }
+        }
+        for target in &native_targets {
+            if let Some(modifier) = modifier_for_code(*target) {
+                native_modifiers.insert(modifier);
+            }
+        }
+        for binding in self
+            .bindings
+            .values()
+            .filter(|binding| !binding.follow_modifiers)
+        {
+            for event in &binding.outputs {
+                if held_output_code(event).is_none() {
+                    continue;
+                }
                 if let Some(release) = release_event(event) {
                     if let Some(code) = output_code(&release) {
-                        if released.insert(code) {
+                        if !native_targets.contains(&code) && released.insert(code) {
+                            let release = match release {
+                                OutputEvent::Key { code, phase, .. } => OutputEvent::Key {
+                                    code,
+                                    phase,
+                                    modifiers: native_modifiers,
+                                },
+                                other => other,
+                            };
                             output.push(release);
                         }
                     }
@@ -330,12 +390,29 @@ impl RuleEngine {
     }
     pub fn replace_rules(&mut self, rules: CompiledRules) {
         self.rules = rules;
+        // Existing key bindings remain frozen. Cancel pending gestures so a
+        // release cannot accidentally run an action introduced by the update.
+        self.state.modifier_chord_interrupted = true;
+        self.state.modifier_chord_fired = true;
+        self.state.shift_taps.clear();
     }
     pub fn state(&self) -> &RuntimeState {
         &self.state
     }
     pub fn release_all(&mut self) -> Vec<OutputEvent> {
         self.state.release_all()
+    }
+    pub fn checkpoint(&self) -> RuntimeState {
+        self.state.clone()
+    }
+    pub fn restore(&mut self, checkpoint: RuntimeState) {
+        self.state = checkpoint;
+    }
+    pub fn logical_modifiers(&self) -> ModifierSet {
+        self.map_modifier_flags(self.state.active_modifiers)
+    }
+    pub fn modifiers_for_event(&self, event: &NormalizedEvent) -> ModifierSet {
+        self.map_modifier_flags(event.modifiers)
     }
 
     /// Enables the standalone Shift toggle while the input-source service can
@@ -347,20 +424,58 @@ impl RuleEngine {
     }
 
     pub fn handle(&mut self, event: &NormalizedEvent) -> event_model::Decision {
+        if event.kind == EventKind::MouseMove {
+            for tap in self.state.shift_taps.values_mut() {
+                tap.interrupted = true;
+            }
+            if self.state.active_modifiers != ModifierSet::NONE {
+                self.state.modifier_chord_interrupted = true;
+            }
+            return match self.state.bindings.get(&event.code) {
+                Some(binding) if !binding.passthrough => binding
+                    .outputs
+                    .iter()
+                    .find_map(|output| {
+                        if let OutputEvent::MouseButton { button, .. } = output {
+                            Some(event_model::Decision::Emit(vec![OutputEvent::MouseDrag {
+                                button: *button,
+                            }]))
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(event_model::Decision::Suppress),
+                _ => event_model::Decision::Pass,
+            };
+        }
         let phase = effective_phase(event);
+        if event.kind == EventKind::Keyboard {
+            self.state.active_modifiers = self.physical_modifier_flags(event.modifiers);
+        }
+        if phase == EventPhase::Down && self.state.bindings.contains_key(&event.code) {
+            return event_model::Decision::Suppress;
+        }
         let modifier = modifier_for_code(event.code);
         let modifiers_before = self.state.active_modifiers;
         if let Some(modifier) = modifier {
             if phase == EventPhase::Down {
                 self.state.active_modifiers.insert(modifier);
-                if contains_any(
-                    self.state.active_modifiers,
-                    ModifierSet::LEFT_CONTROL | ModifierSet::RIGHT_CONTROL,
-                ) && contains_any(
-                    self.state.active_modifiers,
-                    ModifierSet::LEFT_SHIFT | ModifierSet::RIGHT_SHIFT,
-                ) {
+                if self
+                    .rules
+                    .find_modifier_chord(self.state.active_modifiers, event.app_context.as_ref())
+                    .is_some()
+                    && self
+                        .rules
+                        .find_modifier_chord(modifiers_before, event.app_context.as_ref())
+                        .is_none()
+                    && self
+                        .state
+                        .physical_down
+                        .iter()
+                        .all(|code| modifier_for_code(*code).is_some())
+                {
                     self.state.modifier_chord_interrupted = false;
+                    self.state.modifier_chord_fired = false;
                 }
                 for (shift_code, state) in &mut self.state.shift_taps {
                     if *shift_code != event.code {
@@ -384,13 +499,7 @@ impl RuleEngine {
                 self.state.active_modifiers.remove(modifier);
             }
         } else {
-            if contains_any(
-                self.state.active_modifiers,
-                ModifierSet::LEFT_CONTROL | ModifierSet::RIGHT_CONTROL,
-            ) && contains_any(
-                self.state.active_modifiers,
-                ModifierSet::LEFT_SHIFT | ModifierSet::RIGHT_SHIFT,
-            ) {
+            if self.state.active_modifiers != ModifierSet::NONE {
                 self.state.modifier_chord_interrupted = true;
             }
             for state in self.state.shift_taps.values_mut() {
@@ -421,31 +530,32 @@ impl RuleEngine {
                 .state
                 .bindings
                 .remove(&event.code)
-                .map(|binding| self.release_binding(binding));
+                .map(|binding| self.release_binding(binding, event));
             let modifier_chord = modifier.is_some()
                 && modifiers_before.bits() != 0
                 && !self.state.modifier_chord_fired
                 && !self.state.modifier_chord_interrupted
                 && self
                     .rules
-                    .find_modifier_chord(modifiers_before)
+                    .find_modifier_chord(modifiers_before, event.app_context.as_ref())
                     .map(|_| true)
                     .unwrap_or(false);
             if modifier_chord {
                 self.state.modifier_chord_fired = true;
                 let mut outputs = self
                     .rules
-                    .find_modifier_chord(modifiers_before)
+                    .find_modifier_chord(modifiers_before, event.app_context.as_ref())
                     .and_then(|rule| match &rule.action {
                         Action::Replace(outputs) => Some(outputs.clone()),
                         _ => None,
                     })
-                    .unwrap_or_else(|| {
-                        vec![OutputEvent::SystemShortcut(
-                            event_model::SystemShortcut::SwitchInputSource,
-                        )]
-                    });
-                append_release_outputs(&mut outputs, binding_decision, event);
+                    .unwrap_or_default();
+                append_release_outputs(
+                    &mut outputs,
+                    binding_decision,
+                    event,
+                    self.modifiers_for_event(event),
+                );
                 return event_model::Decision::Emit(outputs);
             }
             if self.state.active_modifiers.bits() == 0 {
@@ -459,7 +569,12 @@ impl RuleEngine {
                         let mut outputs = vec![OutputEvent::SystemShortcut(
                             event_model::SystemShortcut::TogglePinyinEnglish,
                         )];
-                        append_release_outputs(&mut outputs, binding_decision, event);
+                        append_release_outputs(
+                            &mut outputs,
+                            binding_decision,
+                            event,
+                            self.modifiers_for_event(event),
+                        );
                         return event_model::Decision::Emit(outputs);
                     }
                 }
@@ -470,10 +585,58 @@ impl RuleEngine {
         }
         if phase == EventPhase::Repeat {
             if let Some(binding) = self.state.bindings.get(&event.code) {
-                return if binding.is_empty() {
+                return if binding.follow_modifiers {
+                    let modifiers = self.modifiers_for_event(event);
+                    if binding.passthrough
+                        && modifiers == self.physical_modifier_flags(event.modifiers)
+                    {
+                        event_model::Decision::Pass
+                    } else if matches!(event.code, PhysicalCode::Key(_)) {
+                        event_model::Decision::Emit(vec![OutputEvent::Key {
+                            code: event.code,
+                            phase: EventPhase::Repeat,
+                            modifiers,
+                        }])
+                    } else {
+                        event_model::Decision::Suppress
+                    }
+                } else if binding.outputs.is_empty() {
                     event_model::Decision::Suppress
                 } else {
-                    event_model::Decision::Emit(repeat_outputs(binding))
+                    let repeated = repeat_outputs(&binding.outputs);
+                    if repeated.is_empty() {
+                        event_model::Decision::Suppress
+                    } else {
+                        event_model::Decision::Emit(repeated)
+                    }
+                };
+            }
+            return event_model::Decision::Pass;
+        }
+        if event.kind == EventKind::Scroll {
+            let mut invert_x = false;
+            let mut invert_y = false;
+            let mut only_axis_transforms = true;
+            for axis in [ScrollAxis::Horizontal, ScrollAxis::Vertical] {
+                let mut adjusted = event.clone();
+                adjusted.code = PhysicalCode::Scroll(axis);
+                match self.rules.find(&adjusted).map(|rule| &rule.action) {
+                    Some(Action::InvertScroll) => match axis {
+                        ScrollAxis::Horizontal => invert_x = true,
+                        ScrollAxis::Vertical => invert_y = true,
+                    },
+                    Some(Action::Pass) | None => {}
+                    _ => only_axis_transforms = false,
+                }
+            }
+            if only_axis_transforms {
+                return if invert_x || invert_y {
+                    event_model::Decision::Emit(vec![OutputEvent::ScrollTransform {
+                        invert_x,
+                        invert_y,
+                    }])
+                } else {
+                    event_model::Decision::Pass
                 };
             }
         }
@@ -491,17 +654,23 @@ impl RuleEngine {
             })
             .map(|rule| rule.action.clone());
         match action {
-            Some(Action::Pass) => event_model::Decision::Pass,
+            Some(Action::Pass) => self.pass_event(event),
             Some(Action::Suppress) => {
                 if is_press_phase(phase) {
-                    self.state.bindings.insert(event.code, Vec::new());
+                    self.state.bindings.insert(
+                        event.code,
+                        SourceBinding {
+                            outputs: Vec::new(),
+                            passthrough: false,
+                            follow_modifiers: false,
+                        },
+                    );
                 }
                 event_model::Decision::Suppress
             }
             Some(Action::Replace(outputs)) => {
                 if is_press_phase(phase) {
-                    self.state.bindings.insert(event.code, outputs.clone());
-                    self.track_down(&outputs);
+                    return self.acquire_binding(event, outputs, false, false);
                 }
                 let outputs = if phase == EventPhase::Repeat {
                     repeat_outputs(&outputs)
@@ -511,20 +680,9 @@ impl RuleEngine {
                 event_model::Decision::Emit(outputs)
             }
             Some(Action::InvertScroll) => {
-                let scroll = event
-                    .scroll
-                    .unwrap_or(event_model::ScrollDelta { x: 0.0, y: 0.0 });
-                event_model::Decision::Emit(vec![OutputEvent::Scroll {
-                    delta_x: if matches!(event.code, PhysicalCode::Scroll(ScrollAxis::Horizontal)) {
-                        -scroll.x
-                    } else {
-                        scroll.x
-                    },
-                    delta_y: if matches!(event.code, PhysicalCode::Scroll(ScrollAxis::Vertical)) {
-                        -scroll.y
-                    } else {
-                        scroll.y
-                    },
+                event_model::Decision::Emit(vec![OutputEvent::ScrollTransform {
+                    invert_x: matches!(event.code, PhysicalCode::Scroll(ScrollAxis::Horizontal)),
+                    invert_y: matches!(event.code, PhysicalCode::Scroll(ScrollAxis::Vertical)),
                 }])
             }
             None => self.default_modifier_decision(event),
@@ -533,11 +691,11 @@ impl RuleEngine {
 
     fn default_modifier_decision(&mut self, event: &NormalizedEvent) -> event_model::Decision {
         if !matches!(event.kind, EventKind::Keyboard | EventKind::FlagsChanged) {
-            return event_model::Decision::Pass;
+            return self.pass_event(event);
         }
-        let mapped = map_modifiers(event.modifiers);
-        if mapped == event.modifiers {
-            return event_model::Decision::Pass;
+        let mapped = self.map_modifier_flags(event.modifiers);
+        if mapped == self.physical_modifier_flags(event.modifiers) {
+            return self.pass_event(event);
         }
         let output = OutputEvent::Key {
             code: event.code,
@@ -545,31 +703,103 @@ impl RuleEngine {
             modifiers: mapped,
         };
         if is_press_phase(effective_phase(event)) {
-            self.state.bindings.insert(event.code, vec![output.clone()]);
-            self.track_down(std::slice::from_ref(&output));
+            return self.acquire_binding(event, vec![output], false, true);
         }
         event_model::Decision::Emit(vec![output])
     }
 
-    fn track_down(&mut self, outputs: &[OutputEvent]) {
-        for output in outputs {
-            if let Some(code) = output_code(output) {
-                *self.state.logical_down.entry(code).or_default() += 1;
+    fn pass_event(&mut self, event: &NormalizedEvent) -> event_model::Decision {
+        if effective_phase(event) != EventPhase::Down {
+            return event_model::Decision::Pass;
+        }
+        let output = match event.code {
+            PhysicalCode::Key(_)
+                if matches!(event.kind, EventKind::Keyboard | EventKind::FlagsChanged) =>
+            {
+                OutputEvent::Key {
+                    code: event.code,
+                    phase: EventPhase::Down,
+                    modifiers: event.modifiers,
+                }
             }
+            PhysicalCode::MouseButton(button) if event.kind == EventKind::MouseButton => {
+                OutputEvent::MouseButton {
+                    button,
+                    phase: EventPhase::Down,
+                }
+            }
+            _ => return event_model::Decision::Pass,
+        };
+        self.acquire_binding(event, vec![output], true, true)
+    }
+
+    fn acquire_binding(
+        &mut self,
+        event: &NormalizedEvent,
+        outputs: Vec<OutputEvent>,
+        passthrough: bool,
+        follow_modifiers: bool,
+    ) -> event_model::Decision {
+        self.state.bindings.insert(
+            event.code,
+            SourceBinding {
+                outputs: outputs.clone(),
+                passthrough,
+                follow_modifiers,
+            },
+        );
+        let modifiers = self.map_modifier_flags(event.modifiers);
+        let mut emitted = Vec::new();
+        for mut output in outputs {
+            if let Some(code) = held_output_code(&output) {
+                let count = self.state.logical_down.entry(code).or_default();
+                let first = *count == 0;
+                *count += 1;
+                if !first {
+                    continue;
+                }
+                if let OutputEvent::Key {
+                    code,
+                    modifiers: flags,
+                    ..
+                } = &mut output
+                {
+                    if modifier_for_code(*code).is_some() {
+                        *flags = modifiers;
+                    }
+                }
+            }
+            emitted.push(output);
+        }
+        if emitted.is_empty() {
+            event_model::Decision::Suppress
+        } else if passthrough {
+            event_model::Decision::Pass
+        } else {
+            event_model::Decision::Emit(emitted)
         }
     }
 
-    fn release_binding(&mut self, binding: Vec<OutputEvent>) -> event_model::Decision {
-        if binding.is_empty() {
+    fn release_binding(
+        &mut self,
+        binding: SourceBinding,
+        event: &NormalizedEvent,
+    ) -> event_model::Decision {
+        if binding.outputs.is_empty() {
             return event_model::Decision::Suppress;
         }
         let mut output = Vec::new();
-        for event in binding {
-            if let Some(code) = output_code(&event) {
+        for held in binding.outputs {
+            if let Some(code) = held_output_code(&held) {
                 let count = self.state.logical_down.entry(code).or_default();
                 *count = count.saturating_sub(1);
                 if *count == 0 {
-                    if let Some(release) = release_event(&event) {
+                    if let Some(mut release) = release_event(&held) {
+                        if let OutputEvent::Key { modifiers, .. } = &mut release {
+                            if binding.follow_modifiers || modifier_for_code(code).is_some() {
+                                *modifiers = self.map_modifier_flags(event.modifiers);
+                            }
+                        }
                         output.push(release);
                     }
                     self.state.logical_down.remove(&code);
@@ -578,9 +808,44 @@ impl RuleEngine {
         }
         if output.is_empty() {
             event_model::Decision::Suppress
+        } else if binding.passthrough
+            && self.modifiers_for_event(event) == self.physical_modifier_flags(event.modifiers)
+        {
+            event_model::Decision::Pass
         } else {
             event_model::Decision::Emit(output)
         }
+    }
+
+    fn physical_modifier_flags(&self, observed: ModifierSet) -> ModifierSet {
+        let mut physical = observed | self.state.active_modifiers;
+        for source in self.state.bindings.keys() {
+            if let Some(modifier) = modifier_for_code(*source) {
+                physical.insert(modifier);
+            }
+        }
+        physical
+    }
+
+    fn map_modifier_flags(&self, physical: ModifierSet) -> ModifierSet {
+        let mut logical = self.physical_modifier_flags(physical);
+        for (code, binding) in &self.state.bindings {
+            if !binding.follow_modifiers {
+                if let Some(source) = modifier_for_code(*code) {
+                    logical.remove(source);
+                }
+            }
+        }
+        for binding in self.state.bindings.values() {
+            if !binding.follow_modifiers {
+                for output in &binding.outputs {
+                    if let Some(modifier) = output_modifier(output) {
+                        logical.insert(modifier);
+                    }
+                }
+            }
+        }
+        logical
     }
 }
 
@@ -588,6 +853,7 @@ fn append_release_outputs(
     outputs: &mut Vec<OutputEvent>,
     decision: Option<event_model::Decision>,
     event: &NormalizedEvent,
+    modifiers: ModifierSet,
 ) {
     match decision {
         Some(event_model::Decision::Emit(releases)) => outputs.extend(releases),
@@ -595,7 +861,7 @@ fn append_release_outputs(
         Some(event_model::Decision::Pass) | None => outputs.push(OutputEvent::Key {
             code: event.code,
             phase: EventPhase::Up,
-            modifiers: ModifierSet::NONE,
+            modifiers,
         }),
     }
 }
@@ -660,19 +926,16 @@ fn contains_any(value: ModifierSet, candidates: ModifierSet) -> bool {
 fn repeat_outputs(outputs: &[OutputEvent]) -> Vec<OutputEvent> {
     outputs
         .iter()
-        .map(|output| match output {
+        .filter_map(|output| match output {
             OutputEvent::Key {
                 code, modifiers, ..
-            } => OutputEvent::Key {
+            } => Some(OutputEvent::Key {
                 code: *code,
                 phase: EventPhase::Repeat,
                 modifiers: *modifiers,
-            },
-            OutputEvent::MouseButton { button, .. } => OutputEvent::MouseButton {
-                button: *button,
-                phase: EventPhase::Repeat,
-            },
-            other => other.clone(),
+            }),
+            OutputEvent::MouseButton { .. } => None,
+            other => Some(other.clone()),
         })
         .collect()
 }
@@ -681,7 +944,7 @@ fn output_code(output: &OutputEvent) -> Option<PhysicalCode> {
     match output {
         OutputEvent::Key { code, .. } => Some(*code),
         OutputEvent::MouseButton { button, .. } => Some(PhysicalCode::MouseButton(*button)),
-        OutputEvent::Scroll { .. } | OutputEvent::SystemShortcut(_) => None,
+        _ => None,
     }
 }
 
@@ -698,27 +961,45 @@ fn release_event(output: &OutputEvent) -> Option<OutputEvent> {
             button: *button,
             phase: EventPhase::Up,
         }),
-        OutputEvent::Scroll { .. } | OutputEvent::SystemShortcut(_) => None,
+        _ => None,
     }
 }
 
-fn map_modifiers(input: ModifierSet) -> ModifierSet {
-    let mut output = ModifierSet::NONE;
-    for (from, to) in [
-        (ModifierSet::LEFT_SHIFT, ModifierSet::LEFT_SHIFT),
-        (ModifierSet::RIGHT_SHIFT, ModifierSet::RIGHT_SHIFT),
-        (ModifierSet::LEFT_CONTROL, ModifierSet::LEFT_CONTROL),
-        (ModifierSet::RIGHT_CONTROL, ModifierSet::RIGHT_CONTROL),
-        (ModifierSet::LEFT_OPTION, ModifierSet::LEFT_WINDOWS),
-        (ModifierSet::RIGHT_OPTION, ModifierSet::RIGHT_WINDOWS),
-        (ModifierSet::LEFT_COMMAND, ModifierSet::LEFT_ALT),
-        (ModifierSet::RIGHT_COMMAND, ModifierSet::RIGHT_ALT),
+fn held_output_code(output: &OutputEvent) -> Option<PhysicalCode> {
+    match output {
+        OutputEvent::Key {
+            phase: EventPhase::Down,
+            ..
+        }
+        | OutputEvent::MouseButton {
+            phase: EventPhase::Down,
+            ..
+        } => output_code(output),
+        _ => None,
+    }
+}
+
+fn output_modifier(output: &OutputEvent) -> Option<ModifierSet> {
+    let OutputEvent::Key {
+        code,
+        modifiers,
+        phase: EventPhase::Down,
+    } = output
+    else {
+        return None;
+    };
+    let physical = modifier_for_code(*code)?;
+    for (target, semantic) in [
+        (55, ModifierSet::LEFT_WINDOWS),
+        (54, ModifierSet::RIGHT_WINDOWS),
+        (58, ModifierSet::LEFT_ALT),
+        (61, ModifierSet::RIGHT_ALT),
     ] {
-        if input.contains(from) {
-            output.insert(to);
+        if *code == PhysicalCode::key(target) && modifiers.contains(semantic) {
+            return Some(semantic);
         }
     }
-    output
+    Some(physical)
 }
 
 #[cfg(test)]
@@ -857,9 +1138,9 @@ mod tests {
         let mut engine = RuleEngine::new(CompiledRules::compile(vec![rule]).unwrap());
         assert_eq!(
             engine.handle(&event),
-            event_model::Decision::Emit(vec![OutputEvent::Scroll {
-                delta_x: 0.25,
-                delta_y: 2.5
+            event_model::Decision::Emit(vec![OutputEvent::ScrollTransform {
+                invert_x: false,
+                invert_y: true,
             }])
         );
     }
@@ -914,25 +1195,14 @@ mod tests {
     }
 
     #[test]
-    fn default_physical_modifier_mapping_emits_windows_semantics() {
+    fn empty_rules_leave_native_option_unchanged() {
         let mut engine = RuleEngine::new(CompiledRules::compile(vec![]).unwrap());
         let mut event = key(4, EventPhase::Down);
         event.modifiers = ModifierSet::LEFT_OPTION;
-        assert_eq!(
-            engine.handle(&event),
-            event_model::Decision::Emit(vec![OutputEvent::Key {
-                code: PhysicalCode::Key(4),
-                phase: EventPhase::Down,
-                modifiers: ModifierSet::LEFT_WINDOWS,
-            }])
-        );
+        assert_eq!(engine.handle(&event), event_model::Decision::Pass);
         assert_eq!(
             engine.handle(&key(4, EventPhase::Up)),
-            event_model::Decision::Emit(vec![OutputEvent::Key {
-                code: PhysicalCode::Key(4),
-                phase: EventPhase::Up,
-                modifiers: ModifierSet::LEFT_WINDOWS,
-            }])
+            event_model::Decision::Pass
         );
     }
 
@@ -986,23 +1256,10 @@ mod tests {
     }
 
     #[test]
-    fn flags_changed_modifier_pairs_changed_press_and_release() {
+    fn flags_changed_native_modifier_pairs_changed_press_and_release() {
         let mut engine = RuleEngine::new(CompiledRules::compile(vec![]).unwrap());
-        let press = NormalizedEvent {
-            kind: EventKind::FlagsChanged,
-            phase: EventPhase::Changed,
-            code: PhysicalCode::left_option(),
-            modifiers: ModifierSet::LEFT_OPTION,
-            ..key(58, EventPhase::Changed)
-        };
-        assert_eq!(
-            engine.handle(&press),
-            event_model::Decision::Emit(vec![OutputEvent::Key {
-                code: PhysicalCode::left_option(),
-                phase: EventPhase::Down,
-                modifiers: ModifierSet::LEFT_WINDOWS,
-            }])
-        );
+        let press = modifier(58, ModifierSet::LEFT_OPTION, 1);
+        assert_eq!(engine.handle(&press), event_model::Decision::Pass);
         assert!(engine.state().physical_down(PhysicalCode::left_option()));
         assert_eq!(
             engine
@@ -1010,17 +1267,9 @@ mod tests {
                 .logical_down_count(PhysicalCode::left_option()),
             1
         );
-        let release = NormalizedEvent {
-            modifiers: ModifierSet::NONE,
-            ..press
-        };
         assert_eq!(
-            engine.handle(&release),
-            event_model::Decision::Emit(vec![OutputEvent::Key {
-                code: PhysicalCode::left_option(),
-                phase: EventPhase::Up,
-                modifiers: ModifierSet::LEFT_WINDOWS,
-            }])
+            engine.handle(&modifier(58, ModifierSet::NONE, 2)),
+            event_model::Decision::Pass
         );
         assert_eq!(
             engine
@@ -1245,6 +1494,442 @@ mod tests {
         let mut engine = RuleEngine::new(CompiledRules::compile(vec![]).unwrap());
         assert_eq!(
             engine.handle(&modifier(57, ModifierSet::NONE, 1)),
+            event_model::Decision::Pass
+        );
+    }
+
+    #[test]
+    fn mapped_and_native_sources_share_target_in_every_order() {
+        for native_first in [false, true] {
+            for native_released_first in [false, true] {
+                let mut engine = RuleEngine::new(
+                    CompiledRules::compile(vec![replacement("a", 0, 1, 10)]).unwrap(),
+                );
+                let presses = if native_first { [1, 0] } else { [0, 1] };
+                engine.handle(&key(presses[0], EventPhase::Down));
+                assert_eq!(
+                    engine.handle(&key(presses[1], EventPhase::Down)),
+                    event_model::Decision::Suppress
+                );
+                assert_eq!(engine.state().logical_down_count(PhysicalCode::key(1)), 2);
+                let releases = if native_released_first {
+                    [1, 0]
+                } else {
+                    [0, 1]
+                };
+                assert_eq!(
+                    engine.handle(&key(releases[0], EventPhase::Up)),
+                    event_model::Decision::Suppress
+                );
+                assert_eq!(engine.state().logical_down_count(PhysicalCode::key(1)), 1);
+                let final_release = engine.handle(&key(releases[1], EventPhase::Up));
+                if releases[1] == 1 {
+                    assert_eq!(final_release, event_model::Decision::Pass);
+                } else {
+                    assert_eq!(
+                        final_release,
+                        event_model::Decision::Emit(vec![OutputEvent::Key {
+                            code: PhysicalCode::key(1),
+                            phase: EventPhase::Up,
+                            modifiers: ModifierSet::NONE,
+                        }])
+                    );
+                }
+                assert_eq!(engine.state().logical_down_count(PhysicalCode::key(1)), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn repeats_and_duplicate_down_do_not_acquire_extra_holds() {
+        let mut engine =
+            RuleEngine::new(CompiledRules::compile(vec![replacement("a", 0, 1, 10)]).unwrap());
+        engine.handle(&key(0, EventPhase::Down));
+        assert_eq!(
+            engine.handle(&key(0, EventPhase::Down)),
+            event_model::Decision::Suppress
+        );
+        engine.handle(&key(0, EventPhase::Repeat));
+        engine.handle(&key(0, EventPhase::Repeat));
+        assert_eq!(engine.state().logical_down_count(PhysicalCode::key(1)), 1);
+        engine.handle(&key(0, EventPhase::Up));
+        assert_eq!(engine.state().logical_down_count(PhysicalCode::key(1)), 0);
+    }
+
+    #[test]
+    fn release_all_preserves_native_holders_and_releases_mapped_only() {
+        let mut engine =
+            RuleEngine::new(CompiledRules::compile(vec![replacement("a", 0, 1, 10)]).unwrap());
+        engine.handle(&key(0, EventPhase::Down));
+        engine.handle(&key(1, EventPhase::Down));
+        engine.handle(&key(2, EventPhase::Down));
+        assert!(engine.release_all().is_empty());
+        engine.handle(&key(0, EventPhase::Down));
+        assert_eq!(engine.release_all().len(), 1);
+        assert!(engine.release_all().is_empty());
+    }
+
+    #[test]
+    fn restore_checkpoint_discards_uncommitted_mapping() {
+        let mut engine =
+            RuleEngine::new(CompiledRules::compile(vec![replacement("a", 0, 1, 10)]).unwrap());
+        let checkpoint = engine.checkpoint();
+        engine.handle(&key(0, EventPhase::Down));
+        engine.restore(checkpoint);
+        assert_eq!(engine.state().logical_down_count(PhysicalCode::key(1)), 0);
+        assert!(!engine.state().physical_down(PhysicalCode::key(0)));
+        assert!(engine.release_all().is_empty());
+    }
+
+    #[test]
+    fn modifier_chords_reject_non_atomic_actions() {
+        for action in [
+            Action::Pass,
+            Action::Suppress,
+            Action::InvertScroll,
+            Action::Replace(vec![OutputEvent::Key {
+                code: PhysicalCode::key(7),
+                phase: EventPhase::Down,
+                modifiers: ModifierSet::NONE,
+            }]),
+            Action::Replace(vec![
+                OutputEvent::SystemShortcut(
+                    event_model::SystemShortcut::SwitchInputSource
+                );
+                2
+            ]),
+        ] {
+            let mut rule = modifier_chord_rule();
+            rule.action = action;
+            assert!(matches!(
+                CompiledRules::compile(vec![rule]),
+                Err(EngineError::InvalidModifierChord { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn modifier_chords_respect_application_scope_and_unknown_context() {
+        let mut rule = modifier_chord_rule();
+        rule.scope = RuleScope::App {
+            bundle_id: "com.example.Editor".into(),
+        };
+        for bundle in [None, Some("com.apple.finder"), Some("com.example.Editor")] {
+            let mut engine = RuleEngine::new(CompiledRules::compile(vec![rule.clone()]).unwrap());
+            let mut event = modifier(59, ModifierSet::LEFT_CONTROL, 1);
+            event.app_context = bundle.map(|id| AppContext {
+                bundle_id: id.into(),
+            });
+            engine.handle(&event);
+            event.code = PhysicalCode::key(56);
+            event.modifiers = ModifierSet::LEFT_SHIFT;
+            engine.handle(&event);
+            event.modifiers = ModifierSet::NONE;
+            let result = engine.handle(&event);
+            assert_eq!(
+                matches!(result, event_model::Decision::Emit(ref outputs) if outputs.iter().any(|output| matches!(output, OutputEvent::SystemShortcut(_)))),
+                bundle == Some("com.example.Editor")
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_modifier_rules_drive_character_flags_and_release() {
+        let mut rule = replacement("option", 58, 55, 10);
+        rule.action = Action::Replace(vec![OutputEvent::Key {
+            code: PhysicalCode::key(55),
+            phase: EventPhase::Down,
+            modifiers: ModifierSet::LEFT_WINDOWS,
+        }]);
+        let mut engine = RuleEngine::new(CompiledRules::compile(vec![rule]).unwrap());
+        assert!(
+            matches!(engine.handle(&modifier(58, ModifierSet::LEFT_OPTION, 1)), event_model::Decision::Emit(ref outputs) if outputs == &vec![OutputEvent::Key {code: PhysicalCode::key(55), phase: EventPhase::Down, modifiers: ModifierSet::LEFT_WINDOWS}])
+        );
+        assert_eq!(engine.logical_modifiers(), ModifierSet::LEFT_WINDOWS);
+        let mut letter = key(4, EventPhase::Down);
+        letter.modifiers = ModifierSet::LEFT_OPTION;
+        assert!(
+            matches!(engine.handle(&letter), event_model::Decision::Emit(ref outputs) if outputs == &vec![OutputEvent::Key {code: PhysicalCode::key(4), phase: EventPhase::Down, modifiers: ModifierSet::LEFT_WINDOWS}])
+        );
+        engine.handle(&key(4, EventPhase::Up));
+        assert_eq!(
+            engine.handle(&modifier(58, ModifierSet::NONE, 2)),
+            event_model::Decision::Emit(vec![OutputEvent::Key {
+                code: PhysicalCode::key(55),
+                phase: EventPhase::Up,
+                modifiers: ModifierSet::NONE
+            }])
+        );
+        assert_eq!(engine.logical_modifiers(), ModifierSet::NONE);
+    }
+
+    #[test]
+    fn diagonal_scroll_combines_axis_rules_and_honors_axis_pass() {
+        let horizontal = Rule {
+            id: "horizontal".into(),
+            enabled: true,
+            priority: 1,
+            scope: RuleScope::Global,
+            trigger: Trigger::Scroll {
+                axis: ScrollAxis::Horizontal,
+            },
+            action: Action::InvertScroll,
+        };
+        let vertical = Rule {
+            id: "vertical".into(),
+            trigger: Trigger::Scroll {
+                axis: ScrollAxis::Vertical,
+            },
+            ..horizontal.clone()
+        };
+        let event = NormalizedEvent {
+            source: DeviceSource::Mouse,
+            kind: EventKind::Scroll,
+            phase: EventPhase::Motion,
+            code: PhysicalCode::Scroll(ScrollAxis::Vertical),
+            scroll: Some(event_model::ScrollDelta { x: 0.25, y: -2.5 }),
+            ..key(0, EventPhase::Motion)
+        };
+        let mut engine = RuleEngine::new(
+            CompiledRules::compile(vec![horizontal.clone(), vertical.clone()]).unwrap(),
+        );
+        assert_eq!(
+            engine.handle(&event),
+            event_model::Decision::Emit(vec![OutputEvent::ScrollTransform {
+                invert_x: true,
+                invert_y: true
+            }])
+        );
+        let mut pass = vertical;
+        pass.action = Action::Pass;
+        engine.replace_rules(CompiledRules::compile(vec![horizontal, pass]).unwrap());
+        assert_eq!(
+            engine.handle(&event),
+            event_model::Decision::Emit(vec![OutputEvent::ScrollTransform {
+                invert_x: true,
+                invert_y: false
+            }])
+        );
+    }
+
+    #[test]
+    fn mapped_modifier_releases_and_shutdown_preserve_native_control() {
+        for drain in [false, true] {
+            let mut rule = replacement("option", 58, 55, 10);
+            rule.action = Action::Replace(vec![OutputEvent::Key {
+                code: PhysicalCode::key(55),
+                phase: EventPhase::Down,
+                modifiers: ModifierSet::LEFT_WINDOWS,
+            }]);
+            let mut engine = RuleEngine::new(CompiledRules::compile(vec![rule]).unwrap());
+            assert_eq!(
+                engine.handle(&modifier(59, ModifierSet::LEFT_CONTROL, 1)),
+                event_model::Decision::Pass
+            );
+            engine.handle(&modifier(58, ModifierSet::LEFT_OPTION, 2));
+            assert_eq!(
+                engine.logical_modifiers(),
+                ModifierSet::LEFT_CONTROL | ModifierSet::LEFT_WINDOWS
+            );
+            let outputs = if drain {
+                engine.release_all()
+            } else {
+                match engine.handle(&modifier(58, ModifierSet::NONE, 3)) {
+                    event_model::Decision::Emit(outputs) => outputs,
+                    other => panic!("{other:?}"),
+                }
+            };
+            assert_eq!(
+                outputs,
+                vec![OutputEvent::Key {
+                    code: PhysicalCode::key(55),
+                    phase: EventPhase::Up,
+                    modifiers: ModifierSet::LEFT_CONTROL
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn keyboard_to_mouse_holds_do_not_repeat_mouse_down() {
+        let mut rule = replacement("mouse", 0, 1, 10);
+        rule.action = Action::Replace(vec![OutputEvent::MouseButton {
+            button: event_model::MouseButton::Right,
+            phase: EventPhase::Down,
+        }]);
+        let mut engine = RuleEngine::new(CompiledRules::compile(vec![rule]).unwrap());
+        engine.handle(&key(0, EventPhase::Down));
+        assert_eq!(
+            engine.handle(&key(0, EventPhase::Repeat)),
+            event_model::Decision::Suppress
+        );
+        assert_eq!(
+            engine.handle(&key(0, EventPhase::Up)),
+            event_model::Decision::Emit(vec![OutputEvent::MouseButton {
+                button: event_model::MouseButton::Right,
+                phase: EventPhase::Up
+            }])
+        );
+    }
+
+    #[test]
+    fn modifier_gesture_release_retains_other_native_modifier_flags() {
+        let mut engine =
+            RuleEngine::new(CompiledRules::compile(vec![modifier_chord_rule()]).unwrap());
+        engine.handle(&modifier(59, ModifierSet::LEFT_CONTROL, 1));
+        engine.handle(&modifier(56, ModifierSet::LEFT_SHIFT, 2));
+        assert_eq!(
+            engine.handle(&modifier(56, ModifierSet::NONE, 3)),
+            event_model::Decision::Emit(vec![
+                OutputEvent::SystemShortcut(event_model::SystemShortcut::SwitchInputSource),
+                OutputEvent::Key {
+                    code: PhysicalCode::key(56),
+                    phase: EventPhase::Up,
+                    modifiers: ModifierSet::LEFT_CONTROL
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn native_flags_rewrites_follow_current_modifiers_without_new_synthetic_holds() {
+        let mut rule = replacement("option", 58, 55, 10);
+        rule.action = Action::Replace(vec![OutputEvent::Key {
+            code: PhysicalCode::key(55),
+            phase: EventPhase::Down,
+            modifiers: ModifierSet::LEFT_WINDOWS,
+        }]);
+        let mut engine = RuleEngine::new(CompiledRules::compile(vec![rule]).unwrap());
+        engine.handle(&modifier(58, ModifierSet::LEFT_OPTION, 1));
+        let mut letter = key(1, EventPhase::Down);
+        letter.modifiers = ModifierSet::LEFT_OPTION;
+        engine.handle(&letter);
+        engine.handle(&modifier(58, ModifierSet::NONE, 2));
+        assert_eq!(
+            engine.handle(&key(1, EventPhase::Repeat)),
+            event_model::Decision::Emit(vec![OutputEvent::Key {
+                code: PhysicalCode::key(1),
+                phase: EventPhase::Repeat,
+                modifiers: ModifierSet::NONE
+            }])
+        );
+        assert!(engine.release_all().is_empty());
+    }
+
+    #[test]
+    fn native_modifier_pressed_during_mapping_survives_drain() {
+        let mut rule = replacement("option", 58, 55, 10);
+        rule.action = Action::Replace(vec![OutputEvent::Key {
+            code: PhysicalCode::key(55),
+            phase: EventPhase::Down,
+            modifiers: ModifierSet::LEFT_WINDOWS,
+        }]);
+        let mut engine = RuleEngine::new(CompiledRules::compile(vec![rule]).unwrap());
+        engine.handle(&modifier(58, ModifierSet::LEFT_OPTION, 1));
+        assert_eq!(
+            engine.handle(&modifier(59, ModifierSet::LEFT_CONTROL, 2)),
+            event_model::Decision::Emit(vec![OutputEvent::Key {
+                code: PhysicalCode::key(59),
+                phase: EventPhase::Down,
+                modifiers: ModifierSet::LEFT_CONTROL | ModifierSet::LEFT_WINDOWS
+            }])
+        );
+        assert_eq!(
+            engine.release_all(),
+            vec![OutputEvent::Key {
+                code: PhysicalCode::key(55),
+                phase: EventPhase::Up,
+                modifiers: ModifierSet::LEFT_CONTROL
+            }]
+        );
+    }
+
+    #[test]
+    fn ordinary_event_bootstraps_modifiers_held_before_enable() {
+        let mut engine = RuleEngine::new(CompiledRules::compile(vec![]).unwrap());
+        let mut event = key(96, EventPhase::Down);
+        event.modifiers = ModifierSet::LEFT_CONTROL;
+        assert_eq!(
+            engine.modifiers_for_event(&event),
+            ModifierSet::LEFT_CONTROL
+        );
+        engine.handle(&event);
+        assert_eq!(engine.logical_modifiers(), ModifierSet::LEFT_CONTROL);
+        let mut rule = replacement("option", 58, 55, 10);
+        rule.action = Action::Replace(vec![OutputEvent::Key {
+            code: PhysicalCode::key(55),
+            phase: EventPhase::Down,
+            modifiers: ModifierSet::LEFT_WINDOWS,
+        }]);
+        engine.replace_rules(CompiledRules::compile(vec![rule]).unwrap());
+        engine.handle(&modifier(58, ModifierSet::LEFT_OPTION, 1));
+        assert_eq!(
+            engine.release_all(),
+            vec![OutputEvent::Key {
+                code: PhysicalCode::key(55),
+                phase: EventPhase::Up,
+                modifiers: ModifierSet::LEFT_CONTROL
+            }]
+        );
+    }
+
+    #[test]
+    fn mouse_drag_uses_the_frozen_mapped_button() {
+        let mut rule = replacement("mouse", 0, 1, 10);
+        rule.trigger = Trigger::MouseButton {
+            button: event_model::MouseButton::Right,
+            phase: EventPhase::Down,
+        };
+        rule.action = Action::Replace(vec![OutputEvent::MouseButton {
+            button: event_model::MouseButton::Left,
+            phase: EventPhase::Down,
+        }]);
+        let mut engine = RuleEngine::new(CompiledRules::compile(vec![rule]).unwrap());
+        let down = NormalizedEvent {
+            source: DeviceSource::Mouse,
+            kind: EventKind::MouseButton,
+            phase: EventPhase::Down,
+            code: PhysicalCode::MouseButton(event_model::MouseButton::Right),
+            ..key(0, EventPhase::Down)
+        };
+        engine.handle(&down);
+        engine.replace_rules(CompiledRules::compile(vec![]).unwrap());
+        let drag = NormalizedEvent {
+            kind: EventKind::MouseMove,
+            phase: EventPhase::Motion,
+            ..down.clone()
+        };
+        assert_eq!(
+            engine.handle(&drag),
+            event_model::Decision::Emit(vec![OutputEvent::MouseDrag {
+                button: event_model::MouseButton::Left
+            }])
+        );
+        let up = NormalizedEvent {
+            phase: EventPhase::Up,
+            ..down
+        };
+        assert_eq!(
+            engine.handle(&up),
+            event_model::Decision::Emit(vec![OutputEvent::MouseButton {
+                button: event_model::MouseButton::Left,
+                phase: EventPhase::Up
+            }])
+        );
+    }
+
+    #[test]
+    fn rule_update_cancels_pending_gesture_without_releasing_native_modifiers() {
+        let mut engine = RuleEngine::new(CompiledRules::compile(vec![]).unwrap());
+        engine.handle(&modifier(59, ModifierSet::LEFT_CONTROL, 1));
+        engine.handle(&modifier(56, ModifierSet::LEFT_SHIFT, 2));
+        engine.replace_rules(CompiledRules::compile(vec![modifier_chord_rule()]).unwrap());
+        assert_eq!(
+            engine.handle(&modifier(56, ModifierSet::NONE, 3)),
+            event_model::Decision::Pass
+        );
+        assert_eq!(
+            engine.handle(&modifier(59, ModifierSet::NONE, 4)),
             event_model::Decision::Pass
         );
     }

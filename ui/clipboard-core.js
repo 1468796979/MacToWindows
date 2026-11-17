@@ -8,6 +8,7 @@
       entries: Array.isArray(snapshot?.entries) ? snapshot.entries : [],
       panelOpen: Boolean(snapshot?.panel_open ?? snapshot?.panelOpen),
       lastError: snapshot?.last_error ?? snapshot?.lastError ?? null,
+      operationError: snapshot?.operation_error ?? snapshot?.operationError ?? null,
     };
   }
 

@@ -27,11 +27,15 @@
             <button id="open-settings-button" class="text-button">打开系统设置</button>
           </div>
           <p id="permission-feedback" class="muted" aria-live="polite"></p>
+          <p id="settings-feedback" class="form-feedback" aria-live="polite"></p>
         </article>
         <article class="card profile-card">
           <div class="card-heading"><span>当前预设</span><span class="pill accent-pill">推荐</span></div>
-          <select id="profile-select"><option value="windows_physical">Windows 物理键位</option><option value="shortcut">快捷键习惯</option><option value="custom">自定义</option></select>
-          <p class="muted">左 Option → Windows，左 Command → Alt，Ctrl+A/C/V/X/Z、Ctrl+F5、Ctrl+Shift 和 Win+V 使用 Windows 习惯。</p>
+          <select id="profile-select" aria-label="当前预设" disabled></select>
+          <p class="muted">下方规则来自当前生效的本地配置；修改成功后自动保存。</p>
+          <label class="form-field">显示桌面输出快捷键<input id="show-desktop-shortcut" placeholder="key:103（F11）" /></label>
+          <div class="form-actions"><button id="show-desktop-save" class="secondary" type="button" disabled>保存快捷键</button></div>
+          <p class="muted form-hint">供 shortcut:show_desktop 使用，填写与 macOS“显示桌面”设置一致的快捷键，例如 key:103。</p>
           <p class="muted input-source-note">首次使用请在“键盘 → 文本输入 → 编辑”中关闭“使用 Caps Lock 键切换到和切换自 ABC”；Caps Lock 将保留为大小写锁定，Apple Pinyin 的单独 Shift 负责中英文切换。</p>
         </article>
       </section>
@@ -43,6 +47,7 @@
         </div>
         <label class="search"><span>⌕</span><input id="search" placeholder="搜索触发键、动作或规则名称" /></label>
         <div id="rules" class="rules"></div>
+        <p class="muted">内置行为（只读说明）：Caps Lock 保留原生大小写锁定，Apple Pinyin 的单独 Shift 负责中英文切换；左 Option+V 独立打开剪贴板历史，不受 Windows 模式开关影响。</p>
       </section>
 
       <section class="bottom-grid">
@@ -59,7 +64,7 @@
         </article>
       </section>
 
-      <footer><span>隐私：默认不记录字符、文本内容或完整按键序列。</span><span>配置保存在本机。</span></footer>
+      <footer><span>剪贴板历史仅保存在本机；输入映射不记录完整按键序列。</span><span>配置修改成功后保存在本机。</span></footer>
     </main>
     <div id="rule-dialog" class="modal" hidden role="dialog" aria-modal="true" aria-labelledby="rule-dialog-title">
       <div class="modal-backdrop" data-close-rule-dialog></div>
@@ -73,9 +78,9 @@
           <label class="form-field">触发键<input id="rule-trigger" name="trigger" required placeholder="例如：chord:left_control+key:11" /></label>
           <div class="form-actions"><button id="record-trigger" class="secondary" type="button">录制按键</button><span id="recording-state" class="muted" aria-live="polite"></span></div>
           <label class="form-field">动作<input id="rule-action" name="action" required placeholder="例如：command:key:11 或 shortcut:hard_refresh" /></label>
-          <p class="muted form-hint">可用格式：key:keycode、chord:修饰键+key:keycode、command:keycode、shortcut:动作名、pass、suppress。</p>
+          <p class="muted form-hint">可用格式：key:keycode、chord:left_control|right_shift+key:keycode、modifier_chord:left_control|right_shift、command:key:11、shortcut:动作名、pass、suppress。多个修饰键用 | 分隔。</p>
           <p id="rule-feedback" class="form-feedback" aria-live="polite"></p>
-          <div class="modal-actions"><button id="rule-cancel" class="secondary" type="button">取消</button><button class="primary" type="submit">添加规则</button></div>
+          <div class="modal-actions"><button id="rule-cancel" class="secondary" type="button">取消</button><button id="rule-submit" class="primary" type="submit">添加规则</button></div>
         </form>
       </section>
     </div>

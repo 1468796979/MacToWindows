@@ -188,9 +188,18 @@ pub enum OutputEvent {
         button: MouseButton,
         phase: EventPhase,
     },
+    /// Continue a mapped mouse-button hold using the source event's position.
+    MouseDrag {
+        button: MouseButton,
+    },
     Scroll {
         delta_x: f64,
         delta_y: f64,
+    },
+    /// Transform the original scroll event without discarding its precision or phases.
+    ScrollTransform {
+        invert_x: bool,
+        invert_y: bool,
     },
     SystemShortcut(SystemShortcut),
 }
@@ -212,6 +221,29 @@ pub enum SystemShortcut {
     SwitchInputSource,
     TogglePinyinEnglish,
     ShowClipboard,
+}
+
+/// Reassert held logical modifiers after a complete transient shortcut. The
+/// keycodes are macOS target keys; these snapshots do not create new holders.
+pub fn modifier_restore_outputs(modifiers: ModifierSet) -> Vec<OutputEvent> {
+    [
+        (56, ModifierSet::LEFT_SHIFT),
+        (60, ModifierSet::RIGHT_SHIFT),
+        (59, ModifierSet::LEFT_CONTROL),
+        (62, ModifierSet::RIGHT_CONTROL),
+        (58, ModifierSet::LEFT_OPTION | ModifierSet::LEFT_ALT),
+        (61, ModifierSet::RIGHT_OPTION | ModifierSet::RIGHT_ALT),
+        (55, ModifierSet::LEFT_COMMAND | ModifierSet::LEFT_WINDOWS),
+        (54, ModifierSet::RIGHT_COMMAND | ModifierSet::RIGHT_WINDOWS),
+    ]
+    .into_iter()
+    .filter(|(_, candidates)| modifiers.bits() & candidates.bits() != 0)
+    .map(|(code, _)| OutputEvent::Key {
+        code: PhysicalCode::key(code),
+        phase: EventPhase::Down,
+        modifiers,
+    })
+    .collect()
 }
 
 /// Returns the default Windows physical-key semantic conversion for modifiers.
@@ -309,6 +341,43 @@ mod tests {
             let decoded: OutputEvent = serde_json::from_str(&encoded).unwrap();
             assert_eq!(decoded, OutputEvent::SystemShortcut(shortcut));
         }
+    }
+
+    #[test]
+    fn contextual_mouse_and_scroll_outputs_round_trip() {
+        for output in [
+            OutputEvent::MouseDrag {
+                button: MouseButton::Other(4),
+            },
+            OutputEvent::ScrollTransform {
+                invert_x: true,
+                invert_y: false,
+            },
+        ] {
+            let encoded = serde_json::to_string(&output).unwrap();
+            assert_eq!(
+                serde_json::from_str::<OutputEvent>(&encoded).unwrap(),
+                output
+            );
+        }
+    }
+
+    #[test]
+    fn modifier_restoration_uses_actual_target_codes_and_deduplicates_aliases() {
+        let held = ModifierSet::LEFT_WINDOWS | ModifierSet::LEFT_COMMAND | ModifierSet::RIGHT_ALT;
+        let output = modifier_restore_outputs(held);
+        assert_eq!(output.len(), 2);
+        assert!(output.contains(&OutputEvent::Key {
+            code: PhysicalCode::key(55),
+            phase: EventPhase::Down,
+            modifiers: held
+        }));
+        assert!(output.contains(&OutputEvent::Key {
+            code: PhysicalCode::key(61),
+            phase: EventPhase::Down,
+            modifiers: held
+        }));
+        assert!(modifier_restore_outputs(ModifierSet::NONE).is_empty());
     }
 
     #[test]

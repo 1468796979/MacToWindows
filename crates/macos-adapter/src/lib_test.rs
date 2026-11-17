@@ -5,6 +5,70 @@ mod tests {
         InjectionError, SafeAdapter,
     };
     use diagnostics::{PermissionState, TapState};
+    use event_model::{ModifierSet, MouseButton, PhysicalCode, ScrollAxis};
+
+    #[test]
+    fn physical_modifier_snapshot_tracks_all_eight_native_sides() {
+        let keys = [
+            (56, ModifierSet::LEFT_SHIFT),
+            (60, ModifierSet::RIGHT_SHIFT),
+            (59, ModifierSet::LEFT_CONTROL),
+            (62, ModifierSet::RIGHT_CONTROL),
+            (58, ModifierSet::LEFT_OPTION),
+            (61, ModifierSet::RIGHT_OPTION),
+            (55, ModifierSet::LEFT_COMMAND),
+            (54, ModifierSet::RIGHT_COMMAND),
+        ];
+        for (held, expected) in keys {
+            assert_eq!(
+                super::super::modifier_snapshot_from_key_state(|code| code == held),
+                expected
+            );
+        }
+        assert_eq!(
+            super::super::modifier_snapshot_from_key_state(|code| [59, 62, 58, 61].contains(&code)),
+            ModifierSet::LEFT_CONTROL
+                | ModifierSet::RIGHT_CONTROL
+                | ModifierSet::LEFT_OPTION
+                | ModifierSet::RIGHT_OPTION
+        );
+        assert_eq!(
+            super::super::modifier_snapshot_from_key_state(|_| false),
+            ModifierSet::NONE
+        );
+    }
+
+    #[test]
+    fn physical_holds_query_only_the_appropriate_hardware_table() {
+        use super::super::physical_code_is_down_with as held;
+        assert!(held(
+            PhysicalCode::key(8),
+            |key| key == 8,
+            |_| panic!("keyboard must not query mouse")
+        ));
+        for button in [
+            MouseButton::Left,
+            MouseButton::Right,
+            MouseButton::Middle,
+            MouseButton::Other(31),
+        ] {
+            assert!(held(
+                PhysicalCode::MouseButton(button),
+                |_| panic!("mouse must not query keyboard"),
+                |_| true
+            ));
+        }
+        assert!(!held(
+            PhysicalCode::MouseButton(MouseButton::Other(32)),
+            |_| panic!(),
+            |_| panic!("invalid button must not reach FFI")
+        ));
+        assert!(!held(
+            PhysicalCode::Scroll(ScrollAxis::Vertical),
+            |_| panic!(),
+            |_| panic!()
+        ));
+    }
     #[test]
     fn marker_is_filtered_only_for_own_instance() {
         let marker = next_marker();

@@ -1,5 +1,5 @@
 use clipboard_core::{
-    ClipboardEntry, ClipboardHistory, ClipboardStore, IngestOutcome, LoadOutcome,
+    ClipboardEntry, ClipboardHistory, ClipboardStore, IngestOutcome, LoadOutcome, StoreError,
 };
 use macos_adapter::{ForegroundApplication, PasteboardError, PasteboardService};
 use serde::Serialize;
@@ -126,19 +126,187 @@ pub struct ClipboardSnapshot {
     pub entries: Vec<ClipboardEntry>,
     pub panel_open: bool,
     pub last_error: Option<String>,
+    pub persistence_pending: bool,
+    pub storage_error: Option<String>,
+    pub read_error: Option<String>,
+    pub operation_error: Option<String>,
 }
 
-impl ClipboardSnapshot {
-    fn from_history(
-        history: &ClipboardHistory,
-        panel_open: bool,
-        last_error: Option<String>,
-    ) -> Self {
+#[derive(Default, Debug, PartialEq, Eq, Clone)]
+struct ClipboardErrors {
+    storage: Option<String>,
+    read: Option<String>,
+    operation: Option<String>,
+}
+
+impl ClipboardErrors {
+    fn message(&self) -> Option<String> {
+        let messages: Vec<&str> = [&self.storage, &self.read, &self.operation]
+            .into_iter()
+            .filter_map(|message| message.as_deref())
+            .collect();
+        (!messages.is_empty()).then(|| messages.join("\n"))
+    }
+}
+
+/// The worker owns the current history. Disk is loaded once; a failed save must
+/// never turn a UI refresh into a replacement with an older persisted snapshot.
+struct HistoryState {
+    history: ClipboardHistory,
+    dirty: bool,
+    next_retry_at: Option<Instant>,
+    retry_step: usize,
+    storage_ready: bool,
+    errors: ClipboardErrors,
+}
+
+impl HistoryState {
+    fn from_load(result: Result<LoadOutcome, StoreError>) -> Self {
+        let (history, storage_error, storage_ready) = match result {
+            Ok(LoadOutcome::Loaded(history)) => (history, None, true),
+            Ok(LoadOutcome::RecoveredCorrupt { history, path }) => (
+                history,
+                Some(format!("历史文件损坏，已备份到 {}", path.display())),
+                true,
+            ),
+            Err(error) => (
+                ClipboardHistory::default(),
+                Some(format!(
+                    "加载剪贴板历史失败：{error}；已暂停写入，请修复文件后重启应用"
+                )),
+                false,
+            ),
+        };
         Self {
-            entries: history.entries().to_vec(),
-            panel_open,
-            last_error,
+            history,
+            dirty: false,
+            next_retry_at: None,
+            retry_step: 0,
+            storage_ready,
+            errors: ClipboardErrors {
+                storage: storage_error,
+                ..ClipboardErrors::default()
+            },
         }
+    }
+
+    fn snapshot(&self, panel_open: bool) -> ClipboardSnapshot {
+        ClipboardSnapshot {
+            entries: self.history.entries().to_vec(),
+            panel_open,
+            last_error: self.errors.message(),
+            persistence_pending: self.dirty,
+            storage_error: self.errors.storage.clone(),
+            read_error: self.errors.read.clone(),
+            operation_error: self.errors.operation.clone(),
+        }
+    }
+
+    fn collected(&mut self, history: ClipboardHistory, now: Instant) {
+        self.history = history;
+        if !self.dirty {
+            self.next_retry_at = Some(now);
+        }
+        self.dirty = true;
+    }
+
+    fn saved(&mut self) {
+        self.dirty = false;
+        self.next_retry_at = None;
+        self.retry_step = 0;
+        self.errors.storage = None;
+    }
+
+    fn save_current<F>(&mut self, now: Instant, save: F) -> Result<(), String>
+    where
+        F: FnOnce(&ClipboardHistory) -> Result<(), String>,
+    {
+        if !self.dirty {
+            return Ok(());
+        }
+        self.ensure_storage_ready()?;
+        match save(&self.history) {
+            Ok(()) => {
+                self.saved();
+                Ok(())
+            }
+            Err(error) => {
+                const RETRY_SECONDS: [u64; 6] = [1, 2, 4, 8, 16, 30];
+                let delay = RETRY_SECONDS[self.retry_step.min(RETRY_SECONDS.len() - 1)];
+                self.retry_step = (self.retry_step + 1).min(RETRY_SECONDS.len() - 1);
+                self.next_retry_at = Some(now + Duration::from_secs(delay));
+                self.errors.storage = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    fn retry_if_due<F>(&mut self, now: Instant, save: F) -> bool
+    where
+        F: FnOnce(&ClipboardHistory) -> Result<(), String>,
+    {
+        if !self.storage_ready
+            || !self.dirty
+            || self.next_retry_at.is_some_and(|deadline| now < deadline)
+        {
+            return false;
+        }
+        let before = (self.dirty, self.errors.clone());
+        let _ = self.save_current(now, save);
+        before != (self.dirty, self.errors.clone())
+    }
+
+    fn ensure_storage_ready(&self) -> Result<(), String> {
+        if self.storage_ready {
+            Ok(())
+        } else {
+            Err(self.errors.storage.clone().unwrap_or_else(|| {
+                "历史文件未成功加载，已暂停写入以保护原文件；请修复文件后重启应用".to_owned()
+            }))
+        }
+    }
+
+    fn commit_candidate<F>(&mut self, candidate: ClipboardHistory, save: F) -> Result<(), String>
+    where
+        F: FnOnce(&ClipboardHistory) -> Result<(), String>,
+    {
+        self.ensure_storage_ready()?;
+        match save(&candidate) {
+            Ok(()) => {
+                self.history = candidate;
+                self.saved();
+                self.errors.operation = None;
+                Ok(())
+            }
+            Err(error) => {
+                // Keep the original current history and retry schedule. A
+                // rejected delete/clear must not become a deferred mutation.
+                self.errors.storage = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    fn delete<F>(&mut self, id: u64, save: F) -> Result<(), String>
+    where
+        F: FnOnce(&ClipboardHistory) -> Result<(), String>,
+    {
+        let mut candidate = self.history.clone();
+        if !candidate.remove(id) {
+            let message = "剪贴板条目不存在".to_owned();
+            self.errors.operation = Some(message.clone());
+            return Err(message);
+        }
+        self.commit_candidate(candidate, save)
+    }
+
+    fn clear<F>(&mut self, save: F) -> Result<(), String>
+    where
+        F: FnOnce(&ClipboardHistory) -> Result<(), String>,
+    {
+        let mut candidate = self.history.clone();
+        candidate.clear();
+        self.commit_candidate(candidate, save)
     }
 }
 
@@ -179,6 +347,9 @@ enum WorkerCommand {
     Close {
         reply: Sender<Result<(), String>>,
     },
+    Shutdown {
+        reply: Sender<Result<(), String>>,
+    },
 }
 
 pub struct ClipboardManager {
@@ -205,6 +376,10 @@ impl ClipboardManager {
             entries: Vec::new(),
             panel_open: false,
             last_error: None,
+            persistence_pending: false,
+            storage_error: None,
+            read_error: None,
+            operation_error: None,
         }));
         let worker_snapshot = Arc::clone(&snapshot);
         let select_generation = Arc::new(AtomicU64::new(0));
@@ -237,7 +412,18 @@ impl ClipboardManager {
                 entries: Vec::new(),
                 panel_open: false,
                 last_error: Some("剪贴板状态锁不可用".into()),
+                persistence_pending: false,
+                storage_error: None,
+                read_error: None,
+                operation_error: None,
             })
+    }
+
+    pub fn last_error(&self) -> Option<String> {
+        self.snapshot
+            .lock()
+            .map(|snapshot| snapshot.last_error.clone())
+            .unwrap_or_else(|_| Some("剪贴板状态锁不可用".into()))
     }
 
     pub fn try_show(&self) -> bool {
@@ -277,6 +463,13 @@ impl ClipboardManager {
             .map_err(|_| ClipboardManagerError::WorkerUnavailable)
     }
 
+    /// Cancel selection, attempt one final save, and stop the worker. Invoke
+    /// from a background cleanup task so AppKit work can finish on the UI thread.
+    pub fn shutdown(&self) -> Result<(), ClipboardManagerError> {
+        self.select_generation.fetch_add(1, Ordering::AcqRel);
+        self.request(|reply| WorkerCommand::Shutdown { reply })
+    }
+
     fn request<F>(&self, build: F) -> Result<(), ClipboardManagerError>
     where
         F: FnOnce(Sender<Result<(), String>>) -> WorkerCommand,
@@ -293,6 +486,11 @@ impl ClipboardManager {
     }
 }
 
+fn save_history(path: &PathBuf, history: &ClipboardHistory) -> Result<(), String> {
+    ClipboardStore::save_atomic(path, history)
+        .map_err(|error| format!("保存剪贴板历史失败：{error}"))
+}
+
 fn worker_loop(
     app: AppHandle,
     history_path: PathBuf,
@@ -301,34 +499,24 @@ fn worker_loop(
     select_generation: Arc<AtomicU64>,
     marker: u64,
 ) {
-    let (mut history, mut last_error) = match ClipboardStore::load_or_recover(&history_path) {
-        Ok(LoadOutcome::Loaded(history)) => (history, None),
-        Ok(LoadOutcome::RecoveredCorrupt { history, path }) => (
-            history,
-            Some(format!("历史文件损坏，已备份到 {}", path.display())),
-        ),
-        Err(error) => (
-            ClipboardHistory::default(),
-            Some(format!("加载剪贴板历史失败：{error}")),
-        ),
+    let mut state = HistoryState::from_load(ClipboardStore::load_or_recover(&history_path));
+    let pasteboard = match PasteboardService::start() {
+        Ok(service) => Some(service),
+        Err(error) => {
+            state.errors.read = Some(format!("macOS 剪贴板服务不可用：{error}"));
+            None
+        }
     };
-    let mut pasteboard = PasteboardService::start().ok();
-    if pasteboard.is_none() && last_error.is_none() {
-        last_error = Some("macOS 剪贴板服务不可用".into());
-    }
     let own_bundle_id = app.config().identifier.clone();
-    let mut core = pasteboard.take().map(|service| {
-        ClipboardManagerCore::new_with_own_bundle(history.clone(), service, Some(own_bundle_id))
+    let mut core = pasteboard.map(|service| {
+        ClipboardManagerCore::new_with_own_bundle(
+            state.history.clone(),
+            service,
+            Some(own_bundle_id),
+        )
     });
     let mut panel_open = false;
-    publish_snapshot(
-        &app,
-        &snapshot,
-        &history,
-        panel_open,
-        last_error.as_deref(),
-        "clipboard-updated",
-    );
+    publish_snapshot(&app, &snapshot, &state, panel_open, "clipboard-updated");
 
     let poll_interval = Duration::from_millis(25);
     let command_wakeup = Duration::from_millis(20);
@@ -339,69 +527,76 @@ fn worker_loop(
             .min(command_wakeup);
         match receiver.recv_timeout(wait) {
             Ok(command) => {
-                let should_stop = handle_command(
+                if handle_command(
                     &app,
                     &history_path,
                     &mut core,
-                    &mut history,
+                    &mut state,
                     &mut panel_open,
-                    &mut last_error,
                     &snapshot,
                     &select_generation,
                     marker,
                     command,
-                );
-                if should_stop {
+                ) {
                     return;
                 }
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = state.save_current(Instant::now(), |history| {
+                    save_history(&history_path, history)
+                });
+                return;
+            }
         }
 
         if Instant::now() < next_poll {
             continue;
         }
         next_poll = Instant::now() + poll_interval;
-        if poll_clipboard_once(&mut core, &history_path, &mut history, &mut last_error) {
-            publish_snapshot(
-                &app,
-                &snapshot,
-                &history,
-                panel_open,
-                last_error.as_deref(),
-                "clipboard-updated",
-            );
+        if refresh_memory_history(&mut core, &mut state, Instant::now(), |history| {
+            save_history(&history_path, history)
+        }) {
+            publish_snapshot(&app, &snapshot, &state, panel_open, "clipboard-updated");
         }
     }
 }
 
-fn poll_clipboard_once(
+fn refresh_memory_history<F>(
     core: &mut Option<ClipboardManagerCore>,
-    history_path: &PathBuf,
-    history: &mut ClipboardHistory,
-    last_error: &mut Option<String>,
-) -> bool {
-    let Some(core) = core.as_mut() else {
-        return false;
-    };
-    match core.poll_once() {
-        Ok(Some(IngestOutcome::Added(_) | IngestOutcome::Moved(_))) => {
-            *history = core.history_clone();
-            if let Err(error) = ClipboardStore::save_atomic(history_path, history) {
-                *last_error = Some(format!("保存剪贴板历史失败：{error}"));
-            } else {
-                *last_error = None;
+    state: &mut HistoryState,
+    now: Instant,
+    save: F,
+) -> bool
+where
+    F: FnOnce(&ClipboardHistory) -> Result<(), String>,
+{
+    let mut changed = false;
+    if let Some(core) = core.as_mut() {
+        match core.poll_once() {
+            Ok(outcome) => {
+                changed |= state.errors.read.take().is_some();
+                if matches!(
+                    outcome,
+                    Some(IngestOutcome::Added(_) | IngestOutcome::Moved(_))
+                ) {
+                    state.collected(core.history_clone(), now);
+                    changed = true;
+                }
             }
-            true
+            Err(error) => {
+                let message = format!("读取系统剪贴板失败：{error}");
+                changed |= state.errors.read.as_deref() != Some(message.as_str());
+                state.errors.read = Some(message);
+            }
         }
-        Ok(Some(IngestOutcome::IgnoredEmpty | IngestOutcome::IgnoredTooLarge)) | Ok(None) => false,
-        Err(error) => {
-            let message = format!("读取系统剪贴板失败：{error}");
-            let changed = last_error.as_deref() != Some(message.as_str());
-            *last_error = Some(message);
-            changed
-        }
+    }
+    state.retry_if_due(now, save) || changed
+}
+
+fn sync_core_history(core: &mut Option<ClipboardManagerCore>, state: &HistoryState) {
+    if let Some(core) = core.as_mut() {
+        core.history = state.history.clone();
     }
 }
 
@@ -410,9 +605,8 @@ fn handle_command(
     app: &AppHandle,
     history_path: &PathBuf,
     core: &mut Option<ClipboardManagerCore>,
-    history: &mut ClipboardHistory,
+    state: &mut HistoryState,
     panel_open: &mut bool,
-    last_error: &mut Option<String>,
     snapshot: &Arc<Mutex<ClipboardSnapshot>>,
     select_generation: &Arc<AtomicU64>,
     marker: u64,
@@ -420,52 +614,35 @@ fn handle_command(
 ) -> bool {
     match command {
         WorkerCommand::Show => {
-            let _ = reload_history_from_store(history_path, core, history, last_error);
-            let _ = poll_clipboard_once(core, history_path, history, last_error);
+            refresh_memory_history(core, state, Instant::now(), |history| {
+                save_history(history_path, history)
+            });
             if !*panel_open {
-                *last_error = None;
+                state.errors.operation = None;
                 if let Some(core) = core.as_mut() {
                     core.target_bundle_id = None;
-                    let result = frontmost_application_on_main_thread(app)
-                        .map_err(|error| error.to_owned())
-                        .and_then(|target| {
-                            core.capture_target_value(target)
-                                .map_err(|error| error.to_string())
-                        });
+                    let result = frontmost_application_on_main_thread(app).and_then(|target| {
+                        core.capture_target_value(target)
+                            .map_err(|error| error.to_string())
+                    });
                     if let Err(error) = result {
-                        // Opening the panel while MacToWindows itself is
-                        // frontmost (or while macOS is between applications)
-                        // legitimately has no paste target. Keep history
-                        // usable and let selection report the missing target
-                        // only when the user actually chooses an item.
                         if should_report_show_capture_error(&error) {
-                            *last_error = Some(format!("无法记录前台应用：{error}"));
+                            state.errors.operation = Some(format!("无法记录前台应用：{error}"));
                         }
                     }
                 }
                 *panel_open = true;
             }
-            publish_snapshot(
-                app,
-                snapshot,
-                history,
-                *panel_open,
-                last_error.as_deref(),
-                "clipboard-show",
-            );
+            publish_snapshot(app, snapshot, state, *panel_open, "clipboard-show");
             show_window(app);
         }
         WorkerCommand::Refresh { reply } => {
-            let result = reload_history_from_store(history_path, core, history, last_error);
-            publish_snapshot(
-                app,
-                snapshot,
-                history,
-                *panel_open,
-                last_error.as_deref(),
-                "clipboard-updated",
-            );
-            let _ = reply.send(result);
+            refresh_memory_history(core, state, Instant::now(), |history| {
+                save_history(history_path, history)
+            });
+            publish_snapshot(app, snapshot, state, *panel_open, "clipboard-updated");
+            // A readable in-memory snapshot remains useful while disk is failing.
+            let _ = reply.send(Ok(()));
         }
         WorkerCommand::Select {
             id,
@@ -476,107 +653,49 @@ fn handle_command(
                 app,
                 core,
                 panel_open,
-                last_error,
+                &mut state.errors.operation,
                 select_generation,
                 generation,
                 marker,
                 id,
             );
             if let Err(error) = result.as_ref() {
-                if error == "操作已取消" {
-                    *last_error = None;
-                } else {
-                    *last_error = Some(error.clone());
-                }
+                state.errors.operation = (error != "操作已取消").then(|| error.clone());
             }
-            publish_snapshot(
-                app,
-                snapshot,
-                history,
-                *panel_open,
-                last_error.as_deref(),
-                "clipboard-updated",
-            );
+            publish_snapshot(app, snapshot, state, *panel_open, "clipboard-updated");
             let _ = reply.send(result);
         }
         WorkerCommand::Delete { id, reply } => {
-            let result = if history.entries().iter().any(|entry| entry.id == id) {
-                let mut candidate = history.clone();
-                candidate.remove(id);
-                match ClipboardStore::save_atomic(history_path, &candidate) {
-                    Ok(()) => {
-                        *history = candidate;
-                        if let Some(core) = core.as_mut() {
-                            core.history = history.clone();
-                        }
-                        *last_error = None;
-                        Ok(())
-                    }
-                    Err(error) => {
-                        let message = format!("保存剪贴板历史失败：{error}");
-                        *last_error = Some(message.clone());
-                        Err(message)
-                    }
-                }
-            } else {
-                let message = "剪贴板条目不存在".to_owned();
-                *last_error = Some(message.clone());
-                Err(message)
-            };
-            publish_snapshot(
-                app,
-                snapshot,
-                history,
-                *panel_open,
-                last_error.as_deref(),
-                "clipboard-updated",
-            );
+            let result = state.delete(id, |history| save_history(history_path, history));
+            if result.is_ok() {
+                sync_core_history(core, state);
+            }
+            publish_snapshot(app, snapshot, state, *panel_open, "clipboard-updated");
             let _ = reply.send(result);
         }
         WorkerCommand::Clear { reply } => {
-            let candidate = ClipboardHistory::default();
-            let result = match ClipboardStore::save_atomic(history_path, &candidate) {
-                Ok(()) => {
-                    *history = candidate;
-                    if let Some(core) = core.as_mut() {
-                        core.history = history.clone();
-                    }
-                    *last_error = None;
-                    Ok(())
-                }
-                Err(error) => {
-                    let message = format!("保存剪贴板历史失败：{error}");
-                    *last_error = Some(message.clone());
-                    Err(message)
-                }
-            };
-            publish_snapshot(
-                app,
-                snapshot,
-                history,
-                *panel_open,
-                last_error.as_deref(),
-                "clipboard-updated",
-            );
+            let result = state.clear(|history| save_history(history_path, history));
+            if result.is_ok() {
+                sync_core_history(core, state);
+            }
+            publish_snapshot(app, snapshot, state, *panel_open, "clipboard-updated");
             let _ = reply.send(result);
         }
         WorkerCommand::Close { reply } => {
             dismiss_panel(core, panel_open);
             let result = hide_window_and_wait(app);
-            if let Err(error) = &result {
-                *last_error = Some(error.clone());
-            } else {
-                *last_error = None;
-            }
-            publish_snapshot(
-                app,
-                snapshot,
-                history,
-                *panel_open,
-                last_error.as_deref(),
-                "clipboard-updated",
-            );
+            state.errors.operation = result.as_ref().err().cloned();
+            publish_snapshot(app, snapshot, state, *panel_open, "clipboard-updated");
             let _ = reply.send(result);
+        }
+        WorkerCommand::Shutdown { reply } => {
+            dismiss_panel(core, panel_open);
+            let result = state.save_current(Instant::now(), |history| {
+                save_history(history_path, history)
+            });
+            publish_snapshot(app, snapshot, state, *panel_open, "clipboard-updated");
+            let _ = reply.send(result);
+            return true;
         }
     }
     false
@@ -584,40 +703,6 @@ fn handle_command(
 
 fn should_report_show_capture_error(error: &str) -> bool {
     error != PasteboardError::ApplicationUnavailable.to_string()
-}
-
-fn reload_history_from_store(
-    history_path: &PathBuf,
-    core: &mut Option<ClipboardManagerCore>,
-    history: &mut ClipboardHistory,
-    last_error: &mut Option<String>,
-) -> Result<(), String> {
-    match ClipboardStore::load_or_recover(history_path) {
-        Ok(LoadOutcome::Loaded(loaded)) => {
-            *history = loaded.clone();
-            if let Some(core) = core.as_mut() {
-                core.history = loaded;
-            }
-            Ok(())
-        }
-        Ok(LoadOutcome::RecoveredCorrupt {
-            history: recovered,
-            path,
-        }) => {
-            *history = recovered.clone();
-            if let Some(core) = core.as_mut() {
-                core.history = recovered;
-            }
-            let message = format!("历史文件损坏，已备份到 {}", path.display());
-            *last_error = Some(message.clone());
-            Err(message)
-        }
-        Err(error) => {
-            let message = format!("加载剪贴板历史失败：{error}");
-            *last_error = Some(message.clone());
-            Err(message)
-        }
-    }
 }
 
 fn dismiss_panel(core: &mut Option<ClipboardManagerCore>, panel_open: &mut bool) {
@@ -811,12 +896,11 @@ fn wait_for_frontmost(
 fn publish_snapshot(
     app: &AppHandle,
     snapshot: &Arc<Mutex<ClipboardSnapshot>>,
-    history: &ClipboardHistory,
+    state: &HistoryState,
     panel_open: bool,
-    last_error: Option<&str>,
     event: &str,
 ) {
-    let value = ClipboardSnapshot::from_history(history, panel_open, last_error.map(str::to_owned));
+    let value = state.snapshot(panel_open);
     if let Ok(mut current) = snapshot.lock() {
         *current = value.clone();
     }
@@ -860,12 +944,14 @@ fn hide_window_and_wait(app: &AppHandle) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        dismiss_panel, reload_history_from_store, ClipboardManagerCore, ClipboardSelection,
+        dismiss_panel, refresh_memory_history, sync_core_history, ClipboardManagerCore,
+        ClipboardSelection, HistoryState,
     };
-    use clipboard_core::{ClipboardHistory, ClipboardStore, IngestOutcome};
+    use clipboard_core::{ClipboardHistory, IngestOutcome};
     use macos_adapter::{PasteboardBackend, PasteboardError, PasteboardService};
-    use std::path::PathBuf;
+    use std::cell::{Cell, RefCell};
     use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
 
     #[derive(Default)]
     struct MockState {
@@ -1000,43 +1086,265 @@ mod tests {
         assert!(core.as_ref().unwrap().target_bundle_id.is_none());
     }
 
-    #[test]
-    fn reload_history_syncs_worker_core_from_persisted_store() {
-        let path = std::env::temp_dir().join(format!(
-            "mactowindows-clipboard-refresh-{}.json",
-            std::process::id()
-        ));
-        let mut persisted = ClipboardHistory::default();
-        persisted.ingest("persisted-entry".into(), 1);
-        ClipboardStore::save_atomic(&path, &persisted).unwrap();
-
-        let service = PasteboardService::with_backend(Box::new(MockBackend {
-            state: Arc::new(Mutex::new(MockState::default())),
-        }));
-        let mut core = Some(ClipboardManagerCore::new_for_test(service));
+    fn history_state_with(texts: &[&str]) -> HistoryState {
         let mut history = ClipboardHistory::default();
-        let mut last_error = None;
-        reload_history_from_store(
-            &PathBuf::from(&path),
-            &mut core,
-            &mut history,
-            &mut last_error,
-        )
-        .unwrap();
+        for (index, text) in texts.iter().enumerate() {
+            history.ingest((*text).into(), index as u64);
+        }
+        HistoryState::from_load(Ok(clipboard_core::LoadOutcome::Loaded(history)))
+    }
 
-        assert_eq!(history.entries()[0].text, "persisted-entry");
-        assert_eq!(
-            core.as_ref().unwrap().history().entries()[0].text,
-            "persisted-entry"
+    fn mock_core(
+        history: &ClipboardHistory,
+    ) -> (Option<ClipboardManagerCore>, Arc<Mutex<MockState>>) {
+        let backend = Arc::new(Mutex::new(MockState::default()));
+        let service = PasteboardService::with_backend(Box::new(MockBackend {
+            state: Arc::clone(&backend),
+        }));
+        (
+            Some(ClipboardManagerCore::new_with_own_bundle(
+                history.clone(),
+                service,
+                None,
+            )),
+            backend,
+        )
+    }
+
+    #[test]
+    fn refresh_keeps_unsaved_entries_and_retries_without_another_copy() {
+        let mut state = history_state_with(&["alpha"]);
+        let (mut core, backend) = mock_core(&state.history);
+        let now = Instant::now();
+        let attempts = Cell::new(0);
+        refresh_memory_history(&mut core, &mut state, now, |_| Ok(()));
+        {
+            let mut backend = backend.lock().unwrap();
+            backend.count += 1;
+            backend.text = Some("beta".into());
+        }
+        refresh_memory_history(&mut core, &mut state, now, |_| {
+            attempts.set(attempts.get() + 1);
+            Err("disk unavailable".into())
+        });
+        assert_eq!(state.snapshot(true).entries.len(), 2);
+        assert!(state.snapshot(true).persistence_pending);
+        assert_eq!(state.errors.storage.as_deref(), Some("disk unavailable"));
+        // Both Show and Refresh use this same in-memory refresh operation.
+        for elapsed in [100, 500, 999] {
+            refresh_memory_history(
+                &mut core,
+                &mut state,
+                now + Duration::from_millis(elapsed),
+                |_| {
+                    attempts.set(attempts.get() + 1);
+                    Ok(())
+                },
+            );
+            assert_eq!(state.history.entries().len(), 2);
+            assert!(state.dirty);
+        }
+        assert_eq!(attempts.get(), 1);
+        let saved = RefCell::new(None);
+        refresh_memory_history(
+            &mut core,
+            &mut state,
+            now + Duration::from_secs(1),
+            |history| {
+                attempts.set(attempts.get() + 1);
+                *saved.borrow_mut() = Some(history.clone());
+                Ok(())
+            },
         );
-        assert!(last_error.is_none());
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_file(path.with_extension("bak"));
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(saved.borrow().as_ref().unwrap().entries()[0].text, "beta");
+        assert!(!state.dirty);
+        assert!(state.errors.storage.is_none());
+        assert_eq!(core.as_ref().unwrap().history(), &state.history);
+    }
+
+    #[test]
+    fn retry_backoff_is_capped_and_always_saves_latest_history() {
+        let mut state = history_state_with(&["alpha"]);
+        let start = Instant::now();
+        state.collected(state.history.clone(), start);
+        let mut now = start;
+        for delay in [1, 2, 4, 8, 16, 30, 30] {
+            state.retry_if_due(now, |_| Err("disk unavailable".into()));
+            assert_eq!(state.next_retry_at, Some(now + Duration::from_secs(delay)));
+            let called = Cell::new(false);
+            state.retry_if_due(now + Duration::from_millis(delay * 1000 - 1), |_| {
+                called.set(true);
+                Ok(())
+            });
+            assert!(!called.get());
+            now += Duration::from_secs(delay);
+        }
+        let mut latest = state.history.clone();
+        latest.ingest("beta".into(), 2);
+        latest.ingest("gamma".into(), 3);
+        state.collected(latest, now);
+        state.retry_if_due(now, |history| {
+            let texts: Vec<_> = history
+                .entries()
+                .iter()
+                .map(|entry| entry.text.as_str())
+                .collect();
+            assert_eq!(texts, ["gamma", "beta", "alpha"]);
+            Ok(())
+        });
+        assert!(!state.dirty);
+        assert_eq!(state.retry_step, 0);
+    }
+
+    #[test]
+    fn delete_and_clear_commit_latest_dirty_history_only_after_save_succeeds() {
+        let mut state = history_state_with(&["alpha", "beta"]);
+        let now = Instant::now();
+        state.collected(state.history.clone(), now);
+        state
+            .save_current(now, |_| Err("offline".into()))
+            .unwrap_err();
+        let original = state.history.clone();
+        let beta_id = original.entries()[0].id;
+        let retry_at = state.next_retry_at;
+        state
+            .delete(beta_id, |_| Err("offline delete".into()))
+            .unwrap_err();
+        assert_eq!(state.history, original);
+        assert_eq!(state.next_retry_at, retry_at);
+        assert!(state.dirty);
+        // An automatic retry saves the original history, not the rejected delete.
+        state.retry_if_due(retry_at.unwrap(), |history| {
+            assert_eq!(history, &original);
+            Err("offline".into())
+        });
+        state.clear(|_| Err("offline clear".into())).unwrap_err();
+        assert_eq!(state.history, original);
+        state
+            .delete(beta_id, |candidate| {
+                assert_eq!(candidate.entries().len(), 1);
+                assert_eq!(candidate.entries()[0].text, "alpha");
+                Ok(())
+            })
+            .unwrap();
+        assert!(!state.dirty);
+        let (mut core, _) = mock_core(&original);
+        sync_core_history(&mut core, &state);
+        assert_eq!(core.as_ref().unwrap().history(), &state.history);
+        let next_id = state.history.next_id;
+        state
+            .clear(|candidate| {
+                assert!(candidate.entries().is_empty());
+                assert_eq!(candidate.next_id, next_id);
+                Ok(())
+            })
+            .unwrap();
+        let called = Cell::new(false);
+        state.retry_if_due(now + Duration::from_secs(100), |_| {
+            called.set(true);
+            Ok(())
+        });
+        assert!(!called.get());
+        assert_eq!(
+            state.history.ingest("new".into(), 3),
+            IngestOutcome::Added(next_id)
+        );
+    }
+
+    #[test]
+    fn failed_clean_delete_is_not_queued_for_retry() {
+        let mut state = history_state_with(&["alpha"]);
+        let id = state.history.entries()[0].id;
+        state.delete(id, |_| Err("offline".into())).unwrap_err();
+        let called = Cell::new(false);
+        state.retry_if_due(Instant::now() + Duration::from_secs(100), |_| {
+            called.set(true);
+            Ok(())
+        });
+        assert!(!called.get());
+        assert_eq!(state.history.entries()[0].id, id);
+    }
+
+    #[test]
+    fn error_categories_survive_unrelated_success_and_refresh() {
+        let mut state = history_state_with(&["alpha"]);
+        let now = Instant::now();
+        state.collected(state.history.clone(), now);
+        state
+            .save_current(now, |_| Err("save error".into()))
+            .unwrap_err();
+        state.errors.operation = Some("paste error".into());
+        // Successful paste, cancelled selection, opening and closing only clear
+        // the operation slot; storage errors remain visible in snapshots.
+        state.errors.operation = None;
+        assert!(state
+            .snapshot(false)
+            .last_error
+            .unwrap()
+            .contains("save error"));
+        let (mut core, backend) = mock_core(&state.history);
+        backend.lock().unwrap().count = -1;
+        refresh_memory_history(&mut core, &mut state, now, |_| Ok(()));
+        assert!(state.errors.read.is_some());
+        assert_eq!(state.errors.storage.as_deref(), Some("save error"));
+        state.save_current(now, |_| Ok(())).unwrap();
+        assert!(state.errors.storage.is_none());
+        assert!(state.errors.read.is_some());
+        backend.lock().unwrap().count = 0;
+        refresh_memory_history(&mut core, &mut state, now, |_| Ok(()));
+        assert!(state.errors.read.is_none());
+    }
+
+    #[test]
+    fn startup_load_failure_blocks_overwriting_unknown_existing_history() {
+        let mut state =
+            HistoryState::from_load(Err(clipboard_core::StoreError::UnsupportedSchema(2)));
+        let now = Instant::now();
+        let mut pending = state.history.clone();
+        pending.ingest("new".into(), 1);
+        state.collected(pending, now);
+        let called = Cell::new(false);
+        assert!(state
+            .save_current(now, |_| {
+                called.set(true);
+                Ok(())
+            })
+            .is_err());
+        assert!(!called.get());
+        assert!(state.dirty);
+        assert!(state
+            .snapshot(true)
+            .last_error
+            .unwrap()
+            .contains("unsupported schema"));
+    }
+
+    #[test]
+    fn final_save_ignores_backoff_and_persists_pending_history() {
+        let mut state = history_state_with(&["alpha"]);
+        let now = Instant::now();
+        state.collected(state.history.clone(), now);
+        state
+            .save_current(now, |_| Err("offline".into()))
+            .unwrap_err();
+        state
+            .save_current(now, |history| {
+                assert_eq!(history.entries()[0].text, "alpha");
+                Ok(())
+            })
+            .unwrap();
+        assert!(!state.dirty);
     }
 
     impl PasteboardBackend for MockBackend {
         fn change_count(&mut self) -> Result<i64, PasteboardError> {
-            Ok(self.state.lock().unwrap().count)
+            let count = self.state.lock().unwrap().count;
+            if count < 0 {
+                Err(PasteboardError::ReadFailed)
+            } else {
+                Ok(count)
+            }
         }
         fn read_text(&mut self) -> Result<Option<String>, PasteboardError> {
             Ok(self.state.lock().unwrap().text.clone())

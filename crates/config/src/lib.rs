@@ -6,19 +6,23 @@ use rule_engine::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs::{self, File},
     io::{self, Write},
     path::Path,
 };
 use thiserror::Error;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// A deliberately small, extensible rule representation. Additional fields can be
 /// added without coupling this crate to the rule engine.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rule {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
     #[serde(default)]
     pub trigger: String,
     #[serde(default)]
@@ -36,6 +40,8 @@ pub struct Rule {
 impl Default for Rule {
     fn default() -> Self {
         Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "自定义规则".into(),
             trigger: String::new(),
             action: String::new(),
             enabled: true,
@@ -89,6 +95,24 @@ pub struct Profile {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemShortcutsConfig {
+    #[serde(default = "default_show_desktop")]
+    pub show_desktop: String,
+}
+
+fn default_show_desktop() -> String {
+    "key:103".into()
+}
+
+impl Default for SystemShortcutsConfig {
+    fn default() -> Self {
+        Self {
+            show_desktop: default_show_desktop(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
@@ -100,6 +124,8 @@ pub struct AppConfig {
     pub panic_hotkey: Vec<String>,
     #[serde(default)]
     pub mouse: MouseConfig,
+    #[serde(default)]
+    pub system_shortcuts: SystemShortcutsConfig,
     #[serde(default)]
     pub keyboard_rules: Vec<KeyboardRule>,
     #[serde(default)]
@@ -120,8 +146,9 @@ impl Default for AppConfig {
     }
 }
 
+// Missing versions belong to the legacy schema and must run migration.
 fn default_schema_version() -> u32 {
-    CURRENT_SCHEMA_VERSION
+    1
 }
 fn default_active_profile() -> String {
     "windows_physical".to_owned()
@@ -164,72 +191,191 @@ impl AppConfig {
         if !self.profiles.contains_key(&self.active_profile) {
             return Err(ConfigError::UnknownProfile(self.active_profile.clone()));
         }
+        for (category, rules) in [
+            ("keyboard_rules", &self.keyboard_rules),
+            ("mouse_rules", &self.mouse_rules),
+            ("global_hotkeys", &self.global_hotkeys),
+            ("app_rules", &self.app_rules),
+            ("device_rules", &self.device_rules),
+        ] {
+            if !rules.is_empty() {
+                return Err(ConfigError::InvalidRule(format!(
+                    "{category}: schema 2 requires rules inside an explicit profile; import legacy rules as schema 1"
+                )));
+            }
+        }
+        let mut ids = HashSet::new();
+        for (profile_id, profile) in &self.profiles {
+            for (category, rules) in profile_rule_lists(profile) {
+                for (index, rule) in rules.iter().enumerate() {
+                    let path = format!("profiles.{profile_id}.{category}[{index}]");
+                    let id = uuid::Uuid::parse_str(&rule.id)
+                        .ok()
+                        .filter(|id| id.get_version_num() == 4)
+                        .ok_or_else(|| {
+                            ConfigError::InvalidRule(format!("{path}.id must be a UUIDv4"))
+                        })?;
+                    if !ids.insert(id) {
+                        return Err(ConfigError::InvalidRule(format!("{path}.id is duplicated")));
+                    }
+                    if rule.name.trim().is_empty() {
+                        return Err(ConfigError::InvalidRule(format!(
+                            "{path}.name must not be empty"
+                        )));
+                    }
+                }
+            }
+            compile_profile(profile_id, profile)?;
+        }
+        self.show_desktop_output()?;
+        Ok(())
+    }
+
+    /// Desktop releases do not yet supply a reliable foreground application
+    /// context. Reject enabled scoped rules rather than silently globalizing them.
+    pub fn validate_desktop(&self) -> Result<(), ConfigError> {
+        self.validate()?;
+        for (profile_id, profile) in &self.profiles {
+            if let Some((index, _)) = profile
+                .app_rules
+                .iter()
+                .enumerate()
+                .find(|(_, rule)| rule.enabled)
+            {
+                return Err(ConfigError::UnsupportedScope(format!("profiles.{profile_id}.app_rules[{index}]: desktop application context is unavailable")));
+            }
+        }
         Ok(())
     }
 
     pub fn compile_active_profile(&self) -> Result<CompiledRules, ConfigError> {
         self.validate()?;
-        let base_profile = self
-            .profiles
-            .get(&self.active_profile)
-            .ok_or_else(|| ConfigError::UnknownProfile(self.active_profile.clone()))?;
-        let mut profile = base_profile.clone();
-        let profile_is_empty = profile.keyboard_rules.is_empty()
-            && profile.mouse_rules.is_empty()
-            && profile.global_hotkeys.is_empty()
-            && profile.app_rules.is_empty()
-            && profile.device_rules.is_empty();
-        if profile_is_empty {
-            profile.keyboard_rules = self.keyboard_rules.clone();
-            profile.mouse_rules = self.mouse_rules.clone();
-            profile.global_hotkeys = self.global_hotkeys.clone();
-            profile.app_rules = self.app_rules.clone();
-            profile.device_rules = self.device_rules.clone();
-        }
-        let mut rules = Vec::new();
-        compile_rules(
-            &mut rules,
-            &self.active_profile,
-            "keyboard_rules",
-            &profile.keyboard_rules,
-            |_| Ok(RuleScope::Global),
-        )?;
-        compile_rules(
-            &mut rules,
-            &self.active_profile,
-            "mouse_rules",
-            &profile.mouse_rules,
-            |_| Ok(RuleScope::Global),
-        )?;
-        compile_rules(
-            &mut rules,
-            &self.active_profile,
-            "global_hotkeys",
-            &profile.global_hotkeys,
-            |_| Ok(RuleScope::Global),
-        )?;
-        compile_rules(
-            &mut rules,
-            &self.active_profile,
-            "app_rules",
-            &profile.app_rules,
-            |input| {
-                let bundle_id = input.app_bundle_id.clone().ok_or_else(|| {
-                    ConfigError::InvalidRule("app_rules.app_bundle_id is required".into())
-                })?;
-                if bundle_id.trim().is_empty() {
-                    return Err(ConfigError::InvalidRule(
-                        "app_rules.app_bundle_id must not be empty".into(),
-                    ));
-                }
-                Ok(RuleScope::App { bundle_id })
-            },
-        )?;
-        if !profile.device_rules.is_empty() {
-            return Err(ConfigError::UnsupportedScope("device_rules".into()));
-        }
-        Ok(CompiledRules::compile(rules)?)
+        compile_profile(&self.active_profile, &self.profiles[&self.active_profile])
     }
+
+    pub fn show_desktop_output(&self) -> Result<Vec<OutputEvent>, ConfigError> {
+        let (key, modifiers) = match parse_trigger(&self.system_shortcuts.show_desktop) {
+            Some(Trigger::Key {
+                code,
+                phase: EventPhase::Down,
+                ..
+            }) => (code, ModifierSet::NONE),
+            Some(Trigger::Chord {
+                key,
+                modifiers,
+                phase: EventPhase::Down,
+            }) => (key, modifiers),
+            _ => {
+                return Err(ConfigError::InvalidRule(
+                    "system_shortcuts.show_desktop must be a key or modifier+key chord".into(),
+                ))
+            }
+        };
+        if modifier_codes()
+            .iter()
+            .any(|(code, flag)| *code == key && modifiers.contains(*flag))
+        {
+            return Err(ConfigError::InvalidRule(
+                "system_shortcuts.show_desktop repeats the main modifier key".into(),
+            ));
+        }
+        let mut outputs = Vec::new();
+        let mut flags = ModifierSet::NONE;
+        let held: Vec<_> = modifier_codes()
+            .into_iter()
+            .filter(|(_, flag)| modifiers.contains(*flag))
+            .collect();
+        for (code, flag) in &held {
+            flags.insert(*flag);
+            outputs.push(OutputEvent::Key {
+                code: *code,
+                phase: EventPhase::Down,
+                modifiers: flags,
+            });
+        }
+        outputs.push(OutputEvent::Key {
+            code: key,
+            phase: EventPhase::Down,
+            modifiers: flags
+                | modifier_codes()
+                    .into_iter()
+                    .find(|(code, _)| *code == key)
+                    .map(|(_, modifier)| modifier)
+                    .unwrap_or(ModifierSet::NONE),
+        });
+        outputs.push(OutputEvent::Key {
+            code: key,
+            phase: EventPhase::Up,
+            modifiers: flags,
+        });
+        for (code, flag) in held.into_iter().rev() {
+            flags.remove(flag);
+            outputs.push(OutputEvent::Key {
+                code,
+                phase: EventPhase::Up,
+                modifiers: flags,
+            });
+        }
+        Ok(outputs)
+    }
+}
+
+fn modifier_codes() -> [(PhysicalCode, ModifierSet); 8] {
+    [
+        (PhysicalCode::key(56), ModifierSet::LEFT_SHIFT),
+        (PhysicalCode::key(60), ModifierSet::RIGHT_SHIFT),
+        (PhysicalCode::key(59), ModifierSet::LEFT_CONTROL),
+        (PhysicalCode::key(62), ModifierSet::RIGHT_CONTROL),
+        (PhysicalCode::key(58), ModifierSet::LEFT_OPTION),
+        (PhysicalCode::key(61), ModifierSet::RIGHT_OPTION),
+        (PhysicalCode::key(55), ModifierSet::LEFT_COMMAND),
+        (PhysicalCode::key(54), ModifierSet::RIGHT_COMMAND),
+    ]
+}
+
+fn profile_rule_lists(profile: &Profile) -> [(&str, &[Rule]); 5] {
+    [
+        ("keyboard_rules", &profile.keyboard_rules),
+        ("mouse_rules", &profile.mouse_rules),
+        ("global_hotkeys", &profile.global_hotkeys),
+        ("app_rules", &profile.app_rules),
+        ("device_rules", &profile.device_rules),
+    ]
+}
+
+fn compile_profile(profile_id: &str, profile: &Profile) -> Result<CompiledRules, ConfigError> {
+    let mut rules = Vec::new();
+    for (category, inputs) in [
+        ("keyboard_rules", &profile.keyboard_rules),
+        ("mouse_rules", &profile.mouse_rules),
+        ("global_hotkeys", &profile.global_hotkeys),
+    ] {
+        compile_rules(&mut rules, profile_id, category, inputs, |_| {
+            Ok(RuleScope::Global)
+        })?;
+    }
+    compile_rules(
+        &mut rules,
+        profile_id,
+        "app_rules",
+        &profile.app_rules,
+        |input| {
+            let bundle_id = input
+                .app_bundle_id
+                .clone()
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| {
+                    ConfigError::InvalidRule(format!(
+                        "profiles.{profile_id}.app_rules.app_bundle_id is required"
+                    ))
+                })?;
+            Ok(RuleScope::App { bundle_id })
+        },
+    )?;
+    if profile.device_rules.iter().any(|rule| rule.enabled) {
+        return Err(ConfigError::UnsupportedScope("device_rules".into()));
+    }
+    Ok(CompiledRules::compile(rules)?)
 }
 
 fn compile_rules<F>(
@@ -243,12 +389,22 @@ where
     F: Fn(&Rule) -> Result<RuleScope, ConfigError>,
 {
     for (index, input) in inputs.iter().enumerate() {
-        let trigger = parse_trigger(&input.trigger)
-            .ok_or_else(|| ConfigError::InvalidRule(format!("{category}[{index}].trigger")))?;
-        let action = parse_action(&input.action)
-            .ok_or_else(|| ConfigError::InvalidRule(format!("{category}[{index}].action")))?;
+        let trigger = parse_trigger(&input.trigger).ok_or_else(|| {
+            ConfigError::InvalidRule(format!("profiles.{profile_id}.{category}[{index}].trigger"))
+        })?;
+        let action = parse_action(&input.action).ok_or_else(|| {
+            ConfigError::InvalidRule(format!("profiles.{profile_id}.{category}[{index}].action"))
+        })?;
+        if input.enabled
+            && matches!(trigger, Trigger::ModifierChord { .. })
+            && !matches!(&action, Action::Replace(outputs) if matches!(outputs.as_slice(), [OutputEvent::SystemShortcut(_)]))
+        {
+            return Err(ConfigError::InvalidRule(format!(
+                "profiles.{profile_id}.{category}[{index}].action: a release-only modifier chord requires exactly one system shortcut"
+            )));
+        }
         output.push(EngineRule {
-            id: format!("{profile_id}-{category}-{index}"),
+            id: input.id.clone(),
             enabled: input.enabled,
             priority: input.priority,
             scope: scope(input)?,
@@ -323,13 +479,27 @@ fn parse_action(value: &str) -> Option<Action> {
         }]));
     }
     Some(Action::Replace(vec![OutputEvent::Key {
-        code: parse_code(value)?,
+        code: match value {
+            "left_windows" => PhysicalCode::left_command(),
+            "right_windows" => PhysicalCode::right_command(),
+            "left_alt" => PhysicalCode::left_option(),
+            "right_alt" => PhysicalCode::right_option(),
+            _ => parse_code(value)?,
+        },
         phase: EventPhase::Down,
         modifiers: match value {
             "left_windows" => ModifierSet::LEFT_WINDOWS,
             "right_windows" => ModifierSet::RIGHT_WINDOWS,
             "left_alt" => ModifierSet::LEFT_ALT,
             "right_alt" => ModifierSet::RIGHT_ALT,
+            "left_option" => ModifierSet::LEFT_OPTION,
+            "right_option" => ModifierSet::RIGHT_OPTION,
+            "left_command" => ModifierSet::LEFT_COMMAND,
+            "right_command" => ModifierSet::RIGHT_COMMAND,
+            "left_control" => ModifierSet::LEFT_CONTROL,
+            "right_control" => ModifierSet::RIGHT_CONTROL,
+            "left_shift" => ModifierSet::LEFT_SHIFT,
+            "right_shift" => ModifierSet::RIGHT_SHIFT,
             _ => ModifierSet::NONE,
         },
     }]))
@@ -358,7 +528,16 @@ fn parse_mouse_button(value: &str) -> Option<MouseButton> {
         "left" => MouseButton::Left,
         "right" => MouseButton::Right,
         "middle" => MouseButton::Middle,
-        value => MouseButton::Other(value.strip_prefix("other:")?.parse().ok()?),
+        value => {
+            let button = value.strip_prefix("other:")?.parse::<u8>().ok()?;
+            match button {
+                0 => MouseButton::Left,
+                1 => MouseButton::Right,
+                2 => MouseButton::Middle,
+                3..=31 => MouseButton::Other(button),
+                _ => return None,
+            }
+        }
     })
 }
 
@@ -378,6 +557,8 @@ fn parse_system_shortcut(value: &str) -> Option<SystemShortcut> {
 
 fn parse_code(value: &str) -> Option<PhysicalCode> {
     match value {
+        "left_shift" => Some(PhysicalCode::key(56)),
+        "right_shift" => Some(PhysicalCode::key(60)),
         "left_control" => Some(PhysicalCode::left_control()),
         "left_option" | "left_windows" => Some(PhysicalCode::left_option()),
         "left_command" | "left_alt" => Some(PhysicalCode::left_command()),
@@ -393,7 +574,7 @@ fn parse_code(value: &str) -> Option<PhysicalCode> {
 }
 
 pub fn default_config() -> AppConfig {
-    let profile = Profile {
+    let mut profile = Profile {
         keyboard_rules: vec![
             Rule {
                 trigger: "left_option".into(),
@@ -403,6 +584,16 @@ pub fn default_config() -> AppConfig {
             Rule {
                 trigger: "left_command".into(),
                 action: "left_alt".into(),
+                ..Rule::default()
+            },
+            Rule {
+                trigger: "right_option".into(),
+                action: "right_windows".into(),
+                ..Rule::default()
+            },
+            Rule {
+                trigger: "right_command".into(),
+                action: "right_alt".into(),
                 ..Rule::default()
             },
             Rule {
@@ -477,29 +668,112 @@ pub fn default_config() -> AppConfig {
         ],
         ..Profile::default()
     };
+    for rule in &mut profile.keyboard_rules {
+        rule.name = format!("{} → {}", rule.trigger, rule.action);
+    }
     let mut profiles = BTreeMap::new();
     profiles.insert("windows_physical".into(), profile.clone());
-    profiles.insert("shortcut".into(), Profile::default());
-    profiles.insert("custom".into(), Profile::default());
+    for id in ["shortcut", "custom"] {
+        let mut independent = profile.clone();
+        for rule in &mut independent.keyboard_rules {
+            rule.id = uuid::Uuid::new_v4().to_string();
+        }
+        profiles.insert(id.into(), independent);
+    }
     AppConfig {
         schema_version: CURRENT_SCHEMA_VERSION,
         active_profile: "windows_physical".into(),
         enabled: false,
         panic_hotkey: default_panic_hotkey(),
         mouse: MouseConfig::default(),
-        keyboard_rules: profile.keyboard_rules.clone(),
-        mouse_rules: profile.mouse_rules.clone(),
-        global_hotkeys: profile.global_hotkeys.clone(),
-        app_rules: profile.app_rules.clone(),
-        device_rules: profile.device_rules.clone(),
+        system_shortcuts: SystemShortcutsConfig::default(),
+        keyboard_rules: Vec::new(),
+        mouse_rules: Vec::new(),
+        global_hotkeys: Vec::new(),
+        app_rules: Vec::new(),
+        device_rules: Vec::new(),
         profiles,
     }
 }
 
 pub fn import_toml(input: &str) -> Result<AppConfig, ConfigError> {
-    let config: AppConfig = toml::from_str(input)?;
-    config.compile_active_profile()?;
+    let mut config: AppConfig = toml::from_str(input)?;
+    if config.schema_version == 1 {
+        migrate_v1(&mut config);
+    }
+    config.validate()?;
     Ok(config)
+}
+
+fn migrate_v1(config: &mut AppConfig) {
+    let legacy = Profile {
+        keyboard_rules: std::mem::take(&mut config.keyboard_rules),
+        mouse_rules: std::mem::take(&mut config.mouse_rules),
+        global_hotkeys: std::mem::take(&mut config.global_hotkeys),
+        app_rules: std::mem::take(&mut config.app_rules),
+        device_rules: std::mem::take(&mut config.device_rules),
+    };
+    let mut ids = HashSet::new();
+    for profile in config.profiles.values_mut() {
+        if profile_rule_lists(profile)
+            .iter()
+            .all(|(_, rules)| rules.is_empty())
+        {
+            *profile = legacy.clone();
+        }
+        // Materialize the old engine's hidden conversion as editable rules.
+        // An explicit rule, including a disabled one, always wins over the baseline.
+        for (trigger, action) in [
+            ("left_option", "left_windows"),
+            ("right_option", "right_windows"),
+            ("left_command", "left_alt"),
+            ("right_command", "right_alt"),
+        ] {
+            let source = parse_code(trigger).unwrap();
+            let explicit = [
+                &profile.keyboard_rules,
+                &profile.mouse_rules,
+                &profile.global_hotkeys,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|rule| {
+                matches!(parse_trigger(&rule.trigger),
+                    Some(Trigger::Key {code, modifiers, phase: EventPhase::Down})
+                        if code == source && modifiers.required == ModifierSet::NONE)
+            });
+            if !explicit {
+                profile.keyboard_rules.push(Rule {
+                    trigger: trigger.into(),
+                    action: action.into(),
+                    priority: i32::MIN,
+                    name: format!("{trigger} → {action}"),
+                    ..Rule::default()
+                });
+            }
+        }
+        for rules in [
+            &mut profile.keyboard_rules,
+            &mut profile.mouse_rules,
+            &mut profile.global_hotkeys,
+            &mut profile.app_rules,
+            &mut profile.device_rules,
+        ] {
+            for rule in rules {
+                let valid_id = uuid::Uuid::parse_str(&rule.id)
+                    .ok()
+                    .filter(|id| id.get_version_num() == 4);
+                if valid_id.is_none() || !ids.insert(valid_id.unwrap()) {
+                    rule.id = uuid::Uuid::new_v4().to_string();
+                    ids.insert(uuid::Uuid::parse_str(&rule.id).unwrap());
+                }
+                if rule.name.trim().is_empty() {
+                    rule.name = format!("{} → {}", rule.trigger, rule.action);
+                }
+            }
+        }
+    }
+    config.schema_version = CURRENT_SCHEMA_VERSION;
 }
 
 pub fn export_toml(config: &AppConfig) -> Result<String, ConfigError> {
@@ -555,7 +829,7 @@ mod tests {
     #[test]
     fn default_config_is_valid_and_has_windows_profile() {
         let config = default_config();
-        assert_eq!(config.schema_version, 1);
+        assert_eq!(config.schema_version, 2);
         assert_eq!(config.active_profile, "windows_physical");
         assert!(config.profiles.contains_key("windows_physical"));
         config.validate().unwrap();
@@ -608,7 +882,7 @@ mod tests {
     fn active_profile_compiles_to_rule_snapshot() {
         let config = default_config();
         let compiled = config.compile_active_profile().unwrap();
-        assert_eq!(compiled.rules().len(), 13);
+        assert_eq!(compiled.rules().len(), 15);
     }
 
     #[test]
@@ -643,6 +917,7 @@ mod tests {
     fn compile_active_profile_includes_all_supported_rule_categories() {
         let mut config = default_config();
         let profile = config.profiles.get_mut("custom").unwrap();
+        *profile = Profile::default();
         profile.mouse_rules.push(Rule {
             trigger: "scroll:vertical".into(),
             action: "invert_scroll".into(),
@@ -696,16 +971,27 @@ mod tests {
     }
 
     #[test]
-    fn legacy_top_level_rules_are_used_when_profile_rules_are_empty() {
+    fn v2_rejects_legacy_top_level_rules_instead_of_implicit_fallback() {
         let mut config = default_config();
         config.active_profile = "custom".into();
+        config.profiles.insert("custom".into(), Profile::default());
         config.keyboard_rules = vec![Rule {
             trigger: "key:12".into(),
             action: "key:13".into(),
             ..Rule::default()
         }];
-        let compiled = config.compile_active_profile().unwrap();
-        assert_eq!(compiled.rules().len(), 1);
+        assert!(matches!(
+            config.compile_active_profile(),
+            Err(ConfigError::InvalidRule(_))
+        ));
+    }
+
+    #[test]
+    fn v2_empty_profile_is_explicitly_empty() {
+        let mut config = default_config();
+        config.active_profile = "custom".into();
+        config.profiles.insert("custom".into(), Profile::default());
+        assert!(config.compile_active_profile().unwrap().rules().is_empty());
     }
 
     #[test]
@@ -835,5 +1121,327 @@ mod tests {
                 )
             }));
         }
+    }
+
+    #[test]
+    fn custom_profile_starts_as_an_independent_copy_and_keeps_defaults_on_add() {
+        let mut config = default_config();
+        config.active_profile = "custom".into();
+        let original_windows = config.profiles["windows_physical"].clone();
+        config
+            .profiles
+            .get_mut("custom")
+            .unwrap()
+            .keyboard_rules
+            .push(Rule {
+                trigger: "key:12".into(),
+                action: "key:13".into(),
+                ..Rule::default()
+            });
+        assert_eq!(config.compile_active_profile().unwrap().rules().len(), 16);
+        assert_eq!(config.profiles["windows_physical"], original_windows);
+        let windows_ids: HashSet<_> = original_windows
+            .keyboard_rules
+            .iter()
+            .map(|rule| &rule.id)
+            .collect();
+        assert!(config.profiles["custom"]
+            .keyboard_rules
+            .iter()
+            .all(|rule| !windows_ids.contains(&rule.id)));
+    }
+
+    #[test]
+    fn migrate_legacy_empty_profiles_materializes_fallback_and_hidden_modifiers_once() {
+        let legacy = r#"
+            schema_version = 1
+            active_profile = "custom"
+            [[keyboard_rules]]
+            trigger = "key:12"
+            action = "key:13"
+            [profiles.custom]
+            [profiles.other]
+        "#;
+        let migrated = import_toml(legacy).unwrap();
+        assert_eq!(migrated.schema_version, 2);
+        assert!(migrated.keyboard_rules.is_empty());
+        for profile in migrated.profiles.values() {
+            assert_eq!(profile.keyboard_rules.len(), 5);
+            assert!(profile
+                .keyboard_rules
+                .iter()
+                .all(|rule| !rule.name.is_empty()
+                    && uuid::Uuid::parse_str(&rule.id).unwrap().get_version_num() == 4));
+        }
+        assert_eq!(
+            import_toml(&export_toml(&migrated).unwrap()).unwrap(),
+            migrated
+        );
+    }
+
+    #[test]
+    fn migrate_legacy_nonempty_profiles_does_not_merge_top_level_rules() {
+        let migrated = import_toml(
+            r#"
+            schema_version = 1
+            active_profile = "custom"
+            [[keyboard_rules]]
+            trigger = "key:12"
+            action = "key:13"
+            [[profiles.custom.mouse_rules]]
+            trigger = "scroll:vertical"
+            action = "invert_scroll"
+        "#,
+        )
+        .unwrap();
+        assert!(!migrated.profiles["custom"]
+            .keyboard_rules
+            .iter()
+            .any(|rule| rule.trigger == "key:12"));
+        assert_eq!(migrated.profiles["custom"].mouse_rules.len(), 1);
+    }
+
+    #[test]
+    fn v1_migration_respects_explicit_disabled_modifier_rule() {
+        let migrated = import_toml(
+            r#"
+            schema_version = 1
+            active_profile = "custom"
+            [[profiles.custom.keyboard_rules]]
+            trigger = "left_option"
+            action = "left_windows"
+            enabled = false
+        "#,
+        )
+        .unwrap();
+        let matching: Vec<_> = migrated.profiles["custom"]
+            .keyboard_rules
+            .iter()
+            .filter(|rule| rule.trigger == "left_option")
+            .collect();
+        assert_eq!(matching.len(), 1);
+        assert!(!matching[0].enabled);
+    }
+
+    #[test]
+    fn validates_inactive_profiles_and_rejects_duplicate_ids() {
+        let mut config = default_config();
+        config.profiles.get_mut("custom").unwrap().keyboard_rules[0].trigger = "key:999".into();
+        assert!(config.compile_active_profile().is_err());
+        let mut config = default_config();
+        let duplicate = config.profiles["windows_physical"].keyboard_rules[0]
+            .id
+            .clone();
+        config.profiles.get_mut("custom").unwrap().keyboard_rules[0].id = duplicate;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn v2_requires_stable_uuid_and_name() {
+        let mut config = default_config();
+        config
+            .profiles
+            .get_mut("windows_physical")
+            .unwrap()
+            .keyboard_rules[0]
+            .id
+            .clear();
+        assert!(config.validate().is_err());
+        let mut config = default_config();
+        config
+            .profiles
+            .get_mut("windows_physical")
+            .unwrap()
+            .keyboard_rules[0]
+            .name
+            .clear();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn desktop_rejects_enabled_application_rules_in_any_profile() {
+        let mut config = default_config();
+        config
+            .profiles
+            .get_mut("custom")
+            .unwrap()
+            .app_rules
+            .push(Rule {
+                trigger: "key:12".into(),
+                action: "pass".into(),
+                app_bundle_id: Some("com.example.Editor".into()),
+                ..Rule::default()
+            });
+        assert!(config.validate().is_ok());
+        assert!(matches!(
+            config.validate_desktop(),
+            Err(ConfigError::UnsupportedScope(_))
+        ));
+        config.profiles.get_mut("custom").unwrap().app_rules[0].enabled = false;
+        config.validate_desktop().unwrap();
+    }
+
+    #[test]
+    fn show_desktop_configuration_generates_complete_key_and_chord_pairs() {
+        let mut config = default_config();
+        assert_eq!(
+            config.show_desktop_output().unwrap(),
+            vec![
+                OutputEvent::Key {
+                    code: PhysicalCode::key(103),
+                    phase: EventPhase::Down,
+                    modifiers: ModifierSet::NONE
+                },
+                OutputEvent::Key {
+                    code: PhysicalCode::key(103),
+                    phase: EventPhase::Up,
+                    modifiers: ModifierSet::NONE
+                },
+            ]
+        );
+        config.system_shortcuts.show_desktop = "chord:left_control|left_shift+key:103".into();
+        let outputs = config.show_desktop_output().unwrap();
+        assert_eq!(outputs.len(), 6);
+        assert!(matches!(
+            outputs.last(),
+            Some(OutputEvent::Key {
+                phase: EventPhase::Up,
+                modifiers: ModifierSet::NONE,
+                ..
+            })
+        ));
+        config.system_shortcuts.show_desktop = "modifier_chord:left_shift".into();
+        assert!(config.validate().is_err());
+        config.system_shortcuts.show_desktop = "left_shift".into();
+        assert_eq!(
+            config.show_desktop_output().unwrap(),
+            vec![
+                OutputEvent::Key {
+                    code: PhysicalCode::key(56),
+                    phase: EventPhase::Down,
+                    modifiers: ModifierSet::LEFT_SHIFT
+                },
+                OutputEvent::Key {
+                    code: PhysicalCode::key(56),
+                    phase: EventPhase::Up,
+                    modifiers: ModifierSet::NONE
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn disabled_default_option_mapping_has_no_hidden_modifier_fallback() {
+        use event_model::{DeviceSource, EventKind, EventOrigin, NormalizedEvent};
+        let mut config = default_config();
+        config
+            .profiles
+            .get_mut("windows_physical")
+            .unwrap()
+            .keyboard_rules
+            .iter_mut()
+            .find(|rule| rule.trigger == "left_option")
+            .unwrap()
+            .enabled = false;
+        let mut engine = rule_engine::RuleEngine::new(config.compile_active_profile().unwrap());
+        let press = NormalizedEvent {
+            source: DeviceSource::Keyboard,
+            kind: EventKind::FlagsChanged,
+            phase: EventPhase::Changed,
+            code: PhysicalCode::left_option(),
+            modifiers: ModifierSet::LEFT_OPTION,
+            location: None,
+            scroll: None,
+            timestamp_ns: 1,
+            app_context: None,
+            origin: EventOrigin::Hardware,
+        };
+        assert_eq!(engine.handle(&press), event_model::Decision::Pass);
+        let letter = NormalizedEvent {
+            kind: EventKind::Keyboard,
+            phase: EventPhase::Down,
+            code: PhysicalCode::key(4),
+            ..press.clone()
+        };
+        assert_eq!(engine.handle(&letter), event_model::Decision::Pass);
+        assert_eq!(engine.logical_modifiers(), ModifierSet::LEFT_OPTION);
+        let release = NormalizedEvent {
+            modifiers: ModifierSet::NONE,
+            ..press
+        };
+        assert_eq!(engine.handle(&release), event_model::Decision::Pass);
+    }
+
+    #[test]
+    fn modifier_actions_use_native_target_codes_and_mouse_buttons_are_bounded() {
+        for (action, code) in [
+            ("left_windows", 55),
+            ("right_windows", 54),
+            ("left_alt", 58),
+            ("right_alt", 61),
+        ] {
+            assert!(
+                matches!(parse_action(action), Some(Action::Replace(ref outputs)) if matches!(outputs.as_slice(), [OutputEvent::Key {code: PhysicalCode::Key(target), ..}] if *target == code))
+            );
+        }
+        assert!(parse_action("mouse:other:255").is_none());
+        assert_eq!(parse_mouse_button("other:0"), Some(MouseButton::Left));
+        assert_eq!(parse_mouse_button("other:31"), Some(MouseButton::Other(31)));
+    }
+
+    #[test]
+    fn all_eight_recorded_modifier_names_compile_and_shift_outputs_keep_flags() {
+        let mut config = default_config();
+        let profile = config.profiles.get_mut("custom").unwrap();
+        *profile = Profile::default();
+        for trigger in [
+            "left_shift",
+            "right_shift",
+            "left_control",
+            "right_control",
+            "left_option",
+            "right_option",
+            "left_command",
+            "right_command",
+        ] {
+            profile.keyboard_rules.push(Rule {
+                trigger: trigger.into(),
+                action: "pass".into(),
+                ..Rule::default()
+            });
+        }
+        config.active_profile = "custom".into();
+        assert_eq!(config.compile_active_profile().unwrap().rules().len(), 8);
+        for (action, code, flag) in [
+            ("left_shift", 56, ModifierSet::LEFT_SHIFT),
+            ("right_shift", 60, ModifierSet::RIGHT_SHIFT),
+        ] {
+            assert_eq!(
+                parse_action(action),
+                Some(Action::Replace(vec![OutputEvent::Key {
+                    code: PhysicalCode::key(code),
+                    phase: EventPhase::Down,
+                    modifiers: flag,
+                }]))
+            );
+        }
+    }
+
+    #[test]
+    fn modifier_chord_action_error_identifies_profile_category_and_index() {
+        let mut config = default_config();
+        config
+            .profiles
+            .get_mut("custom")
+            .unwrap()
+            .global_hotkeys
+            .push(Rule {
+                trigger: "modifier_chord:left_control|left_shift".into(),
+                action: "suppress".into(),
+                ..Rule::default()
+            });
+        assert!(
+            matches!(config.validate(), Err(ConfigError::InvalidRule(message)) if message.contains("profiles.custom.global_hotkeys[0].action"))
+        );
     }
 }

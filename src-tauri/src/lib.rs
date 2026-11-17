@@ -4,16 +4,17 @@ use mac_to_windows_config::AppConfig;
 use macos_adapter::{
     EventAdapter, InjectionError, InputSourceCommand, InputSourceService, SafeAdapter,
 };
-use rule_engine::{CompiledRules, Rule, RuleEngine};
+use rule_engine::{CompiledRules, RuleEngine};
 use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread::JoinHandle;
-use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 mod clipboard;
+mod settings;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum RuntimeStatus {
@@ -131,12 +132,18 @@ pub struct RuntimeController {
     profile: String,
     config: Option<AppConfig>,
     status: RuntimeStatus,
+    config_revision: u64,
+    pending_releases: Vec<OutputEvent>,
+    last_error: Option<String>,
 }
 
 pub struct AppState {
     pub runtime: Arc<Mutex<RuntimeController>>,
     pub event_runtime: EventRuntime,
     clipboard: Arc<Mutex<Option<Arc<clipboard::ClipboardManager>>>>,
+    settings: settings::SettingsStore,
+    shutdown_started: AtomicBool,
+    shutdown_complete: AtomicBool,
 }
 
 impl AppState {
@@ -145,6 +152,9 @@ impl AppState {
             runtime: Arc::new(Mutex::new(RuntimeController::new(rules))),
             event_runtime: EventRuntime::default(),
             clipboard: Arc::new(Mutex::new(None)),
+            settings: settings::SettingsStore::default(),
+            shutdown_started: AtomicBool::new(false),
+            shutdown_complete: AtomicBool::new(false),
         }
     }
 
@@ -153,6 +163,9 @@ impl AppState {
             runtime: Arc::new(Mutex::new(RuntimeController::from_config(config)?)),
             event_runtime: EventRuntime::default(),
             clipboard: Arc::new(Mutex::new(None)),
+            settings: settings::SettingsStore::default(),
+            shutdown_started: AtomicBool::new(false),
+            shutdown_complete: AtomicBool::new(false),
         })
     }
 
@@ -179,7 +192,8 @@ impl AppState {
 
 #[derive(Default)]
 pub struct EventRuntime {
-    started: AtomicBool,
+    started: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -196,76 +210,101 @@ impl EventRuntime {
         if self.started.swap(true, Ordering::AcqRel) {
             return Ok(());
         }
+        self.stop.store(false, Ordering::Release);
         #[cfg(target_os = "macos")]
         {
             let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+            let stopped = Arc::clone(&self.stop);
+            let started = Arc::clone(&self.started);
             let thread = std::thread::Builder::new()
                 .name("mac-to-windows-event-tap".into())
                 .spawn(move || {
-                    let mask = event_mask();
+                    let callback_runtime = Arc::clone(&runtime);
+                    let marker = runtime.lock().map(|r| r.own_marker()).unwrap_or(0);
+                    let mut normalizer = macos_adapter::EventNormalizer::new(marker);
                     let mut clipboard_hotkey = ClipboardHotkeyLatch::default();
-                    let tap = macos_adapter::EventTap::create(mask, move |raw| {
+                    let tap = macos_adapter::EventTap::create(event_mask(), move |raw| {
                         if raw.is_tap_disabled() {
+                            normalizer.reset();
                             clipboard_hotkey.reset();
+                            if let Ok(mut controller) = callback_runtime.lock() {
+                                if controller.status == RuntimeStatus::Running {
+                                    controller.degrade_with(
+                                        "Event Tap 已被系统禁用，请重新启用映射".into(),
+                                        &mut macos_adapter::inject_outputs,
+                                    );
+                                }
+                            }
                             return macos_adapter::EventTapAction::Pass;
                         }
-                        let proxy = raw.proxy();
-                        let Some(event) = macos_adapter::normalize_event(raw) else {
+                        let Some(event) = normalizer.normalize(raw) else {
                             return macos_adapter::EventTapAction::Pass;
                         };
                         if let Some(action) = clipboard_hotkey.handle(&event) {
-                            if matches!(action, ClipboardHotkeyAction::Show) {
+                            if action == ClipboardHotkeyAction::Show {
                                 if let Some(manager) = &clipboard {
                                     let _ = manager.try_show();
                                 }
                             }
                             return macos_adapter::EventTapAction::Suppress;
                         }
-                        let decision = runtime
+                        let decision = callback_runtime
                             .lock()
                             .map(|mut controller| {
                                 controller.process_event_marked(&event, |outputs, marker| unsafe {
-                                    macos_adapter::inject_outputs_at(outputs, marker, proxy)
+                                    macos_adapter::inject_outputs_with_context(
+                                        outputs,
+                                        marker,
+                                        raw.proxy(),
+                                        raw.raw_event(),
+                                    )
                                 })
                             })
                             .unwrap_or(Decision::Pass);
-                        match decision {
-                            Decision::Suppress => macos_adapter::EventTapAction::Suppress,
-                            Decision::Pass | Decision::Emit(_) => {
-                                macos_adapter::EventTapAction::Pass
-                            }
+                        if decision == Decision::Suppress {
+                            macos_adapter::EventTapAction::Suppress
+                        } else {
+                            macos_adapter::EventTapAction::Pass
                         }
                     });
-                    let Ok(mut tap) = tap else {
-                        let _ = ready_tx.send(Err(
-                            "CGEventTap 创建失败，请检查辅助功能和输入监控权限".into(),
-                        ));
-                        return;
-                    };
-                    if let Err(error) = tap.start() {
-                        let _ = ready_tx.send(Err(format!("Event Tap 启动失败: {error:?}")));
-                        return;
+                    match tap {
+                        Ok(mut tap) => match tap.start() {
+                            Ok(()) => {
+                                let _ = ready_tx.send(Ok(()));
+                                tap.run_loop_until(&stopped);
+                                // Do not queue global cleanup behind a tap whose run loop has stopped.
+                                tap.stop();
+                                if let Ok(mut controller) = runtime.lock() {
+                                    if let Ok(outputs) = controller.apply(RuntimeCommand::Shutdown)
+                                    {
+                                        let _ = flush_outputs(&mut controller, &outputs);
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                let _ =
+                                    ready_tx.send(Err(format!("Event Tap 启动失败：{error:?}")));
+                            }
+                        },
+                        Err(error) => {
+                            let _ = ready_tx.send(Err(format!("Event Tap 创建失败：{error:?}")));
+                        }
                     }
-                    let _ = ready_tx.send(Ok(()));
-                    tap.run_loop();
+                    started.store(false, Ordering::Release);
                 })
-                .map_err(|error| error.to_string())?;
+                .map_err(|error| {
+                    self.started.store(false, Ordering::Release);
+                    error.to_string()
+                })?;
+            *self
+                .thread
+                .lock()
+                .map_err(|_| "event runtime lock poisoned")? = Some(thread);
             match ready_rx.recv_timeout(std::time::Duration::from_secs(3)) {
-                Ok(Ok(())) => {
-                    *self
-                        .thread
-                        .lock()
-                        .map_err(|_| "event runtime lock poisoned")? = Some(thread);
-                    Ok(())
-                }
-                Ok(Err(error)) => {
-                    self.started.store(false, Ordering::Release);
-                    let _ = thread.join();
-                    Err(error)
-                }
+                Ok(result) => result,
                 Err(error) => {
-                    self.started.store(false, Ordering::Release);
-                    Err(format!("Event Tap 启动超时: {error}"))
+                    self.stop.store(true, Ordering::Release);
+                    Err(format!("Event Tap 启动超时：{error}"))
                 }
             }
         }
@@ -275,6 +314,34 @@ impl EventRuntime {
             self.started.store(false, Ordering::Release);
             Err("Event Tap 仅支持 macOS".into())
         }
+    }
+
+    pub fn shutdown(&self, runtime: &Mutex<RuntimeController>) -> Result<(), String> {
+        self.stop.store(true, Ordering::Release);
+        let thread = self
+            .thread
+            .lock()
+            .map_err(|_| "event runtime lock poisoned")?
+            .take();
+        if let Some(thread) = thread {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !thread.is_finished() {
+                if std::time::Instant::now() >= deadline {
+                    *self
+                        .thread
+                        .lock()
+                        .map_err(|_| "event runtime lock poisoned")? = Some(thread);
+                    return Err("等待事件线程退出超时".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            thread.join().map_err(|_| "事件线程异常退出".to_owned())?;
+        }
+        let mut controller = runtime.lock().map_err(|_| "runtime lock poisoned")?;
+        let outputs = controller
+            .apply(RuntimeCommand::Shutdown)
+            .map_err(|e| format!("{e:?}"))?;
+        flush_outputs(&mut controller, &outputs).map_err(|e| format!("{e:?}"))
     }
 }
 
@@ -298,6 +365,8 @@ pub struct RuntimeView {
     pub event_runtime_started: bool,
     pub input_source: String,
     pub clipboard_status: String,
+    pub last_error: Option<String>,
+    pub pending_releases: usize,
 }
 
 impl RuntimeController {
@@ -317,10 +386,14 @@ impl RuntimeController {
             profile: "windows_physical".into(),
             config: None,
             status: RuntimeStatus::Disabled,
+            config_revision: 0,
+            pending_releases: Vec::new(),
+            last_error: None,
         }
     }
 
     pub fn from_config(config: AppConfig) -> Result<Self, mac_to_windows_config::ConfigError> {
+        config.validate_desktop()?;
         let rules = config.compile_active_profile()?;
         let profile = config.active_profile.clone();
         let mut controller = Self::new(rules);
@@ -357,94 +430,159 @@ impl RuntimeController {
         self.clipboard = Some(manager);
     }
 
+    fn install_config(&mut self, config: AppConfig, rules: CompiledRules) {
+        self.engine.replace_rules(rules);
+        self.profile = config.active_profile.clone();
+        self.config = Some(config);
+        self.config_revision += 1;
+    }
+
+    fn transition(&mut self, status: RuntimeStatus) -> Vec<OutputEvent> {
+        let mut releases = std::mem::take(&mut self.pending_releases);
+        for output in self.engine.release_all() {
+            if !releases.contains(&output) {
+                releases.push(output);
+            }
+        }
+        self.adapter.stop();
+        self.status = status;
+        if matches!(
+            self.status,
+            RuntimeStatus::Degraded | RuntimeStatus::PermissionRequired
+        ) {
+            self.diagnostics.set_tap_state(TapState::Degraded);
+        }
+        releases
+    }
+
+    fn flush_with<F>(
+        &mut self,
+        outputs: &[OutputEvent],
+        mut inject: F,
+    ) -> Result<(), InjectionError>
+    where
+        F: FnMut(&[OutputEvent], u64) -> Result<(), InjectionError>,
+    {
+        if outputs.is_empty() {
+            return Ok(());
+        }
+        #[cfg(not(test))]
+        let batch = prepare_cleanup_outputs(
+            outputs,
+            macos_adapter::physical_modifier_snapshot(),
+            macos_adapter::physical_code_is_down,
+        );
+        #[cfg(test)]
+        let batch = prepare_cleanup_outputs(outputs, event_model::ModifierSet::NONE, |_| false);
+        if batch.is_empty() {
+            self.pending_releases.clear();
+            return Ok(());
+        }
+        match inject(&batch, self.own_marker()) {
+            Ok(()) => {
+                self.pending_releases.clear();
+                Ok(())
+            }
+            Err(error) => {
+                for output in outputs {
+                    if !self.pending_releases.contains(output) {
+                        self.pending_releases.push(output.clone());
+                    }
+                }
+                self.last_error = Some(format!("按键释放尚未完成：{error}"));
+                self.diagnostics.record_injection_failure();
+                Err(error)
+            }
+        }
+    }
+
+    fn degrade_with<F>(&mut self, message: String, inject: &mut F)
+    where
+        F: FnMut(&[OutputEvent], u64) -> Result<(), InjectionError>,
+    {
+        let outputs = self.transition(RuntimeStatus::Degraded);
+        self.last_error = Some(message);
+        self.diagnostics.record_injection_failure();
+        let _ = self.flush_with(&outputs, inject);
+    }
+
+    fn permissions_refreshed(&mut self, permission: PermissionState) -> Vec<OutputEvent> {
+        self.adapter.set_permission(permission);
+        if permission != PermissionState::Granted {
+            self.last_error = Some("输入权限未就绪，映射已暂停".into());
+            return self.transition(RuntimeStatus::PermissionRequired);
+        }
+        if self.status == RuntimeStatus::PermissionRequired {
+            self.status = RuntimeStatus::Disabled;
+        }
+        std::mem::take(&mut self.pending_releases)
+    }
+
     pub fn apply(&mut self, command: RuntimeCommand) -> Result<Vec<OutputEvent>, RuntimeError> {
         match command {
             RuntimeCommand::Enable => {
-                if let Err(error) = self.adapter.start() {
-                    if matches!(error, InjectionError::PermissionDenied) {
-                        self.status = RuntimeStatus::PermissionRequired;
-                    }
+                if !self.pending_releases.is_empty() {
+                    let outputs = self.pending_releases.clone();
+                    self.flush_with(&outputs, macos_adapter::inject_outputs)
+                        .map_err(|e| RuntimeError::Injection(e.to_string()))?;
+                }
+                if self.adapter.start().is_err() {
+                    let outputs = self.transition(RuntimeStatus::PermissionRequired);
+                    self.pending_releases = outputs;
                     return Err(RuntimeError::PermissionDenied);
                 }
+                self.last_error = None;
                 self.status = RuntimeStatus::Running;
-                if let Some(config) = self.config.as_mut() {
-                    config.enabled = true;
-                }
             }
-            RuntimeCommand::Disable => {
-                let released = self.engine.release_all();
-                self.adapter.stop();
-                self.status = RuntimeStatus::Disabled;
-                if let Some(config) = self.config.as_mut() {
-                    config.enabled = false;
-                }
-                return Ok(released);
-            }
-            RuntimeCommand::ReplaceRules(rules) => {
-                let released = self.engine.release_all();
-                self.engine.replace_rules(rules);
-                return Ok(released);
-            }
+            RuntimeCommand::Disable => return Ok(self.transition(RuntimeStatus::Disabled)),
+            RuntimeCommand::ReplaceRules(rules) => self.engine.replace_rules(rules),
             RuntimeCommand::ReplaceConfig(config) => {
+                config
+                    .validate_desktop()
+                    .map_err(|e| RuntimeError::Configuration(e.to_string()))?;
                 let rules = config
                     .compile_active_profile()
-                    .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-                let released = self.engine.release_all();
-                self.engine.replace_rules(rules);
-                self.profile = config.active_profile.clone();
-                self.config = Some(config);
-                return Ok(released);
+                    .map_err(|e| RuntimeError::Configuration(e.to_string()))?;
+                self.install_config(config, rules);
             }
             RuntimeCommand::SetProfile(profile) => {
                 let mut config = self
                     .config
                     .clone()
                     .ok_or(RuntimeError::ProfileConfigurationUnavailable)?;
-                config.active_profile = profile.clone();
+                config.active_profile = profile;
+                config
+                    .validate_desktop()
+                    .map_err(|e| RuntimeError::Configuration(e.to_string()))?;
                 let rules = config
                     .compile_active_profile()
-                    .map_err(|error| RuntimeError::Configuration(error.to_string()))?;
-                let released = self.engine.release_all();
-                self.engine.replace_rules(rules);
-                self.config = Some(config);
-                self.profile = profile;
-                return Ok(released);
+                    .map_err(|e| RuntimeError::Configuration(e.to_string()))?;
+                self.install_config(config, rules);
             }
             RuntimeCommand::ReloadPermissions => {
                 let permission = self.adapter.request_permissions();
-                if permission == PermissionState::Granted {
-                    if self.status == RuntimeStatus::PermissionRequired {
-                        self.status = RuntimeStatus::Disabled;
-                    }
-                } else {
-                    self.adapter.stop();
-                    self.status = RuntimeStatus::PermissionRequired;
-                }
+                return Ok(self.permissions_refreshed(permission));
             }
-            RuntimeCommand::ReleaseAll => return Ok(self.engine.release_all()),
-            RuntimeCommand::Shutdown => {
-                let released = self.engine.release_all();
-                self.adapter.stop();
-                self.status = RuntimeStatus::Stopped;
-                if let Some(config) = self.config.as_mut() {
-                    config.enabled = false;
-                }
-                return Ok(released);
+            RuntimeCommand::ReleaseAll => {
+                let mut outputs = std::mem::take(&mut self.pending_releases);
+                outputs.extend(self.engine.release_all());
+                return Ok(outputs);
             }
+            RuntimeCommand::Shutdown => return Ok(self.transition(RuntimeStatus::Stopped)),
         }
         Ok(Vec::new())
     }
 
-    pub fn process_event<F>(&mut self, event: &NormalizedEvent, inject: F) -> Decision
+    pub fn process_event<F>(&mut self, event: &NormalizedEvent, mut inject: F) -> Decision
     where
-        F: FnOnce(&[OutputEvent]) -> Result<(), InjectionError>,
+        F: FnMut(&[OutputEvent]) -> Result<(), InjectionError>,
     {
         self.process_event_marked(event, |outputs, _marker| inject(outputs))
     }
 
-    pub fn process_event_marked<F>(&mut self, event: &NormalizedEvent, inject: F) -> Decision
+    pub fn process_event_marked<F>(&mut self, event: &NormalizedEvent, mut inject: F) -> Decision
     where
-        F: FnOnce(&[OutputEvent], u64) -> Result<(), InjectionError>,
+        F: FnMut(&[OutputEvent], u64) -> Result<(), InjectionError>,
     {
         self.diagnostics.record_seen();
         if let event_model::EventOrigin::Injected { marker } = event.origin {
@@ -453,26 +591,22 @@ impl RuntimeController {
                 return Decision::Pass;
             }
         }
+        if is_emergency_hotkey(event) {
+            let outputs = self.transition(RuntimeStatus::Disabled);
+            let _ = self.flush_with(&outputs, &mut inject);
+            self.diagnostics.record_passed();
+            return Decision::Pass;
+        }
         if self.status != RuntimeStatus::Running {
             self.diagnostics.record_passed();
             return Decision::Pass;
         }
-        if self
+        if let Some(error) = self
             .input_source
             .as_ref()
             .and_then(|service| service.take_last_error())
-            .is_some()
         {
-            self.diagnostics.record_injection_failure();
-            self.diagnostics.set_tap_state(TapState::Degraded);
-            self.status = RuntimeStatus::Degraded;
-            self.diagnostics.record_passed();
-            return Decision::Pass;
-        }
-        if is_emergency_hotkey(event) {
-            if let Ok(outputs) = self.apply(RuntimeCommand::Disable) {
-                let _ = macos_adapter::inject_outputs(&outputs, self.adapter.own_marker());
-            }
+            self.degrade_with(format!("输入源服务异常：{error:?}"), &mut inject);
             self.diagnostics.record_passed();
             return Decision::Pass;
         }
@@ -488,6 +622,7 @@ impl RuntimeController {
             })
             .unwrap_or(false);
         self.engine.set_pinyin_active(pinyin_toggle_available);
+        let checkpoint = self.engine.checkpoint();
         let decision = self.engine.handle(event);
         match decision {
             Decision::Pass => {
@@ -498,18 +633,19 @@ impl RuntimeController {
                 self.diagnostics.record_suppressed();
                 Decision::Suppress
             }
-            Decision::Emit(outputs) => match self.dispatch_outputs(&outputs, inject) {
+            Decision::Emit(outputs) => match self.dispatch_outputs(
+                &outputs,
+                self.engine.modifiers_for_event(event),
+                &mut inject,
+            ) {
                 Ok(()) => {
                     self.diagnostics.record_injected();
                     self.diagnostics.record_suppressed();
                     Decision::Suppress
                 }
-                Err(_) => {
-                    let released = self.engine.release_all();
-                    let _ = macos_adapter::inject_outputs(&released, self.adapter.own_marker());
-                    self.diagnostics.record_injection_failure();
-                    self.diagnostics.set_tap_state(TapState::Degraded);
-                    self.status = RuntimeStatus::Degraded;
+                Err(error) => {
+                    self.engine.restore(checkpoint);
+                    self.degrade_with(format!("事件注入失败：{error}"), &mut inject);
                     self.diagnostics.record_passed();
                     Decision::Pass
                 }
@@ -517,11 +653,17 @@ impl RuntimeController {
         }
     }
 
-    fn dispatch_outputs<F>(&self, outputs: &[OutputEvent], inject: F) -> Result<(), InjectionError>
+    fn dispatch_outputs<F>(
+        &self,
+        outputs: &[OutputEvent],
+        restore_flags: event_model::ModifierSet,
+        mut inject: F,
+    ) -> Result<(), InjectionError>
     where
-        F: FnOnce(&[OutputEvent], u64) -> Result<(), InjectionError>,
+        F: FnMut(&[OutputEvent], u64) -> Result<(), InjectionError>,
     {
         let mut regular = Vec::new();
+        let mut restore_modifiers = false;
         let mut input_source_error = None;
         for output in outputs {
             match output {
@@ -557,8 +699,24 @@ impl RuntimeController {
                         input_source_error = Some(InjectionError::Unavailable);
                     }
                 }
-                other => regular.push(other.clone()),
+                OutputEvent::SystemShortcut(SystemShortcut::ShowDesktop) => {
+                    restore_modifiers = true;
+                    let config = self.config.clone().unwrap_or_default();
+                    match config.show_desktop_output() {
+                        Ok(outputs) => regular.extend(outputs),
+                        Err(error) => {
+                            input_source_error = Some(InjectionError::Failed(error.to_string()))
+                        }
+                    }
+                }
+                other => {
+                    restore_modifiers |= matches!(other, OutputEvent::SystemShortcut(_));
+                    regular.push(other.clone());
+                }
             }
+        }
+        if restore_modifiers {
+            regular.extend(event_model::modifier_restore_outputs(restore_flags));
         }
         if let Some(error) = input_source_error {
             // The event tap must fall back to the original event when the
@@ -574,11 +732,56 @@ impl RuntimeController {
     }
 }
 
-fn flush_outputs(runtime: &RuntimeController, outputs: &[OutputEvent]) -> Result<(), RuntimeError> {
+fn prepare_cleanup_outputs<F>(
+    outputs: &[OutputEvent],
+    native_modifiers: event_model::ModifierSet,
+    mut physically_held: F,
+) -> Vec<OutputEvent>
+where
+    F: FnMut(event_model::PhysicalCode) -> bool,
+{
+    let mut batch = Vec::new();
+    for output in outputs {
+        match output {
+            OutputEvent::Key {
+                code,
+                phase: event_model::EventPhase::Up,
+                ..
+            } => {
+                if !physically_held(*code) {
+                    batch.push(OutputEvent::Key {
+                        code: *code,
+                        phase: event_model::EventPhase::Up,
+                        modifiers: native_modifiers,
+                    });
+                }
+            }
+            OutputEvent::MouseButton {
+                button,
+                phase: event_model::EventPhase::Up,
+            } => {
+                if !physically_held(event_model::PhysicalCode::MouseButton(*button)) {
+                    batch.push(output.clone());
+                }
+            }
+            _ => batch.push(output.clone()),
+        }
+    }
+    if !batch.is_empty() {
+        batch.extend(event_model::modifier_restore_outputs(native_modifiers));
+    }
+    batch
+}
+
+fn flush_outputs(
+    runtime: &mut RuntimeController,
+    outputs: &[OutputEvent],
+) -> Result<(), RuntimeError> {
     if outputs.is_empty() {
         return Ok(());
     }
-    macos_adapter::inject_outputs(outputs, runtime.adapter.own_marker())
+    runtime
+        .flush_with(outputs, macos_adapter::inject_outputs)
         .map_err(|error| RuntimeError::Injection(error.to_string()))
 }
 
@@ -592,6 +795,7 @@ fn is_emergency_hotkey(event: &NormalizedEvent) -> bool {
         )
 }
 
+#[cfg(test)]
 fn append_keyboard_rule(
     config: &mut AppConfig,
     rule: mac_to_windows_config::Rule,
@@ -621,16 +825,79 @@ fn should_restore_main_window(has_visible_windows: bool) -> bool {
     !has_visible_windows
 }
 
-pub fn run() {
-    let config = AppConfig::default();
-    let app_state = AppState::from_config(config).unwrap_or_else(|_| {
-        AppState::new(CompiledRules::compile(Vec::<Rule>::new()).expect("empty rules"))
+fn start_status_notifications(app: tauri::AppHandle) {
+    std::thread::spawn(move || {
+        let mut previous = None;
+        loop {
+            let state = app.state::<AppState>();
+            if state.shutdown_started.load(Ordering::Acquire) {
+                break;
+            }
+            // Emit away from the Event Tap callback; event counters are refreshed on demand.
+            let current = state.runtime.lock().ok().map(|r| {
+                (
+                    r.status.clone(),
+                    r.config_revision,
+                    r.last_error.clone(),
+                    r.pending_releases.len(),
+                )
+            });
+            if current != previous {
+                previous = current;
+                let _ = app.emit("runtime-changed", ());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
     });
+}
+
+fn begin_shutdown(app: &tauri::AppHandle, code: i32) {
+    let state = app.state::<AppState>();
+    if state.shutdown_started.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let worker_app = app.clone();
+    std::thread::spawn(move || {
+        let state = worker_app.state::<AppState>();
+        if let Err(error) = state.event_runtime.shutdown(&state.runtime) {
+            eprintln!("退出清理：{error}");
+        }
+        if let Some(manager) = state.clipboard() {
+            if let Err(error) = manager.shutdown() {
+                eprintln!("剪贴板退出清理：{error}");
+            }
+        }
+        state.shutdown_complete.store(true, Ordering::Release);
+        worker_app.exit(code);
+    });
+    let timer_app = app.clone();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        if !timer_app
+            .state::<AppState>()
+            .shutdown_complete
+            .swap(true, Ordering::AcqRel)
+        {
+            eprintln!("退出清理超时，按键释放或剪贴板持久化可能尚未完成");
+            timer_app.exit(code);
+        }
+    });
+}
+
+pub fn run() {
+    let config_path = clipboard_history_path().with_file_name("config.toml");
+    let (config, error) = settings::load_startup(&config_path);
+    let mut app_state = AppState::from_config(config).expect("validated startup configuration");
+    app_state.settings.path = Some(config_path);
+    *app_state.settings.error.lock().expect("new settings lock") = error;
     tauri::Builder::default()
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
             commands::toggle_mode,
             commands::runtime_status,
+            commands::settings_snapshot,
+            commands::set_rule_enabled,
+            commands::set_show_desktop_shortcut,
             commands::set_profile,
             commands::release_all,
             commands::emergency_disable,
@@ -668,6 +935,7 @@ pub fn run() {
                 .skip_taskbar(true)
                 .center()
                 .build()?;
+            start_status_notifications(app.handle().clone());
             let state = app.state::<AppState>();
             let manager = clipboard::ClipboardManager::start_with_marker(
                 app.handle().clone(),
@@ -693,7 +961,10 @@ pub fn run() {
                         }
                     }
                     "toggle" => {
-                        let _ = commands::toggle_mode(app.state::<AppState>());
+                        let app = app.clone();
+                        std::thread::spawn(move || {
+                            let _ = commands::toggle_mode_impl(&app.state::<AppState>());
+                        });
                     }
                     "quit" => app.exit(0),
                     _ => {}
@@ -704,6 +975,16 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building MacToWindows")
         .run(|app, event| {
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = &event {
+                if !app
+                    .state::<AppState>()
+                    .shutdown_complete
+                    .load(Ordering::Acquire)
+                {
+                    api.prevent_exit();
+                    begin_shutdown(app, code.unwrap_or(0));
+                }
+            }
             #[cfg(target_os = "macos")]
             if let tauri::RunEvent::Reopen {
                 has_visible_windows,
@@ -725,11 +1006,55 @@ pub fn run() {
         });
 }
 
+fn runtime_view(state: &AppState, runtime: &RuntimeController) -> RuntimeView {
+    let snapshot = runtime.diagnostics().snapshot();
+    let (listen_access, post_access) = runtime.adapter.permission_access();
+    let input_source = runtime
+        .input_source
+        .as_ref()
+        .and_then(|service| service.snapshot().current_id)
+        .unwrap_or_else(|| "未知".into());
+    let clipboard_status = state
+        .clipboard()
+        .and_then(|manager| manager.last_error())
+        .unwrap_or_else(|| "正常".into());
+    let tap_state =
+        if state.event_runtime.is_started() && matches!(snapshot.tap_state, TapState::Stopped) {
+            "Running".to_owned()
+        } else {
+            format!("{:?}", snapshot.tap_state)
+        };
+    RuntimeView {
+        status: runtime.status().clone(),
+        profile: runtime.profile().to_owned(),
+        events_seen: snapshot.events_seen,
+        injection_failures: snapshot.injection_failures,
+        tap_state,
+        permission: format!("{:?}", snapshot.permission),
+        listen_access,
+        post_access,
+        event_runtime_started: state.event_runtime.is_started(),
+        input_source,
+        clipboard_status,
+        last_error: runtime.last_error.clone(),
+        pending_releases: runtime.pending_releases.len(),
+    }
+}
+
 pub mod commands {
     use super::*;
 
     #[tauri::command]
-    pub fn toggle_mode(state: tauri::State<'_, AppState>) -> Result<bool, String> {
+    pub async fn toggle_mode(app: tauri::AppHandle) -> Result<bool, String> {
+        tauri::async_runtime::spawn_blocking(move || toggle_mode_impl(&app.state::<AppState>()))
+            .await
+            .map_err(|e| e.to_string())?
+    }
+
+    pub(super) fn toggle_mode_impl(state: &AppState) -> Result<bool, String> {
+        if state.shutdown_started.load(Ordering::Acquire) {
+            return Err("应用正在退出".into());
+        }
         let mut runtime = state
             .runtime
             .lock()
@@ -739,7 +1064,7 @@ pub mod commands {
                 let outputs = runtime
                     .apply(RuntimeCommand::Disable)
                     .map_err(|error| format!("{error:?}"))?;
-                flush_outputs(&runtime, &outputs).map_err(|error| format!("{error:?}"))?;
+                flush_outputs(&mut runtime, &outputs).map_err(|error| format!("{error:?}"))?;
                 Ok(false)
             }
             RuntimeStatus::Disabled
@@ -768,54 +1093,64 @@ pub mod commands {
 
     #[tauri::command]
     pub fn runtime_status(state: tauri::State<'_, AppState>) -> Result<RuntimeView, String> {
-        let runtime = state
-            .runtime
-            .lock()
-            .map_err(|_| "runtime lock poisoned".to_owned())?;
-        let snapshot = runtime.diagnostics().snapshot();
-        let (listen_access, post_access) = runtime.adapter.permission_access();
-        let input_source = runtime
-            .input_source
-            .as_ref()
-            .and_then(|service| service.snapshot().current_id)
-            .unwrap_or_else(|| "未知".into());
-        let clipboard_status = state
-            .clipboard()
-            .and_then(|manager| manager.snapshot().last_error)
-            .unwrap_or_else(|| "正常".into());
-        let tap_state = if state.event_runtime.is_started()
-            && matches!(snapshot.tap_state, TapState::Stopped)
-        {
-            "Running".to_owned()
-        } else {
-            format!("{:?}", snapshot.tap_state)
-        };
-        Ok(RuntimeView {
-            status: runtime.status().clone(),
-            profile: runtime.profile().to_owned(),
-            events_seen: snapshot.events_seen,
-            injection_failures: snapshot.injection_failures,
-            tap_state,
-            permission: format!("{:?}", snapshot.permission),
-            listen_access,
-            post_access,
-            event_runtime_started: state.event_runtime.is_started(),
-            input_source,
-            clipboard_status,
-        })
+        let runtime = state.runtime.lock().map_err(|_| "runtime lock poisoned")?;
+        Ok(runtime_view(&state, &runtime))
     }
 
     #[tauri::command]
-    pub fn set_profile(state: tauri::State<'_, AppState>, profile: String) -> Result<(), String> {
-        let mut runtime = state
-            .runtime
-            .lock()
-            .map_err(|_| "runtime lock poisoned".to_owned())?;
-        let outputs = runtime
-            .apply(RuntimeCommand::SetProfile(profile))
-            .map_err(|error| format!("{error:?}"))?;
-        flush_outputs(&runtime, &outputs).map_err(|error| format!("{error:?}"))?;
-        Ok(())
+    pub fn settings_snapshot(
+        state: tauri::State<'_, AppState>,
+    ) -> Result<settings::SettingsSnapshot, String> {
+        settings::snapshot(&state)
+    }
+
+    #[tauri::command]
+    pub async fn set_profile(
+        app: tauri::AppHandle,
+        profile: String,
+        expected_revision: u64,
+    ) -> Result<settings::SettingsSnapshot, String> {
+        tauri::async_runtime::spawn_blocking(move || {
+            settings::mutate(&app.state::<AppState>(), expected_revision, |config| {
+                config.active_profile = profile;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    #[tauri::command]
+    pub async fn set_rule_enabled(
+        app: tauri::AppHandle,
+        profile_id: String,
+        rule_id: String,
+        enabled: bool,
+        expected_revision: u64,
+    ) -> Result<settings::SettingsSnapshot, String> {
+        tauri::async_runtime::spawn_blocking(move || {
+            settings::mutate(&app.state::<AppState>(), expected_revision, |config| {
+                settings::set_enabled(config, &profile_id, &rule_id, enabled)
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    #[tauri::command]
+    pub async fn set_show_desktop_shortcut(
+        app: tauri::AppHandle,
+        trigger: String,
+        expected_revision: u64,
+    ) -> Result<settings::SettingsSnapshot, String> {
+        tauri::async_runtime::spawn_blocking(move || {
+            settings::mutate(&app.state::<AppState>(), expected_revision, |config| {
+                config.system_shortcuts.show_desktop = trigger;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
 
     #[tauri::command]
@@ -827,7 +1162,7 @@ pub mod commands {
         let outputs = runtime
             .apply(RuntimeCommand::ReleaseAll)
             .map_err(|error| format!("{error:?}"))?;
-        flush_outputs(&runtime, &outputs).map_err(|error| format!("{error:?}"))?;
+        flush_outputs(&mut runtime, &outputs).map_err(|error| format!("{error:?}"))?;
         Ok(outputs.len())
     }
 
@@ -840,61 +1175,76 @@ pub mod commands {
         let outputs = runtime
             .apply(RuntimeCommand::Disable)
             .map_err(|error| format!("{error:?}"))?;
-        flush_outputs(&runtime, &outputs).map_err(|error| format!("{error:?}"))?;
+        flush_outputs(&mut runtime, &outputs).map_err(|error| format!("{error:?}"))?;
         Ok(())
     }
 
     #[tauri::command]
-    pub fn add_rule(
-        state: tauri::State<'_, AppState>,
+    pub async fn add_rule(
+        app: tauri::AppHandle,
+        name: String,
         trigger: String,
         action: String,
         enabled: bool,
         priority: i32,
-    ) -> Result<(), String> {
-        let mut runtime = state
-            .runtime
-            .lock()
-            .map_err(|_| "runtime lock poisoned".to_owned())?;
-        let mut config = runtime
-            .config()
-            .cloned()
-            .ok_or_else(|| "运行时没有可编辑的配置".to_owned())?;
-        append_keyboard_rule(
-            &mut config,
-            mac_to_windows_config::Rule {
-                trigger,
-                action,
-                enabled,
-                priority,
-                ..mac_to_windows_config::Rule::default()
-            },
-        )?;
-        let outputs = runtime
-            .apply(RuntimeCommand::ReplaceConfig(config))
-            .map_err(|error| format!("{error:?}"))?;
-        flush_outputs(&runtime, &outputs).map_err(|error| format!("{error:?}"))?;
-        Ok(())
+        expected_revision: u64,
+    ) -> Result<settings::SettingsSnapshot, String> {
+        tauri::async_runtime::spawn_blocking(move || {
+            settings::mutate(&app.state::<AppState>(), expected_revision, |config| {
+                let rule = mac_to_windows_config::Rule {
+                    name,
+                    trigger,
+                    action,
+                    enabled,
+                    priority,
+                    ..Default::default()
+                };
+                let profile = config
+                    .profiles
+                    .get_mut(&config.active_profile)
+                    .ok_or("预设不存在")?;
+                if rule.trigger.starts_with("mouse:") || rule.trigger.starts_with("scroll:") {
+                    profile.mouse_rules.push(rule);
+                } else {
+                    profile.keyboard_rules.push(rule);
+                }
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
 
     #[tauri::command]
-    pub fn reload_permissions(state: tauri::State<'_, AppState>) -> Result<RuntimeStatus, String> {
-        let status = {
-            let mut runtime = state
-                .runtime
-                .lock()
-                .map_err(|_| "runtime lock poisoned".to_owned())?;
-            runtime
-                .apply(RuntimeCommand::ReloadPermissions)
-                .map_err(|error| format!("{error:?}"))?;
-            runtime.status().clone()
-        };
-        if !state.event_runtime.is_started() {
-            let _ = state
-                .event_runtime
-                .start(Arc::clone(&state.runtime), state.clipboard());
-        }
-        Ok(status)
+    pub async fn reload_permissions(app: tauri::AppHandle) -> Result<RuntimeStatus, String> {
+        tauri::async_runtime::spawn_blocking(move || {
+            #[cfg(target_os = "macos")]
+            let permission = {
+                let (listen, post) = macos_adapter::platform::request_permissions();
+                if listen && post {
+                    PermissionState::Granted
+                } else {
+                    PermissionState::Denied
+                }
+            };
+            #[cfg(not(target_os = "macos"))]
+            let permission = PermissionState::Denied;
+            let state = app.state::<AppState>();
+            let status = {
+                let mut runtime = state.runtime.lock().map_err(|_| "runtime lock poisoned")?;
+                let outputs = runtime.permissions_refreshed(permission);
+                flush_outputs(&mut runtime, &outputs).map_err(|e| format!("{e:?}"))?;
+                runtime.status().clone()
+            };
+            if permission == PermissionState::Granted && !state.event_runtime.is_started() {
+                state
+                    .event_runtime
+                    .start(Arc::clone(&state.runtime), state.clipboard())?;
+            }
+            Ok(status)
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
 
     #[tauri::command]
@@ -1011,21 +1361,20 @@ pub mod commands {
     }
 
     #[tauri::command]
-    pub fn import_config(
-        state: tauri::State<'_, AppState>,
+    pub async fn import_config(
+        app: tauri::AppHandle,
         contents: String,
-    ) -> Result<(), String> {
-        let config =
-            mac_to_windows_config::import_toml(&contents).map_err(|error| error.to_string())?;
-        let mut runtime = state
-            .runtime
-            .lock()
-            .map_err(|_| "runtime lock poisoned".to_owned())?;
-        let outputs = runtime
-            .apply(RuntimeCommand::ReplaceConfig(config))
-            .map_err(|error| format!("{error:?}"))?;
-        flush_outputs(&runtime, &outputs).map_err(|error| format!("{error:?}"))?;
-        Ok(())
+        expected_revision: u64,
+    ) -> Result<settings::SettingsSnapshot, String> {
+        tauri::async_runtime::spawn_blocking(move || {
+            settings::mutate(&app.state::<AppState>(), expected_revision, |candidate| {
+                *candidate =
+                    mac_to_windows_config::import_toml(&contents).map_err(|e| e.to_string())?;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
     }
 }
 
@@ -1035,7 +1384,7 @@ mod tests {
     use event_model::{
         DeviceSource, EventKind, EventOrigin, EventPhase, ModifierSet, PhysicalCode,
     };
-    use rule_engine::{Action, ModifierMatcher, RuleScope, Trigger};
+    use rule_engine::{Action, ModifierMatcher, Rule, RuleScope, Trigger};
 
     #[test]
     fn reopen_only_restores_main_window_when_no_window_is_visible() {
@@ -1096,6 +1445,294 @@ mod tests {
             }]),
         };
         RuntimeController::new(CompiledRules::compile(vec![rule]).unwrap())
+    }
+
+    #[test]
+    fn retried_cleanup_uses_current_native_flags_and_does_not_release_physical_holders() {
+        let stale = OutputEvent::Key {
+            code: PhysicalCode::key(8),
+            phase: EventPhase::Up,
+            modifiers: ModifierSet::LEFT_COMMAND,
+        };
+        let now_released = prepare_cleanup_outputs(&[stale.clone()], ModifierSet::NONE, |_| false);
+        assert_eq!(
+            now_released,
+            vec![OutputEvent::Key {
+                code: PhysicalCode::key(8),
+                phase: EventPhase::Up,
+                modifiers: ModifierSet::NONE
+            }]
+        );
+        let still_control =
+            prepare_cleanup_outputs(&[stale.clone()], ModifierSet::RIGHT_CONTROL, |_| false);
+        assert!(matches!(
+            &still_control[0],
+            OutputEvent::Key {
+                modifiers: ModifierSet::RIGHT_CONTROL,
+                ..
+            }
+        ));
+        assert!(still_control.iter().any(|output| matches!(
+            output,
+            OutputEvent::Key {
+                code: PhysicalCode::Key(62),
+                phase: EventPhase::Down,
+                ..
+            }
+        )));
+        let handed_back = prepare_cleanup_outputs(&[stale], ModifierSet::NONE, |code| {
+            code == PhysicalCode::key(8)
+        });
+        assert!(handed_back.is_empty());
+    }
+
+    #[test]
+    fn permission_loss_collects_release_and_stops_processing_mapped_keys() {
+        let mut controller = controller_with_rule();
+        controller.status = RuntimeStatus::Running;
+        controller.process_event(&key(), |_| Ok(()));
+        let releases = controller.permissions_refreshed(PermissionState::Denied);
+        assert_eq!(controller.status, RuntimeStatus::PermissionRequired);
+        assert!(matches!(
+            &releases[..],
+            [OutputEvent::Key {
+                code: PhysicalCode::Key(1),
+                phase: EventPhase::Up,
+                ..
+            }]
+        ));
+        let mut delivered = Vec::new();
+        controller
+            .flush_with(&releases, |outputs, _| {
+                delivered.extend_from_slice(outputs);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(delivered, releases);
+        let up = NormalizedEvent {
+            phase: EventPhase::Up,
+            ..key()
+        };
+        assert_eq!(
+            controller.process_event(&up, |_| panic!("paused runtime must pass")),
+            Decision::Pass
+        );
+        assert_eq!(
+            controller
+                .engine
+                .state()
+                .logical_down_count(PhysicalCode::key(1)),
+            0
+        );
+    }
+
+    #[test]
+    fn failed_cleanup_is_retained_until_successful_retry() {
+        let mut controller = controller_with_rule();
+        controller.status = RuntimeStatus::Running;
+        controller.process_event(&key(), |_| Ok(()));
+        let outputs = controller.transition(RuntimeStatus::Degraded);
+        assert!(controller
+            .flush_with(&outputs, |_, _| Err(InjectionError::PermissionDenied))
+            .is_err());
+        assert_eq!(controller.pending_releases, outputs);
+        controller.flush_with(&[], |_, _| Ok(())).unwrap();
+        assert_eq!(controller.pending_releases, outputs);
+        let retry = controller.permissions_refreshed(PermissionState::Granted);
+        assert_eq!(retry, outputs);
+        assert!(controller
+            .flush_with(&retry, |_, _| Err(InjectionError::Unavailable))
+            .is_err());
+        assert_eq!(controller.pending_releases, outputs);
+        controller.flush_with(&outputs, |_, _| Ok(())).unwrap();
+        assert!(controller.pending_releases.is_empty());
+    }
+
+    #[test]
+    fn failed_output_rolls_back_before_cleanup_and_does_not_release_an_unposted_key() {
+        let mut controller = controller_with_rule();
+        controller.status = RuntimeStatus::Running;
+        let mut attempts = Vec::new();
+        let decision = controller.process_event_marked(&key(), |outputs, _| {
+            attempts.push(outputs.to_vec());
+            Err(InjectionError::Unavailable)
+        });
+        assert_eq!(decision, Decision::Pass);
+        assert_eq!(attempts.len(), 1);
+        assert!(matches!(
+            &attempts[0][..],
+            [OutputEvent::Key {
+                phase: EventPhase::Down,
+                ..
+            }]
+        ));
+        assert!(controller.pending_releases.is_empty());
+        assert_eq!(
+            controller
+                .engine
+                .state()
+                .logical_down_count(PhysicalCode::key(1)),
+            0
+        );
+    }
+
+    #[test]
+    fn asynchronous_failure_releases_prior_binding_through_supplied_injector() {
+        let mut controller = controller_with_rule();
+        controller.status = RuntimeStatus::Running;
+        controller.process_event(&key(), |_| Ok(()));
+        let mut released = Vec::new();
+        controller.degrade_with(
+            "input source failed".into(),
+            &mut |outputs: &[OutputEvent], _| {
+                released.extend_from_slice(outputs);
+                Ok(())
+            },
+        );
+        assert_eq!(controller.status, RuntimeStatus::Degraded);
+        assert!(matches!(
+            &released[..],
+            [OutputEvent::Key {
+                code: PhysicalCode::Key(1),
+                phase: EventPhase::Up,
+                ..
+            }]
+        ));
+        assert!(controller.pending_releases.is_empty());
+    }
+
+    #[test]
+    fn configuration_swap_preserves_a_held_keys_original_release_target() {
+        let mut controller = controller_with_rule();
+        controller.status = RuntimeStatus::Running;
+        controller.process_event(&key(), |_| Ok(()));
+        let mut config = AppConfig::default();
+        config.active_profile = "custom".into();
+        config.profiles.get_mut("custom").unwrap().keyboard_rules =
+            vec![mac_to_windows_config::Rule {
+                trigger: "key:0".into(),
+                action: "key:2".into(),
+                ..Default::default()
+            }];
+        assert!(controller
+            .apply(RuntimeCommand::ReplaceConfig(config))
+            .unwrap()
+            .is_empty());
+        let mut delivered = Vec::new();
+        controller.process_event(
+            &NormalizedEvent {
+                phase: EventPhase::Up,
+                ..key()
+            },
+            |outputs| {
+                delivered.extend_from_slice(outputs);
+                Ok(())
+            },
+        );
+        assert!(matches!(
+            &delivered[..],
+            [OutputEvent::Key {
+                code: PhysicalCode::Key(1),
+                phase: EventPhase::Up,
+                ..
+            }]
+        ));
+        delivered.clear();
+        controller.process_event(&key(), |outputs| {
+            delivered.extend_from_slice(outputs);
+            Ok(())
+        });
+        assert!(matches!(
+            &delivered[..],
+            [OutputEvent::Key {
+                code: PhysicalCode::Key(2),
+                phase: EventPhase::Down,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn shutdown_releases_once_and_does_not_reenable_mapping() {
+        let mut controller = controller_with_rule();
+        controller.status = RuntimeStatus::Running;
+        controller.process_event(&key(), |_| Ok(()));
+        let release = controller.apply(RuntimeCommand::Shutdown).unwrap();
+        assert_eq!(release.len(), 1);
+        controller.flush_with(&release, |_, _| Ok(())).unwrap();
+        assert!(controller
+            .apply(RuntimeCommand::Shutdown)
+            .unwrap()
+            .is_empty());
+        assert_eq!(controller.status, RuntimeStatus::Stopped);
+    }
+
+    #[test]
+    fn shortcut_restores_a_modifier_held_before_mapping_was_enabled() {
+        let mut controller = RuntimeController::from_config(AppConfig::default()).unwrap();
+        controller.status = RuntimeStatus::Running;
+        let f5 = keyboard_event(
+            96,
+            EventPhase::Down,
+            ModifierSet::LEFT_CONTROL,
+            EventKind::Keyboard,
+        );
+        let mut delivered = Vec::new();
+        assert_eq!(
+            controller.process_event(&f5, |outputs| {
+                delivered.extend_from_slice(outputs);
+                Ok(())
+            }),
+            Decision::Suppress
+        );
+        assert!(matches!(
+            delivered.first(),
+            Some(OutputEvent::SystemShortcut(SystemShortcut::HardRefresh))
+        ));
+        assert!(delivered.iter().any(|event| matches!(
+            event,
+            OutputEvent::Key {
+                code: PhysicalCode::Key(59),
+                phase: EventPhase::Down,
+                modifiers: ModifierSet::LEFT_CONTROL
+            }
+        )));
+    }
+
+    #[test]
+    fn show_desktop_uses_the_configured_complete_shortcut() {
+        let mut config = AppConfig::default();
+        config.system_shortcuts.show_desktop = "chord:left_control|left_shift+key:11".into();
+        config
+            .profiles
+            .get_mut("windows_physical")
+            .unwrap()
+            .keyboard_rules
+            .push(mac_to_windows_config::Rule {
+                trigger: "key:0".into(),
+                action: "shortcut:show_desktop".into(),
+                ..Default::default()
+            });
+        let expected = config.show_desktop_output().unwrap();
+        let mut controller = RuntimeController::from_config(config).unwrap();
+        controller.status = RuntimeStatus::Running;
+        let mut delivered = Vec::new();
+        assert_eq!(
+            controller.process_event(&key(), |outputs| {
+                delivered.extend_from_slice(outputs);
+                Ok(())
+            }),
+            Decision::Suppress
+        );
+        assert_eq!(delivered, expected);
+        assert!(delivered.iter().any(|e| matches!(
+            e,
+            OutputEvent::Key {
+                code: PhysicalCode::Key(11),
+                phase: EventPhase::Up,
+                ..
+            }
+        )));
     }
 
     #[test]
@@ -1301,7 +1938,8 @@ mod tests {
                 ..Default::default()
             },
         );
-        let mut controller = RuntimeController::from_config(config).unwrap();
+        let mut controller = RuntimeController::from_config(AppConfig::default()).unwrap();
+        controller.config = Some(config);
         let error = controller
             .apply(RuntimeCommand::SetProfile("broken".into()))
             .unwrap_err();
@@ -1463,5 +2101,14 @@ mod tests {
             .start(Arc::clone(&state.runtime), None)
             .expect("Event Tap should start with macOS input permissions");
         assert!(state.event_runtime.is_started());
+        state
+            .event_runtime
+            .shutdown(&state.runtime)
+            .expect("Event Tap should stop and join cleanly");
+        assert!(!state.event_runtime.is_started());
+        assert_eq!(
+            *state.runtime.lock().unwrap().status(),
+            RuntimeStatus::Stopped
+        );
     }
 }

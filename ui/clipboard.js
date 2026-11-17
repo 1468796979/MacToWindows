@@ -39,7 +39,7 @@ function applySnapshot(snapshot) {
   if (!normalized.panelOpen && !staleClosedSnapshot) {
     state.selecting = false;
     state.selectedIndex = -1;
-  } else if (normalized.lastError) {
+  } else if (normalized.operationError) {
     state.selecting = false;
   }
   if (state.entries.length === 0) state.selectedIndex = -1;
@@ -142,7 +142,10 @@ $("clipboard-clear").addEventListener("click", async () => {
   catch (error) { state.error = error?.message || String(error); render(); }
 });
 document.addEventListener("keydown", (event) => {
+  if (event.defaultPrevented || event.isComposing) return;
   if (event.key === "Escape") { event.preventDefault(); closePanel(); return; }
+  const target = event.target instanceof Element ? event.target : null;
+  if (target?.closest("button, a, input, select, textarea, [role=button], [contenteditable]:not([contenteditable=false])")) return;
   if (event.key === "ArrowDown" && state.entries.length) {
     event.preventDefault(); state.selectedIndex = core.moveSelection(state.selectedIndex, 1, state.entries.length); render();
   }
@@ -170,7 +173,7 @@ if (listen) {
     .catch((error) => { state.error = error?.message || String(error); render(); });
   Promise.resolve(listen("clipboard-updated", (event) => {
     const snapshot = core.normalizeSnapshot(event.payload);
-    if (!snapshot.panelOpen || snapshot.lastError) state.selecting = false;
+    if (!snapshot.panelOpen || snapshot.operationError) state.selecting = false;
     applySnapshot(event.payload);
   }))
     .catch((error) => { state.error = error?.message || String(error); render(); });
