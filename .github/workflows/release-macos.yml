@@ -20,6 +20,9 @@ jobs:
   release:
     runs-on: macos-14
     env:
+      RELEASE_SOURCE_SHA: ${{ github.sha }}
+      RELEASE_TAG: ${{ inputs.tag }}
+      APPLE_API_KEY_BASE64: ${{ secrets.APPLE_API_KEY_BASE64 }}
       APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
       APPLE_API_ISSUER_ID: ${{ secrets.APPLE_API_ISSUER_ID }}
       DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64: ${{ secrets.DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64 }}
@@ -28,6 +31,47 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+
+      - name: Validate release version and source
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$RELEASE_SOURCE_SHA"
+          python3 - <<'PY_VERSION'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          version = json.loads(Path("src-tauri/tauri.conf.json").read_text())["version"]
+          cargo = Path("src-tauri/Cargo.toml").read_text()
+          package = re.search(r"(?ms)^\[package\]\s*(.*?)(?=^\[|\Z)", cargo)
+          cargo_version = re.search(r'^version\s*=\s*"([^"\n]+)"\s*$', package.group(1), re.M) if package else None
+          if not cargo_version or cargo_version.group(1) != version:
+              raise SystemExit("Tauri and Cargo package versions must match")
+          if os.environ["RELEASE_TAG"] != "v" + version:
+              raise SystemExit("Release tag must equal v + the Tauri/Cargo version")
+          PY_VERSION
+          git check-ref-format "refs/tags/$RELEASE_TAG"
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$RELEASE_SOURCE_SHA"
+          fi
+
+      - name: Check signing and notarization secrets
+        run: |
+          python3 - <<'PY_SECRETS'
+          import os
+          required = [
+              "DEVELOPER_ID_APPLICATION_CERTIFICATE_BASE64",
+              "DEVELOPER_ID_APPLICATION_CERTIFICATE_PASSWORD",
+              "APPLE_API_KEY_BASE64", "APPLE_API_KEY_ID", "APPLE_API_ISSUER_ID",
+          ]
+          missing = [name for name in required if not os.environ.get(name)]
+          if missing:
+              raise SystemExit("Missing release secrets: " + ", ".join(missing))
+          PY_SECRETS
 
       - name: Set up Rust
         uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -97,6 +141,7 @@ jobs:
         run: |
           set -euo pipefail
           APP_PATH="$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/bundle/macos/MacToWindows.app"
+          test "$(lipo -archs "$APP_PATH/Contents/MacOS/mac-to-windows")" = arm64
           codesign --force --deep --options runtime --timestamp \
             --sign "$DEVELOPER_ID_APPLICATION" "$APP_PATH"
           codesign --verify --deep --strict --verbose=2 "$APP_PATH"
@@ -109,7 +154,14 @@ jobs:
             --key "$APPLE_API_KEY_PATH" \
             --key-id "$APPLE_API_KEY_ID" \
             --issuer "$APPLE_API_ISSUER_ID" \
-            --wait
+            --wait --output-format json > "$RUNNER_TEMP/app-notarization.json"
+          python3 - "$RUNNER_TEMP/app-notarization.json" <<'PY_NOTARY'
+          import json
+          import sys
+          status = json.load(open(sys.argv[1]))["status"]
+          if status != "Accepted":
+              raise SystemExit("App notarization was not accepted: " + status)
+          PY_NOTARY
           xcrun stapler staple "$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/bundle/macos/MacToWindows.app"
           xcrun stapler validate "$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/bundle/macos/MacToWindows.app"
           ditto -c -k --sequesterRsrc --keepParent \
@@ -121,19 +173,46 @@ jobs:
           set -euo pipefail
           APP_PATH="$GITHUB_WORKSPACE/target/aarch64-apple-darwin/release/bundle/macos/MacToWindows.app"
           DMG_PATH="$RUNNER_TEMP/MacToWindows-arm64.dmg"
-          hdiutil create -volname MacToWindows \
-            -srcfolder "$APP_PATH" \
+          STAGE_PATH="$(mktemp -d "$RUNNER_TEMP/mactowindows-dmg-stage.XXXXXX")"
+          ditto "$APP_PATH" "$STAGE_PATH/MacToWindows.app"
+          ln -s /Applications "$STAGE_PATH/Applications"
+          hdiutil create -volname MacToWindows -fs HFS+ \
+            -srcfolder "$STAGE_PATH" \
             -ov -format UDZO "$DMG_PATH"
           codesign --force --timestamp --sign "$DEVELOPER_ID_APPLICATION" "$DMG_PATH"
           xcrun notarytool submit "$DMG_PATH" \
             --key "$APPLE_API_KEY_PATH" \
             --key-id "$APPLE_API_KEY_ID" \
             --issuer "$APPLE_API_ISSUER_ID" \
-            --wait
+            --wait --output-format json > "$RUNNER_TEMP/dmg-notarization.json"
+          python3 - "$RUNNER_TEMP/dmg-notarization.json" <<'PY_NOTARY'
+          import json
+          import sys
+          status = json.load(open(sys.argv[1]))["status"]
+          if status != "Accepted":
+              raise SystemExit("DMG notarization was not accepted: " + status)
+          PY_NOTARY
           xcrun stapler staple "$DMG_PATH"
           xcrun stapler validate "$DMG_PATH"
-          spctl --assess --type execute --verbose=4 "$APP_PATH"
-          shasum -a 256 "$DMG_PATH" "$RUNNER_TEMP/MacToWindows-arm64.zip" > "$RUNNER_TEMP/SHA256SUMS.txt"
+          hdiutil verify "$DMG_PATH"
+          MOUNT_PATH="$(mktemp -d "$RUNNER_TEMP/mactowindows-dmg-check.XXXXXX")"
+          hdiutil attach -readonly -nobrowse -mountpoint "$MOUNT_PATH" "$DMG_PATH" > /dev/null
+          trap 'hdiutil detach "$MOUNT_PATH" > /dev/null' EXIT
+          test -d "$MOUNT_PATH/MacToWindows.app/Contents"
+          test ! -d "$MOUNT_PATH/Contents"
+          test "$(readlink "$MOUNT_PATH/Applications")" = /Applications
+          test "$(lipo -archs "$MOUNT_PATH/MacToWindows.app/Contents/MacOS/mac-to-windows")" = arm64
+          codesign --verify --deep --strict --verbose=2 "$MOUNT_PATH/MacToWindows.app"
+          xcrun stapler validate "$MOUNT_PATH/MacToWindows.app"
+          spctl --assess --type execute --verbose=4 "$MOUNT_PATH/MacToWindows.app"
+          hdiutil detach "$MOUNT_PATH" > /dev/null
+          trap - EXIT
+          rmdir "$MOUNT_PATH"
+          (
+            cd "$RUNNER_TEMP"
+            shasum -a 256 MacToWindows-arm64.dmg MacToWindows-arm64.zip > SHA256SUMS.txt
+            shasum -a 256 -c SHA256SUMS.txt
+          )
 
       - name: Publish GitHub Release
         env:
@@ -141,10 +220,17 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
           RELEASE_NAME: ${{ inputs.release_name }}
         run: |
+          set -euo pipefail
+          # Recheck tags after the build; never publish against a different commit.
+          git fetch --tags origin
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            test "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")" = "$RELEASE_SOURCE_SHA"
+          fi
           cat > "$RUNNER_TEMP/release-notes.md" <<EOF
           ## MacToWindows ${RELEASE_TAG}
 
           - Apple Silicon (arm64) macOS build
+          - Source commit: ${RELEASE_SOURCE_SHA}
           - Developer ID signed and Apple notarized
           - SHA-256 checksums are included in SHA256SUMS.txt
           EOF
@@ -152,6 +238,7 @@ jobs:
             "$RUNNER_TEMP/MacToWindows-arm64.dmg" \
             "$RUNNER_TEMP/MacToWindows-arm64.zip" \
             "$RUNNER_TEMP/SHA256SUMS.txt" \
+            --target "$RELEASE_SOURCE_SHA" \
             --title "$RELEASE_NAME" \
             --notes-file "$RUNNER_TEMP/release-notes.md"
 
