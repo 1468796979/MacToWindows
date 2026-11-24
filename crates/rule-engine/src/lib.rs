@@ -289,6 +289,7 @@ pub struct RuntimeState {
     active_modifiers: ModifierSet,
     modifier_chord_interrupted: bool,
     modifier_chord_fired: bool,
+    gestures_blocked_until_modifiers_up: bool,
     shift_taps: HashMap<PhysicalCode, ShiftTapState>,
 }
 
@@ -369,6 +370,7 @@ impl RuntimeState {
         self.active_modifiers = ModifierSet::NONE;
         self.modifier_chord_interrupted = false;
         self.modifier_chord_fired = false;
+        self.gestures_blocked_until_modifiers_up = false;
         self.shift_taps.clear();
         output
     }
@@ -415,6 +417,15 @@ impl RuleEngine {
         self.map_modifier_flags(event.modifiers)
     }
 
+    /// External keyboard activity cancels pending local tap gestures without
+    /// changing any held key or its frozen output binding.
+    pub fn interrupt_gestures(&mut self) {
+        self.state.shift_taps.clear();
+        self.state.modifier_chord_interrupted = true;
+        self.state.gestures_blocked_until_modifiers_up =
+            self.physical_modifier_flags(ModifierSet::NONE) != ModifierSet::NONE;
+    }
+
     /// Enables the standalone Shift toggle while the input-source service can
     /// move between the remembered Pinyin and Latin sources.  The service
     /// keeps the toggle available for the Latin half of that pair too, so a
@@ -424,6 +435,11 @@ impl RuleEngine {
     }
 
     pub fn handle(&mut self, event: &NormalizedEvent) -> event_model::Decision {
+        if matches!(event.kind, EventKind::Keyboard | EventKind::FlagsChanged)
+            && matches!(event.origin, event_model::EventOrigin::Injected { .. })
+        {
+            return event_model::Decision::Pass;
+        }
         if event.kind == EventKind::MouseMove {
             for tap in self.state.shift_taps.values_mut() {
                 tap.interrupted = true;
@@ -460,10 +476,14 @@ impl RuleEngine {
         if let Some(modifier) = modifier {
             if phase == EventPhase::Down {
                 self.state.active_modifiers.insert(modifier);
-                if self
-                    .rules
-                    .find_modifier_chord(self.state.active_modifiers, event.app_context.as_ref())
-                    .is_some()
+                if !self.state.gestures_blocked_until_modifiers_up
+                    && self
+                        .rules
+                        .find_modifier_chord(
+                            self.state.active_modifiers,
+                            event.app_context.as_ref(),
+                        )
+                        .is_some()
                     && self
                         .rules
                         .find_modifier_chord(modifiers_before, event.app_context.as_ref())
@@ -506,9 +526,11 @@ impl RuleEngine {
                 state.interrupted = true;
             }
         }
-        if let Some(shift_modifier) =
-            modifier.filter(|_| phase == EventPhase::Down && is_shift_code(event.code))
-        {
+        if let Some(shift_modifier) = modifier.filter(|_| {
+            phase == EventPhase::Down
+                && is_shift_code(event.code)
+                && !self.state.gestures_blocked_until_modifiers_up
+        }) {
             self.state.shift_taps.insert(
                 event.code,
                 ShiftTapState {
@@ -535,6 +557,7 @@ impl RuleEngine {
                 && modifiers_before.bits() != 0
                 && !self.state.modifier_chord_fired
                 && !self.state.modifier_chord_interrupted
+                && !self.state.gestures_blocked_until_modifiers_up
                 && self
                     .rules
                     .find_modifier_chord(modifiers_before, event.app_context.as_ref())
@@ -561,6 +584,7 @@ impl RuleEngine {
             if self.state.active_modifiers.bits() == 0 {
                 self.state.modifier_chord_interrupted = false;
                 self.state.modifier_chord_fired = false;
+                self.state.gestures_blocked_until_modifiers_up = false;
             }
             if is_shift_code(event.code) {
                 if let Some(tap) = self.state.shift_taps.remove(&event.code) {
@@ -1931,6 +1955,217 @@ mod tests {
         assert_eq!(
             engine.handle(&modifier(59, ModifierSet::NONE, 4)),
             event_model::Decision::Pass
+        );
+    }
+
+    fn assert_same_key_holds(actual: &RuntimeState, expected: &RuntimeState) {
+        assert_eq!(actual.physical_down, expected.physical_down);
+        assert_eq!(actual.logical_down, expected.logical_down);
+        assert_eq!(actual.active_modifiers, expected.active_modifiers);
+        assert_eq!(actual.bindings.len(), expected.bindings.len());
+        for (code, binding) in &expected.bindings {
+            let actual = &actual.bindings[code];
+            assert_eq!(actual.outputs, binding.outputs);
+            assert_eq!(actual.passthrough, binding.passthrough);
+            assert_eq!(actual.follow_modifiers, binding.follow_modifiers);
+        }
+    }
+
+    #[test]
+    fn injected_down_only_events_pass_without_registering_or_matching_a_key() {
+        for marker in [0, 100] {
+            let mut engine = RuleEngine::new(
+                CompiledRules::compile(vec![replacement("local-a", 0, 1, 10)]).unwrap(),
+            );
+            let external = NormalizedEvent {
+                origin: EventOrigin::Injected { marker },
+                ..key(0, EventPhase::Down)
+            };
+            for _ in 0..4 {
+                assert_eq!(engine.handle(&external), event_model::Decision::Pass);
+                assert!(!engine.state().physical_down(PhysicalCode::key(0)));
+                assert_eq!(engine.state().logical_down_count(PhysicalCode::key(1)), 0);
+                assert!(engine.state.bindings.is_empty());
+            }
+            assert_eq!(
+                engine.handle(&key(0, EventPhase::Down)),
+                event_model::Decision::Emit(vec![OutputEvent::Key {
+                    code: PhysicalCode::key(1),
+                    phase: EventPhase::Down,
+                    modifiers: ModifierSet::NONE
+                }])
+            );
+            assert_eq!(
+                engine.handle(&key(0, EventPhase::Down)),
+                event_model::Decision::Suppress
+            );
+            assert_eq!(engine.state().logical_down_count(PhysicalCode::key(1)), 1);
+            assert_eq!(
+                engine.handle(&key(0, EventPhase::Up)),
+                event_model::Decision::Emit(vec![OutputEvent::Key {
+                    code: PhysicalCode::key(1),
+                    phase: EventPhase::Up,
+                    modifiers: ModifierSet::NONE
+                }])
+            );
+        }
+    }
+
+    #[test]
+    fn injected_events_cannot_change_local_holds_even_with_the_same_keycode() {
+        let mut engine = RuleEngine::new(
+            CompiledRules::compile(vec![replacement("local-a", 0, 1, 10)]).unwrap(),
+        );
+        engine.handle(&modifier(56, ModifierSet::LEFT_SHIFT, 1));
+        engine.handle(&key(0, EventPhase::Down));
+        let checkpoint = engine.checkpoint();
+        let taps = engine.state.shift_taps.len();
+        let interrupted = engine.state.modifier_chord_interrupted;
+        for marker in [0, 100] {
+            for event in [
+                key(0, EventPhase::Down),
+                key(0, EventPhase::Up),
+                key(0, EventPhase::Repeat),
+                modifier(56, ModifierSet::NONE, 2),
+                modifier(59, ModifierSet::LEFT_CONTROL, 3),
+            ] {
+                let external = NormalizedEvent {
+                    origin: EventOrigin::Injected { marker },
+                    ..event
+                };
+                assert_eq!(engine.handle(&external), event_model::Decision::Pass);
+                assert_same_key_holds(engine.state(), &checkpoint);
+                assert_eq!(engine.state.shift_taps.len(), taps);
+                assert_eq!(engine.state.modifier_chord_interrupted, interrupted);
+            }
+        }
+        assert_eq!(
+            engine.handle(&key(0, EventPhase::Up)),
+            event_model::Decision::Emit(vec![OutputEvent::Key {
+                code: PhysicalCode::key(1),
+                phase: EventPhase::Up,
+                modifiers: ModifierSet::NONE
+            }])
+        );
+    }
+
+    #[test]
+    fn injected_entry_guard_does_not_cancel_a_pending_local_shift_tap() {
+        let mut engine = RuleEngine::new(CompiledRules::compile(vec![]).unwrap());
+        engine.set_pinyin_active(true);
+        engine.handle(&modifier(56, ModifierSet::LEFT_SHIFT, 1));
+        let external = NormalizedEvent {
+            origin: EventOrigin::Injected { marker: 100 },
+            ..key(0, EventPhase::Down)
+        };
+        assert_eq!(engine.handle(&external), event_model::Decision::Pass);
+        assert!(
+            matches!(engine.handle(&modifier(56, ModifierSet::NONE, 100)), event_model::Decision::Emit(ref outputs)
+            if outputs.contains(&OutputEvent::SystemShortcut(event_model::SystemShortcut::TogglePinyinEnglish)))
+        );
+    }
+
+    #[test]
+    fn interrupt_gestures_cancels_shift_without_releasing_any_local_hold() {
+        let mut engine = RuleEngine::new(
+            CompiledRules::compile(vec![replacement("local-a", 0, 1, 10)]).unwrap(),
+        );
+        engine.set_pinyin_active(true);
+        engine.handle(&modifier(56, ModifierSet::LEFT_SHIFT, 1));
+        engine.handle(&key(0, EventPhase::Down));
+        let checkpoint = engine.checkpoint();
+        engine.interrupt_gestures();
+        assert_same_key_holds(engine.state(), &checkpoint);
+        assert!(engine.state.shift_taps.is_empty());
+        assert!(engine.state.modifier_chord_interrupted);
+        assert!(engine.state.gestures_blocked_until_modifiers_up);
+        assert_eq!(
+            engine.handle(&key(0, EventPhase::Up)),
+            event_model::Decision::Emit(vec![OutputEvent::Key {
+                code: PhysicalCode::key(1),
+                phase: EventPhase::Up,
+                modifiers: ModifierSet::NONE
+            }])
+        );
+        assert_eq!(
+            engine.handle(&modifier(56, ModifierSet::NONE, 100)),
+            event_model::Decision::Pass
+        );
+        assert!(!engine.state.gestures_blocked_until_modifiers_up);
+        engine.handle(&modifier(56, ModifierSet::LEFT_SHIFT, 200));
+        assert!(
+            matches!(engine.handle(&modifier(56, ModifierSet::NONE, 300)), event_model::Decision::Emit(ref outputs)
+            if outputs.contains(&OutputEvent::SystemShortcut(event_model::SystemShortcut::TogglePinyinEnglish)))
+        );
+    }
+
+    #[test]
+    fn interrupted_modifier_chords_stay_blocked_until_all_local_modifiers_release() {
+        for already_formed in [false, true] {
+            let mut engine =
+                RuleEngine::new(CompiledRules::compile(vec![modifier_chord_rule()]).unwrap());
+            engine.handle(&modifier(59, ModifierSet::LEFT_CONTROL, 1));
+            if already_formed {
+                engine.handle(&modifier(56, ModifierSet::LEFT_SHIFT, 2));
+            }
+            engine.interrupt_gestures();
+            if !already_formed {
+                engine.handle(&modifier(56, ModifierSet::LEFT_SHIFT, 3));
+            }
+            assert!(engine.state.shift_taps.is_empty());
+            assert!(engine.state.modifier_chord_interrupted);
+            assert_eq!(
+                engine.handle(&modifier(56, ModifierSet::NONE, 4)),
+                event_model::Decision::Pass
+            );
+            assert!(engine.state.gestures_blocked_until_modifiers_up);
+            engine.handle(&modifier(56, ModifierSet::LEFT_SHIFT, 5));
+            assert!(engine.state.shift_taps.is_empty());
+            assert_eq!(
+                engine.handle(&modifier(56, ModifierSet::NONE, 6)),
+                event_model::Decision::Pass
+            );
+            assert!(engine.state.gestures_blocked_until_modifiers_up);
+            assert_eq!(
+                engine.handle(&modifier(59, ModifierSet::NONE, 7)),
+                event_model::Decision::Pass
+            );
+            assert!(!engine.state.gestures_blocked_until_modifiers_up);
+            engine.handle(&modifier(59, ModifierSet::LEFT_CONTROL, 8));
+            engine.handle(&modifier(56, ModifierSet::LEFT_SHIFT, 9));
+            assert!(
+                matches!(engine.handle(&modifier(56, ModifierSet::NONE, 10)), event_model::Decision::Emit(ref outputs)
+                if outputs.contains(&OutputEvent::SystemShortcut(event_model::SystemShortcut::SwitchInputSource)))
+            );
+        }
+    }
+
+    #[test]
+    fn interrupt_without_held_modifiers_does_not_block_the_next_shift_tap() {
+        let mut engine = RuleEngine::new(CompiledRules::compile(vec![]).unwrap());
+        engine.set_pinyin_active(true);
+        engine.interrupt_gestures();
+        assert!(!engine.state.gestures_blocked_until_modifiers_up);
+        engine.handle(&modifier(56, ModifierSet::LEFT_SHIFT, 1));
+        assert!(
+            matches!(engine.handle(&modifier(56, ModifierSet::NONE, 100)), event_model::Decision::Emit(ref outputs)
+            if outputs.contains(&OutputEvent::SystemShortcut(event_model::SystemShortcut::TogglePinyinEnglish)))
+        );
+    }
+
+    #[test]
+    fn release_all_resets_the_interrupted_gesture_latch() {
+        let mut engine = RuleEngine::new(CompiledRules::compile(vec![]).unwrap());
+        engine.set_pinyin_active(true);
+        engine.handle(&modifier(56, ModifierSet::LEFT_SHIFT, 1));
+        engine.interrupt_gestures();
+        assert!(engine.state.gestures_blocked_until_modifiers_up);
+        assert!(engine.release_all().is_empty());
+        assert!(!engine.state.gestures_blocked_until_modifiers_up);
+        engine.handle(&modifier(56, ModifierSet::LEFT_SHIFT, 2));
+        assert!(
+            matches!(engine.handle(&modifier(56, ModifierSet::NONE, 100)), event_model::Decision::Emit(ref outputs)
+            if outputs.contains(&OutputEvent::SystemShortcut(event_model::SystemShortcut::TogglePinyinEnglish)))
         );
     }
 }

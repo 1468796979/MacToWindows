@@ -22,6 +22,7 @@ pub enum TapState {
 pub struct HealthSnapshot {
     pub events_seen: u64,
     pub events_passed: u64,
+    pub external_keyboard_events_passed: u64,
     pub events_suppressed: u64,
     pub events_injected: u64,
     pub injection_failures: u64,
@@ -33,6 +34,7 @@ pub struct HealthSnapshot {
 pub struct Diagnostics {
     events_seen: AtomicU64,
     events_passed: AtomicU64,
+    external_keyboard_events_passed: AtomicU64,
     events_suppressed: AtomicU64,
     events_injected: AtomicU64,
     injection_failures: AtomicU64,
@@ -51,6 +53,7 @@ impl Diagnostics {
         Self {
             events_seen: AtomicU64::new(0),
             events_passed: AtomicU64::new(0),
+            external_keyboard_events_passed: AtomicU64::new(0),
             events_suppressed: AtomicU64::new(0),
             events_injected: AtomicU64::new(0),
             injection_failures: AtomicU64::new(0),
@@ -83,6 +86,11 @@ impl Diagnostics {
     pub fn record_passed(&self) {
         Self::inc(&self.events_passed);
     }
+    /// Counts an external software keyboard event passed through unchanged.
+    /// The caller records `seen` and `passed` separately to avoid double counting.
+    pub fn record_external_keyboard_passed(&self) {
+        Self::inc(&self.external_keyboard_events_passed);
+    }
     pub fn record_suppressed(&self) {
         Self::inc(&self.events_suppressed);
     }
@@ -105,6 +113,9 @@ impl Diagnostics {
         HealthSnapshot {
             events_seen: self.events_seen.load(Ordering::Relaxed),
             events_passed: self.events_passed.load(Ordering::Relaxed),
+            external_keyboard_events_passed: self
+                .external_keyboard_events_passed
+                .load(Ordering::Relaxed),
             events_suppressed: self.events_suppressed.load(Ordering::Relaxed),
             events_injected: self.events_injected.load(Ordering::Relaxed),
             injection_failures: self.injection_failures.load(Ordering::Relaxed),

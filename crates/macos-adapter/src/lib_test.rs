@@ -2,10 +2,53 @@
 mod tests {
     use super::super::{
         is_own_marker, next_marker, AdapterOutcome, EventAdapter, EventTapAction, EventTapEvent,
-        InjectionError, SafeAdapter,
+        InjectionError, KeyboardEventRoute, SafeAdapter,
     };
     use diagnostics::{PermissionState, TapState};
     use event_model::{ModifierSet, MouseButton, PhysicalCode, ScrollAxis};
+
+    #[test]
+    fn keyboard_routing_admits_only_unmarked_pid_zero_hid_sources() {
+        use super::super::classify_keyboard_source as classify;
+        use KeyboardEventRoute::{External, Hardware, OwnInjected};
+        for (marker, own, pid, state, expected) in [
+            (0, 99, 0, 1, Hardware),
+            (0, 0, 0, 1, Hardware),
+            (99, 99, 123, 1, OwnInjected),
+            (99, 99, 0, 0, OwnInjected),
+            (100, 99, 0, 1, External),
+            (100, 99, 123, 0, External),
+            (0, 99, 123, 1, External),
+            (0, 99, 123, 0, External),
+            (0, 99, 123, 12345, External),
+            (0, 99, 0, 0, External),
+            (0, 99, 0, -1, External),
+            (0, 99, 0, 12345, External),
+            (0, 99, -1, 1, External),
+        ] {
+            assert_eq!(
+                classify(marker, own, pid, state),
+                expected,
+                "marker={marker}, own={own}, pid={pid}, state={state}"
+            );
+        }
+    }
+
+    #[test]
+    fn keyboard_routing_keeps_non_keyboard_events_and_missing_handles_explicit() {
+        for event_type in [10, 11, 12] {
+            assert_eq!(
+                EventTapEvent::new(event_type, std::ptr::null_mut()).keyboard_route(99),
+                Some(KeyboardEventRoute::External)
+            );
+        }
+        for event_type in [1, 22, super::super::TAP_DISABLED_BY_TIMEOUT] {
+            assert_eq!(
+                EventTapEvent::new(event_type, std::ptr::null_mut()).keyboard_route(99),
+                None
+            );
+        }
+    }
 
     #[test]
     fn physical_modifier_snapshot_tracks_all_eight_native_sides() {
