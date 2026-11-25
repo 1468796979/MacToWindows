@@ -8,6 +8,17 @@ use thiserror::Error;
 
 const MAX_OUTPUT_EVENTS: usize = 16;
 
+/// Select the rules applied to a complete keyboard stream. Text submissions
+/// must be routed around the key ledger before entering either policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KeyboardMappingPolicy {
+    #[default]
+    Full,
+    /// Preserve ordinary software input while retaining configured shortcuts
+    /// and project actions. Held keys keep the binding chosen on their Down.
+    ShortcutsOnly,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RuleScope {
     Global,
@@ -156,8 +167,17 @@ impl CompiledRules {
     }
 
     fn find(&self, event: &NormalizedEvent) -> Option<&Rule> {
+        self.find_with_policy(event, KeyboardMappingPolicy::Full)
+    }
+
+    fn find_with_policy(
+        &self,
+        event: &NormalizedEvent,
+        policy: KeyboardMappingPolicy,
+    ) -> Option<&Rule> {
         self.rules.iter().find(|rule| {
-            scope_matches(&rule.scope, event.app_context.as_ref())
+            (policy == KeyboardMappingPolicy::Full || shortcut_rule(rule))
+                && scope_matches(&rule.scope, event.app_context.as_ref())
                 && trigger_matches(&rule.trigger, event)
         })
     }
@@ -177,6 +197,22 @@ impl CompiledRules {
                     } if required == modifiers
                 )
         })
+    }
+}
+
+fn shortcut_rule(rule: &Rule) -> bool {
+    match &rule.trigger {
+        Trigger::Chord { modifiers, .. } => *modifiers != ModifierSet::NONE,
+        Trigger::ModifierChord { .. } => true,
+        Trigger::Key { modifiers, .. } if modifiers.required != ModifierSet::NONE => true,
+        Trigger::Key { .. } => matches!(
+            &rule.action,
+            Action::Replace(outputs)
+                if !outputs.is_empty()
+                    && outputs.iter().all(|output| matches!(output, OutputEvent::SystemShortcut(_)))
+        ),
+        // The policy controls keyboard mappings, not mouse/scroll behavior.
+        Trigger::MouseButton { .. } | Trigger::Scroll { .. } => true,
     }
 }
 
@@ -291,6 +327,7 @@ pub struct RuntimeState {
     modifier_chord_fired: bool,
     gestures_blocked_until_modifiers_up: bool,
     shift_taps: HashMap<PhysicalCode, ShiftTapState>,
+    keyboard_policy: KeyboardMappingPolicy,
 }
 
 #[derive(Clone, Debug)]
@@ -299,6 +336,9 @@ struct SourceBinding {
     passthrough: bool,
     // The target is still the physical source; only its flags may need rewriting.
     follow_modifiers: bool,
+    // Ordinary software events must stay raw even if the policy changes while
+    // the key is held. Rebuilding such Repeat/Up events can discard payloads.
+    raw_passthrough: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -380,6 +420,7 @@ pub struct RuleEngine {
     rules: CompiledRules,
     state: RuntimeState,
     pinyin_active: bool,
+    software_input: bool,
 }
 
 impl RuleEngine {
@@ -388,6 +429,7 @@ impl RuleEngine {
             rules,
             state: RuntimeState::default(),
             pinyin_active: false,
+            software_input: false,
         }
     }
     pub fn replace_rules(&mut self, rules: CompiledRules) {
@@ -435,11 +477,50 @@ impl RuleEngine {
     }
 
     pub fn handle(&mut self, event: &NormalizedEvent) -> event_model::Decision {
+        self.handle_with_policy(event, KeyboardMappingPolicy::Full)
+    }
+
+    pub fn set_keyboard_mapping_policy(&mut self, policy: KeyboardMappingPolicy) {
+        if self.state.keyboard_policy != policy {
+            self.interrupt_gestures();
+            self.state.keyboard_policy = policy;
+        }
+    }
+
+    pub fn keyboard_mapping_policy(&self) -> KeyboardMappingPolicy {
+        self.state.keyboard_policy
+    }
+
+    /// Software input can contain repeated Down-only submissions. If the first
+    /// event was passed through, keep later Downs raw without acquiring another
+    /// holder. Mapped and explicitly consumed bindings retain duplicate guards.
+    pub fn set_software_input(&mut self, software: bool) {
+        self.software_input = software;
+    }
+
+    /// Inspect the highest-priority enabled shortcut without changing state.
+    /// A caller can use this to resolve an explicit Alt+Tab session while
+    /// still honoring the active preset's shortcut rules.
+    pub fn shortcut_action(&self, event: &NormalizedEvent) -> Option<Action> {
+        if matches!(event.origin, event_model::EventOrigin::TextInjection { .. }) {
+            return None;
+        }
+        self.rules
+            .find_with_policy(event, KeyboardMappingPolicy::ShortcutsOnly)
+            .map(|rule| rule.action.clone())
+    }
+
+    pub fn handle_with_policy(
+        &mut self,
+        event: &NormalizedEvent,
+        policy: KeyboardMappingPolicy,
+    ) -> event_model::Decision {
         if matches!(event.kind, EventKind::Keyboard | EventKind::FlagsChanged)
             && matches!(event.origin, event_model::EventOrigin::TextInjection { .. })
         {
             return event_model::Decision::Pass;
         }
+        self.set_keyboard_mapping_policy(policy);
         if event.kind == EventKind::MouseMove {
             for tap in self.state.shift_taps.values_mut() {
                 tap.interrupted = true;
@@ -468,8 +549,14 @@ impl RuleEngine {
         if event.kind == EventKind::Keyboard {
             self.state.active_modifiers = self.physical_modifier_flags(event.modifiers);
         }
-        if phase == EventPhase::Down && self.state.bindings.contains_key(&event.code) {
-            return event_model::Decision::Suppress;
+        if phase == EventPhase::Down {
+            if let Some(binding) = self.state.bindings.get(&event.code) {
+                if self.software_input && binding.passthrough {
+                    self.interrupt_gestures();
+                    return event_model::Decision::Pass;
+                }
+                return event_model::Decision::Suppress;
+            }
         }
         let modifier = modifier_for_code(event.code);
         let modifiers_before = self.state.active_modifiers;
@@ -610,6 +697,9 @@ impl RuleEngine {
         if phase == EventPhase::Repeat {
             if let Some(binding) = self.state.bindings.get(&event.code) {
                 return if binding.follow_modifiers {
+                    if binding.raw_passthrough {
+                        return event_model::Decision::Pass;
+                    }
                     let modifiers = self.modifiers_for_event(event);
                     if binding.passthrough
                         && modifiers == self.physical_modifier_flags(event.modifiers)
@@ -666,14 +756,15 @@ impl RuleEngine {
         }
         let action = self
             .rules
-            .find(event)
+            .find_with_policy(event, self.state.keyboard_policy)
             .or_else(|| {
                 if phase == event.phase {
                     None
                 } else {
                     let mut adjusted = event.clone();
                     adjusted.phase = phase;
-                    self.rules.find(&adjusted)
+                    self.rules
+                        .find_with_policy(&adjusted, self.state.keyboard_policy)
                 }
             })
             .map(|rule| rule.action.clone());
@@ -687,6 +778,7 @@ impl RuleEngine {
                             outputs: Vec::new(),
                             passthrough: false,
                             follow_modifiers: false,
+                            raw_passthrough: false,
                         },
                     );
                 }
@@ -708,6 +800,11 @@ impl RuleEngine {
                     invert_x: matches!(event.code, PhysicalCode::Scroll(ScrollAxis::Horizontal)),
                     invert_y: matches!(event.code, PhysicalCode::Scroll(ScrollAxis::Vertical)),
                 }])
+            }
+            None if self.state.keyboard_policy == KeyboardMappingPolicy::ShortcutsOnly
+                && matches!(event.kind, EventKind::Keyboard | EventKind::FlagsChanged) =>
+            {
+                self.pass_event(event)
             }
             None => self.default_modifier_decision(event),
         }
@@ -770,6 +867,8 @@ impl RuleEngine {
                 outputs: outputs.clone(),
                 passthrough,
                 follow_modifiers,
+                raw_passthrough: passthrough
+                    && self.state.keyboard_policy == KeyboardMappingPolicy::ShortcutsOnly,
             },
         );
         let modifiers = self.map_modifier_flags(event.modifiers);
@@ -833,7 +932,8 @@ impl RuleEngine {
         if output.is_empty() {
             event_model::Decision::Suppress
         } else if binding.passthrough
-            && self.modifiers_for_event(event) == self.physical_modifier_flags(event.modifiers)
+            && (binding.raw_passthrough
+                || self.modifiers_for_event(event) == self.physical_modifier_flags(event.modifiers))
         {
             event_model::Decision::Pass
         } else {
@@ -1968,7 +2068,403 @@ mod tests {
             assert_eq!(actual.outputs, binding.outputs);
             assert_eq!(actual.passthrough, binding.passthrough);
             assert_eq!(actual.follow_modifiers, binding.follow_modifiers);
+            assert_eq!(actual.raw_passthrough, binding.raw_passthrough);
         }
+    }
+
+    fn copy_rule(priority: i32) -> Rule {
+        Rule {
+            id: "copy".into(),
+            enabled: true,
+            priority,
+            scope: RuleScope::Global,
+            trigger: Trigger::Chord {
+                modifiers: ModifierSet::LEFT_CONTROL,
+                key: PhysicalCode::key(8),
+                phase: EventPhase::Down,
+            },
+            action: Action::Replace(vec![OutputEvent::Key {
+                code: PhysicalCode::key(8),
+                phase: EventPhase::Down,
+                modifiers: ModifierSet::LEFT_COMMAND,
+            }]),
+        }
+    }
+
+    #[test]
+    fn shortcuts_only_skips_single_keys_before_matching_lower_priority_shortcuts() {
+        let mut engine = RuleEngine::new(
+            CompiledRules::compile(vec![
+                replacement("plain-c", 8, 12, 500),
+                copy_rule(200),
+                replacement("option-to-command", 58, 55, 100),
+            ])
+            .unwrap(),
+        );
+        let policy = KeyboardMappingPolicy::ShortcutsOnly;
+        assert_eq!(
+            engine.handle_with_policy(&modifier(58, ModifierSet::LEFT_OPTION, 1), policy),
+            event_model::Decision::Pass
+        );
+        let plain = NormalizedEvent {
+            modifiers: ModifierSet::LEFT_OPTION,
+            ..key(8, EventPhase::Down)
+        };
+        assert_eq!(
+            engine.handle_with_policy(&plain, policy),
+            event_model::Decision::Pass
+        );
+        assert_eq!(
+            engine.handle_with_policy(
+                &NormalizedEvent {
+                    phase: EventPhase::Up,
+                    ..plain
+                },
+                policy
+            ),
+            event_model::Decision::Pass
+        );
+        assert_eq!(
+            engine.handle_with_policy(&modifier(58, ModifierSet::NONE, 2), policy),
+            event_model::Decision::Pass
+        );
+        let copy = NormalizedEvent {
+            modifiers: ModifierSet::LEFT_CONTROL,
+            ..key(8, EventPhase::Down)
+        };
+        assert_eq!(
+            engine.handle_with_policy(&copy, policy),
+            event_model::Decision::Emit(vec![OutputEvent::Key {
+                code: PhysicalCode::key(8),
+                phase: EventPhase::Down,
+                modifiers: ModifierSet::LEFT_COMMAND,
+            }])
+        );
+        assert_eq!(
+            engine.handle_with_policy(
+                &NormalizedEvent {
+                    phase: EventPhase::Up,
+                    ..copy
+                },
+                policy
+            ),
+            event_model::Decision::Emit(vec![OutputEvent::Key {
+                code: PhysicalCode::key(8),
+                phase: EventPhase::Up,
+                modifiers: ModifierSet::LEFT_COMMAND,
+            }])
+        );
+        assert!(engine.state.bindings.is_empty());
+    }
+
+    #[test]
+    fn policy_changes_keep_old_mapped_and_native_bindings_until_release() {
+        let full = KeyboardMappingPolicy::Full;
+        let native = KeyboardMappingPolicy::ShortcutsOnly;
+        let mut engine = RuleEngine::new(
+            CompiledRules::compile(vec![replacement("a-to-b", 0, 1, 100)]).unwrap(),
+        );
+        assert!(matches!(
+            engine.handle_with_policy(&key(0, EventPhase::Down), full),
+            event_model::Decision::Emit(_)
+        ));
+        assert_eq!(
+            engine.handle_with_policy(&key(0, EventPhase::Repeat), native),
+            event_model::Decision::Emit(vec![OutputEvent::Key {
+                code: PhysicalCode::key(1),
+                phase: EventPhase::Repeat,
+                modifiers: ModifierSet::NONE,
+            }])
+        );
+        assert_eq!(
+            engine.handle_with_policy(&key(0, EventPhase::Up), native),
+            event_model::Decision::Emit(vec![OutputEvent::Key {
+                code: PhysicalCode::key(1),
+                phase: EventPhase::Up,
+                modifiers: ModifierSet::NONE,
+            }])
+        );
+        assert_eq!(
+            engine.handle_with_policy(&key(0, EventPhase::Down), native),
+            event_model::Decision::Pass
+        );
+        assert_eq!(
+            engine.handle_with_policy(&key(0, EventPhase::Repeat), full),
+            event_model::Decision::Pass
+        );
+        assert_eq!(
+            engine.handle_with_policy(&key(0, EventPhase::Up), full),
+            event_model::Decision::Pass
+        );
+        assert!(engine.state.bindings.is_empty());
+        assert_eq!(engine.state().logical_down_count(PhysicalCode::key(0)), 0);
+        assert_eq!(engine.state().logical_down_count(PhysicalCode::key(1)), 0);
+    }
+
+    #[test]
+    fn software_pass_binding_stays_raw_when_a_later_modifier_is_mapped() {
+        let full = KeyboardMappingPolicy::Full;
+        let native = KeyboardMappingPolicy::ShortcutsOnly;
+        let mut engine = RuleEngine::new(
+            CompiledRules::compile(vec![replacement("option-to-command", 58, 55, 100)]).unwrap(),
+        );
+        assert_eq!(
+            engine.handle_with_policy(&key(0, EventPhase::Down), native),
+            event_model::Decision::Pass
+        );
+        assert!(matches!(
+            engine.handle_with_policy(&modifier(58, ModifierSet::LEFT_OPTION, 1), full),
+            event_model::Decision::Emit(_)
+        ));
+        let repeat = NormalizedEvent {
+            modifiers: ModifierSet::LEFT_OPTION,
+            ..key(0, EventPhase::Repeat)
+        };
+        assert_eq!(
+            engine.handle_with_policy(&repeat, full),
+            event_model::Decision::Pass
+        );
+        assert_eq!(
+            engine.handle_with_policy(
+                &NormalizedEvent {
+                    phase: EventPhase::Up,
+                    ..repeat
+                },
+                full
+            ),
+            event_model::Decision::Pass
+        );
+        assert!(matches!(
+            engine.handle_with_policy(&modifier(58, ModifierSet::NONE, 2), full),
+            event_model::Decision::Emit(_)
+        ));
+        assert!(engine.state.bindings.is_empty());
+    }
+
+    #[test]
+    fn shortcut_lookup_respects_priority_disabled_rules_and_application_scope() {
+        let mut high = copy_rule(300);
+        high.id = "disabled".into();
+        high.enabled = false;
+        high.action = Action::Suppress;
+        let mut scoped = copy_rule(250);
+        scoped.id = "scoped".into();
+        scoped.scope = RuleScope::App {
+            bundle_id: "editor".into(),
+        };
+        scoped.action = Action::Suppress;
+        let mut engine =
+            RuleEngine::new(CompiledRules::compile(vec![high, scoped, copy_rule(100)]).unwrap());
+        let event = NormalizedEvent {
+            modifiers: ModifierSet::LEFT_CONTROL,
+            ..key(8, EventPhase::Down)
+        };
+        assert_eq!(engine.shortcut_action(&event), Some(copy_rule(100).action));
+        assert_eq!(
+            engine.shortcut_action(&NormalizedEvent {
+                app_context: Some(AppContext {
+                    bundle_id: "editor".into()
+                }),
+                ..event.clone()
+            }),
+            Some(Action::Suppress)
+        );
+        assert!(engine.state.bindings.is_empty());
+        let decision = engine.handle_with_policy(&event, KeyboardMappingPolicy::ShortcutsOnly);
+        assert!(matches!(decision, event_model::Decision::Emit(_)));
+    }
+
+    #[test]
+    fn shortcuts_only_preserves_project_function_bound_to_a_single_key() {
+        let mut rule = replacement("clipboard", 96, 97, 100);
+        rule.action = Action::Replace(vec![OutputEvent::SystemShortcut(
+            event_model::SystemShortcut::ShowClipboard,
+        )]);
+        let mut engine = RuleEngine::new(CompiledRules::compile(vec![rule]).unwrap());
+        assert_eq!(
+            engine.handle_with_policy(
+                &key(96, EventPhase::Down),
+                KeyboardMappingPolicy::ShortcutsOnly
+            ),
+            event_model::Decision::Emit(vec![OutputEvent::SystemShortcut(
+                event_model::SystemShortcut::ShowClipboard
+            )])
+        );
+        assert_eq!(
+            engine.handle_with_policy(
+                &key(96, EventPhase::Up),
+                KeyboardMappingPolicy::ShortcutsOnly
+            ),
+            event_model::Decision::Suppress
+        );
+    }
+
+    #[test]
+    fn software_shift_and_control_shift_functions_keep_the_original_release() {
+        let policy = KeyboardMappingPolicy::ShortcutsOnly;
+        let mut engine =
+            RuleEngine::new(CompiledRules::compile(vec![modifier_chord_rule()]).unwrap());
+        engine.set_pinyin_active(true);
+        assert_eq!(
+            engine.handle_with_policy(&modifier(56, ModifierSet::LEFT_SHIFT, 1), policy),
+            event_model::Decision::Pass
+        );
+        assert_eq!(
+            engine.handle_with_policy(&modifier(56, ModifierSet::NONE, 2), policy),
+            event_model::Decision::Emit(vec![
+                OutputEvent::SystemShortcut(event_model::SystemShortcut::TogglePinyinEnglish),
+                OutputEvent::Key {
+                    code: PhysicalCode::key(56),
+                    phase: EventPhase::Up,
+                    modifiers: ModifierSet::NONE
+                },
+            ])
+        );
+        assert_eq!(
+            engine.handle_with_policy(&modifier(59, ModifierSet::LEFT_CONTROL, 3), policy),
+            event_model::Decision::Pass
+        );
+        assert_eq!(
+            engine.handle_with_policy(&modifier(56, ModifierSet::LEFT_SHIFT, 4), policy),
+            event_model::Decision::Pass
+        );
+        assert_eq!(
+            engine.handle_with_policy(&modifier(56, ModifierSet::NONE, 5), policy),
+            event_model::Decision::Emit(vec![
+                OutputEvent::SystemShortcut(event_model::SystemShortcut::SwitchInputSource),
+                OutputEvent::Key {
+                    code: PhysicalCode::key(56),
+                    phase: EventPhase::Up,
+                    modifiers: ModifierSet::LEFT_CONTROL
+                },
+            ])
+        );
+        assert_eq!(
+            engine.handle_with_policy(&modifier(59, ModifierSet::NONE, 6), policy),
+            event_model::Decision::Pass
+        );
+        assert!(engine.state.bindings.is_empty());
+    }
+
+    #[test]
+    fn policy_update_cancels_pending_gestures_without_losing_the_release() {
+        let mut engine =
+            RuleEngine::new(CompiledRules::compile(vec![modifier_chord_rule()]).unwrap());
+        engine.set_pinyin_active(true);
+        engine.handle_with_policy(
+            &modifier(56, ModifierSet::LEFT_SHIFT, 1),
+            KeyboardMappingPolicy::ShortcutsOnly,
+        );
+        assert_eq!(
+            engine.handle_with_policy(
+                &modifier(56, ModifierSet::NONE, 2),
+                KeyboardMappingPolicy::Full
+            ),
+            event_model::Decision::Pass
+        );
+        assert!(engine.state.bindings.is_empty());
+    }
+
+    #[test]
+    fn checkpoint_restores_policy_with_its_pending_gestures() {
+        let mut engine = RuleEngine::new(CompiledRules::compile(vec![]).unwrap());
+        engine.set_pinyin_active(true);
+        engine.handle(&modifier(56, ModifierSet::LEFT_SHIFT, 1));
+        let checkpoint = engine.checkpoint();
+        engine.set_keyboard_mapping_policy(KeyboardMappingPolicy::ShortcutsOnly);
+        engine.restore(checkpoint);
+        assert_eq!(
+            engine.keyboard_mapping_policy(),
+            KeyboardMappingPolicy::Full
+        );
+        assert_eq!(
+            engine.handle_with_policy(
+                &modifier(56, ModifierSet::NONE, 2),
+                KeyboardMappingPolicy::ShortcutsOnly
+            ),
+            event_model::Decision::Pass
+        );
+    }
+
+    #[test]
+    fn known_text_does_not_change_policy_or_enter_shortcut_matching() {
+        let mut engine = RuleEngine::new(CompiledRules::compile(vec![copy_rule(100)]).unwrap());
+        engine.set_keyboard_mapping_policy(KeyboardMappingPolicy::ShortcutsOnly);
+        let text = NormalizedEvent {
+            origin: EventOrigin::TextInjection { marker: 100 },
+            modifiers: ModifierSet::LEFT_CONTROL,
+            ..key(8, EventPhase::Down)
+        };
+        assert_eq!(
+            engine.handle_with_policy(&text, KeyboardMappingPolicy::Full),
+            event_model::Decision::Pass
+        );
+        assert_eq!(
+            engine.keyboard_mapping_policy(),
+            KeyboardMappingPolicy::ShortcutsOnly
+        );
+        assert_eq!(engine.shortcut_action(&text), None);
+        assert!(engine.state.bindings.is_empty());
+    }
+
+    #[test]
+    fn software_down_only_passthrough_stays_usable_without_extra_holders() {
+        for policy in [
+            KeyboardMappingPolicy::Full,
+            KeyboardMappingPolicy::ShortcutsOnly,
+        ] {
+            let mut engine = RuleEngine::new(CompiledRules::compile(vec![]).unwrap());
+            engine.set_software_input(true);
+            for _ in 0..5 {
+                assert_eq!(
+                    engine.handle_with_policy(&key(12, EventPhase::Down), policy),
+                    event_model::Decision::Pass
+                );
+                assert_eq!(engine.state().logical_down_count(PhysicalCode::key(12)), 1);
+            }
+            assert_eq!(
+                engine.handle_with_policy(&key(12, EventPhase::Up), policy),
+                event_model::Decision::Pass
+            );
+            assert_eq!(engine.state().logical_down_count(PhysicalCode::key(12)), 0);
+            assert!(engine.state.bindings.is_empty());
+        }
+    }
+
+    #[test]
+    fn software_duplicate_down_does_not_leak_a_mapped_or_consumed_source() {
+        let mut suppressed = replacement("suppress", 8, 9, 100);
+        suppressed.action = Action::Suppress;
+        let mut engine = RuleEngine::new(
+            CompiledRules::compile(vec![replacement("a-to-b", 0, 1, 100), suppressed]).unwrap(),
+        );
+        engine.set_software_input(true);
+        assert!(matches!(
+            engine.handle(&key(0, EventPhase::Down)),
+            event_model::Decision::Emit(_)
+        ));
+        assert_eq!(
+            engine.handle(&key(0, EventPhase::Down)),
+            event_model::Decision::Suppress
+        );
+        assert_eq!(engine.state().logical_down_count(PhysicalCode::key(1)), 1);
+        assert_eq!(
+            engine.handle(&key(8, EventPhase::Down)),
+            event_model::Decision::Suppress
+        );
+        assert_eq!(
+            engine.handle(&key(8, EventPhase::Down)),
+            event_model::Decision::Suppress
+        );
+        assert_eq!(
+            engine.handle(&key(8, EventPhase::Up)),
+            event_model::Decision::Suppress
+        );
+        assert!(matches!(
+            engine.handle(&key(0, EventPhase::Up)),
+            event_model::Decision::Emit(_)
+        ));
+        assert!(engine.state.bindings.is_empty());
     }
 
     #[test]

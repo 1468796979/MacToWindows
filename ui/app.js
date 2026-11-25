@@ -84,7 +84,7 @@ function renderStatus() {
 
 function renderSettings() {
   const busy = state.writesPending > 0 || !state.snapshot;
-  for (const id of ["toggle-mode", "profile-select", "add-rule", "import-config", "export-config", "permission-button", "show-desktop-save", "rule-submit"]) {
+  for (const id of ["toggle-mode", "profile-select", "add-rule", "import-config", "export-config", "permission-button", "show-desktop-save", "rule-submit", "software-input-passthrough"]) {
     $(id).disabled = busy;
   }
   const select = $("profile-select");
@@ -98,6 +98,12 @@ function renderSettings() {
   }
   select.value = state.snapshot?.active_profile || "";
   if (!state.desktopDraftDirty) $("show-desktop-shortcut").value = state.snapshot?.show_desktop_shortcut || "";
+  const passthrough = state.snapshot?.software_input_passthrough !== false;
+  $("software-input-passthrough").className = "switch" + (passthrough ? " on" : "");
+  $("software-input-passthrough").setAttribute("aria-checked", String(passthrough));
+  $("software-input-passthrough-state").textContent = !state.snapshot ? "正在读取配置…"
+    : passthrough ? "已开启 · 软件普通输入透传，保留快捷键"
+      : "已关闭 · 软件普通按键使用项目映射，文字仍受保护";
   renderRules();
   renderStatus();
 }
@@ -168,6 +174,12 @@ $("toggle-mode").addEventListener("click", () => runtimeMutation("toggle_mode").
 $("profile-select").addEventListener("change", (event) => {
   const profile = event.target.value;
   mutateSettings("set_profile", () => ({ profile })).catch(() => {});
+});
+$("software-input-passthrough").addEventListener("click", () => {
+  if (!state.snapshot || state.writesPending > 0) return;
+  mutateSettings("set_software_input_passthrough", () => ({
+    enabled: state.snapshot.software_input_passthrough === false,
+  })).catch(() => {});
 });
 $("permission-button").addEventListener("click", async () => {
   try {

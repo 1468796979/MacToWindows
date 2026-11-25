@@ -29,6 +29,7 @@ pub struct SettingsSnapshot {
     pub profiles: Vec<String>,
     pub rules: Vec<RuleView>,
     pub show_desktop_shortcut: String,
+    pub software_input_passthrough: bool,
     pub runtime: RuntimeView,
     pub config_error: Option<String>,
 }
@@ -72,6 +73,7 @@ pub(super) fn snapshot(state: &AppState) -> Result<SettingsSnapshot, String> {
         profiles: config.profiles.keys().cloned().collect(),
         rules,
         show_desktop_shortcut: config.system_shortcuts.show_desktop.clone(),
+        software_input_passthrough: config.software_input_passthrough,
         runtime: runtime_view(state, &runtime),
         config_error: state
             .settings
@@ -135,6 +137,17 @@ where
         .lock()
         .map_err(|_| "settings error lock poisoned")? = None;
     snapshot(state)
+}
+
+pub(super) fn set_software_input_passthrough(
+    state: &AppState,
+    expected_revision: u64,
+    enabled: bool,
+) -> Result<SettingsSnapshot, String> {
+    mutate(state, expected_revision, |config| {
+        config.software_input_passthrough = enabled;
+        Ok(())
+    })
 }
 
 pub(super) fn set_enabled(
@@ -286,6 +299,54 @@ mod tests {
         assert!(error.is_none());
         assert!(!loaded.profiles["windows_physical"].keyboard_rules[0].enabled);
         assert!(!loaded.enabled);
+    }
+
+    #[test]
+    fn software_passthrough_setting_persists_without_resuming_windows_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = state(temp.path().join("config.toml"));
+        assert!(snapshot(&state).unwrap().software_input_passthrough);
+        let updated = set_software_input_passthrough(&state, 0, false).unwrap();
+        assert!(!updated.software_input_passthrough);
+        assert_eq!(updated.config_revision, 1);
+        assert_eq!(updated.runtime.status, RuntimeStatus::Disabled);
+        let changed_profile = mutate(&state, 1, |config| {
+            config.active_profile = "custom".into();
+            Ok(())
+        })
+        .unwrap();
+        assert!(!changed_profile.software_input_passthrough);
+        let (loaded, error) = load_startup(state.settings.path.as_ref().unwrap());
+        assert!(error.is_none());
+        assert!(!loaded.software_input_passthrough);
+        assert!(!loaded.enabled);
+        assert_eq!(loaded.active_profile, "custom");
+    }
+
+    #[test]
+    fn stale_software_passthrough_write_preserves_the_confirmed_choice() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = state(temp.path().join("config.toml"));
+        set_software_input_passthrough(&state, 0, false).unwrap();
+        let error = set_software_input_passthrough(&state, 0, true).unwrap_err();
+        assert!(error.contains("配置已更新"));
+        let current = snapshot(&state).unwrap();
+        assert!(!current.software_input_passthrough);
+        assert_eq!(current.config_revision, 1);
+    }
+
+    #[test]
+    fn failed_software_passthrough_save_keeps_the_live_policy() {
+        let temp = tempfile::tempdir().unwrap();
+        let blocker = temp.path().join("file");
+        std::fs::write(&blocker, "not a directory").unwrap();
+        let state = state(blocker.join("config.toml"));
+        assert!(set_software_input_passthrough(&state, 0, false).is_err());
+        let current = snapshot(&state).unwrap();
+        assert!(current.software_input_passthrough);
+        assert_eq!(current.config_revision, 0);
+        assert_eq!(current.runtime.status, RuntimeStatus::Disabled);
+        assert!(current.config_error.is_some());
     }
 
     #[test]

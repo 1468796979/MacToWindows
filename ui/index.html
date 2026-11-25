@@ -33,6 +33,12 @@
           <div class="card-heading"><span>当前预设</span><span class="pill accent-pill">推荐</span></div>
           <select id="profile-select" aria-label="当前预设" disabled></select>
           <p class="muted">下方规则来自当前生效的本地配置；修改成功后自动保存。</p>
+          <div class="software-input-setting">
+            <div class="card-heading"><span id="software-input-passthrough-title">软件输入透传</span><button id="software-input-passthrough" class="switch on" type="button" role="switch" aria-checked="true" aria-labelledby="software-input-passthrough-title" aria-describedby="software-input-passthrough-help software-input-passthrough-detail" disabled></button></div>
+            <p id="software-input-passthrough-state" class="muted form-hint" aria-live="polite">正在读取配置…</p>
+            <p id="software-input-passthrough-help" class="muted form-hint">默认开启。Windows 模式启用时，可识别的非 Deskflow 软件保留普通文字和单键输入，同时保留 Windows 快捷键转换、剪贴板与输入法切换功能。关闭后，普通按键也使用当前映射；已生成的文字始终保留内容。</p>
+            <details id="software-input-passthrough-detail" class="muted form-hint"><summary>适用范围</summary><p>物理键盘和 Deskflow 继续使用完整项目映射；无法与物理键盘区分的输入沿用原映射。只发送文字、缺少完整按键事件的软件无法触发对应手势。部分远程文字事件无法识别为按键，对应快捷键保留原样。此开关不自动启用 Windows 模式；暂停时保持原生输入，Option+V 仍可使用。</p></details>
+          </div>
           <label class="form-field">显示桌面输出快捷键<input id="show-desktop-shortcut" placeholder="key:103（F11）" /></label>
           <div class="form-actions"><button id="show-desktop-save" class="secondary" type="button" disabled>保存快捷键</button></div>
           <p class="muted form-hint">供 shortcut:show_desktop 使用，填写与 macOS“显示桌面”设置一致的快捷键，例如 key:103。</p>

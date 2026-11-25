@@ -1,110 +1,151 @@
-# RustDesk 文本通道与 Deskflow 映射兼容性
+# 软件输入透传与 RustDesk / Deskflow 兼容性
 
-本轮修正保留普通成对按键流的 Windows 映射，覆盖本地键盘、Deskflow，以及 RustDesk 的 Map / Translate `Chr` 路径；对 RustDesk 1.5.3 已确认的 Enigo marker 100 键盘通道原样透传。来源 PID、来源状态或“由软件生成”不再作为禁止映射的门槛。
+本轮增加默认开启的“软件输入透传”开关，在可识别的软件来源中分别处理普通单键、组合快捷键和已生成文字。物理键盘、Deskflow 以及无法与硬件区分的输入保留现有映射；软件输入保留 Windows 快捷键和项目功能时，也必须保持按下与释放配对。
 
-用户已确认当前安装的旧版 MacToWindows 能配合 Deskflow 正常执行 Windows 映射，这是本次修正需要保持的行为。本轮只修改源码并进行自动化验证，不生成安装或发布包，不安装、替换本机 App，也不执行签名、公证或发布。下文记录本轮自动回归结果；修正后的人工验收仍待执行，不能用隔离测试结果代替真实会话验收。
+用户已确认旧安装版能配合 Deskflow 正常使用，这是需要保持的基线。本轮修改源码、设置界面和隔离回归，不打包、不替换本机应用、不签名公证或发布。新实现的真实 RustDesk、Deskflow 与前台输入验收尚未完成，不能用源码或隔离测试代替真实会话结论。
 
-## Deskflow：保留 HID 与 CoreGraphics 回退路径
+## 开关行为与说明
 
-已核对本机 Deskflow 的公开版本元数据为 1.27.0.0。官方 v1.27.0 的 [`src/lib/platform/OSXKeyState.cpp`](https://github.com/deskflow/deskflow/blob/v1.27.0/src/lib/platform/OSXKeyState.cpp#L599-L648) 显示：`postHIDVirtualKey()` 使用 `IOHIDPostEvent`；`postKeyboardKey()` 使用 `CGEventCreateKeyboardEvent` 和事件发送；`fakeKey()` 在 HID 发送失败时回退到 CoreGraphics。
+全局配置项 `software_input_passthrough` 默认 `true`；旧配置缺少字段时也按开启处理，显式 `false` 会保存。开关不属于某个预设，切换预设保持该选择。导入导出包含该字段，设置修改复用版本校验、串行写入和原子保存，保存失败时原配置继续生效。
 
-两条路径均需继续按原有按下/释放语义处理，不能只保留 HID 路径的映射。自动回归应覆盖 `user_data = 0`、来源 PID 为正、来源状态为 0（CombinedSessionState）的 CoreGraphics 成对事件；这些是兼容性测试条件，不代表已抓取或确认真实 Deskflow 会话中每个事件都带有相同元数据。
+**软件输入透传（默认开启）**：Windows 模式启用时，可识别的非 Deskflow 软件保留普通文字和单键输入，同时保留 Windows 快捷键转换、剪贴板与输入法切换功能。关闭后，普通按键也使用当前项目映射；被识别为已生成文字的事件保留原始内容。
 
-## RustDesk 1.5.3 的已确认通道
-
-已核对本机 `/Applications/RustDesk.app` 的公开版本元数据：RustDesk 1.5.3，build 71。没有读取个人配置、连接凭据或远程会话内容。用户的实际键盘模式尚未确认。
-
-官方 1.5.3 标签对应提交 `95cca3f661f635b3cc85c04935fe8d96d8f432ef`。该版本 Enigo 的 `key_sequence()` 按 Unicode 字素创建虚拟键码 0、仅 Down 的原生事件并附带文本，不发送配对 Up；`post_event()` 为 Enigo 键盘通道设置 `EVENT_SOURCE_USER_DATA = 100`。实现见 [`libs/enigo/src/macos/macos_impl.rs`](https://github.com/rustdesk/rustdesk/blob/95cca3f661f635b3cc85c04935fe8d96d8f432ef/libs/enigo/src/macos/macos_impl.rs)。
-
-原有按键状态机会在第一次 Down 后登记键码绑定，并抑制没有 Up 的后续同键码 Down。文本通道因此可能把不同字符当成一个始终按住的物理键；重建按键还会丢失原始 Unicode 载荷。此次透传完整 marker 100 键盘通道，保留原生文本和事件顺序，避免在同一通道中只旁路部分按键。
-
-| RustDesk 1.5.3 接收路径 | macOS 注入方式 | 本轮处理 |
+| 输入来源或内容 | 透传开启 | 透传关闭 |
 | --- | --- | --- |
-| Legacy：普通 `Chr`，不含热键修饰键 | Enigo `key_sequence()` | marker 100 键盘通道原样透传 |
-| Legacy：`Unicode`、`Seq` | Enigo `key_sequence()` | marker 100 键盘通道原样透传 |
-| Legacy：热键字符及控制键 | Enigo 布局键或控制键的 Down/Up | 同属 marker 100 通道，也原样透传 |
-| Translate：`Seq` | Enigo `key_sequence()` | marker 100 键盘通道原样透传 |
-| Translate：`Chr` | rdev 原始 macOS 虚拟键码 Down/Up | 继续原有 Windows 映射 |
-| Map | rdev 原始 macOS 虚拟键码 Down/Up | 继续原有 Windows 映射 |
+| 物理键盘、可识别的 Deskflow | 完整项目映射与快捷功能 | 完整项目映射与快捷功能 |
+| 其他软件的普通单键，如 B→N | 原始单键，不执行普通单键替换 | 执行项目映射；同形 A 事件保护除外 |
+| 其他软件明确的组合快捷键 | 保留活动预设中的 Windows 快捷转换 | 保留活动预设中的 Windows 快捷转换 |
+| 剪贴板、单独 Shift / Ctrl+Shift 等功能 | 保留，需有完整且可识别的按键语义 | 保留，需有完整且可识别的按键语义 |
+| 被识别为文字的事件 | 原始内容保留，不进入持续按键账本 | 原始内容保留，不进入持续按键账本 |
+| 无法与物理键盘区分的输入 | 沿用原有完整映射 | 沿用原有完整映射 |
 
-分派见固定提交的 [`src/server/input_service.rs`](https://github.com/rustdesk/rustdesk/blob/95cca3f661f635b3cc85c04935fe8d96d8f432ef/src/server/input_service.rs) 中 `legacy_keyboard_mode()`、`translate_keyboard_mode()`、`map_keyboard_mode()`。该版本 Translate 的 `Unicode` 分支未处理，本轮不改变 RustDesk 自身的这一行为。
+新开关服从全局 Windows 模式，不会自动启用映射，应用启动时仍保持暂停。Windows 模式暂停时，普通输入原样送达，不转换 Ctrl+C、Alt+Tab 或 Shift 手势；Option+V 继续保留原有独立剪贴板功能。
 
-RustDesk 的 [`Cargo.lock`](https://github.com/rustdesk/rustdesk/blob/95cca3f661f635b3cc85c04935fe8d96d8f432ef/Cargo.lock) 锁定 rdev 提交 `0904f23ce496e255461a98848b85c11fa5a62eab`。其 [`src/macos/simulate.rs` 的 `VirtualInput::simulate()`](https://github.com/rustdesk-org/rdev/blob/0904f23ce496e255461a98848b85c11fa5a62eab/src/macos/simulate.rs) 没有显式设置 Enigo marker 100。不能将所有 RustDesk 按键都归入文本旁路，也不能把当前策略描述为隔离全部远程输入。
+只发送最终文字、没有完整修饰键或释放事件的软件，无法提供对应按键手势。本开关不承诺识别全部软件、虚拟 HID 或远程键盘实现。
 
-## 路由契约与限制
+## 来源分类与 Deskflow 例外
 
-`EventTapEvent::keyboard_route(own_marker)` 对 keyDown、keyUp、flagsChanged（原生类型 10、11、12）判定路由；其他事件返回 `None`，继续既有分支。自身 marker 的判断优先。
+原生回调先读取键盘事件的必要元数据，自身非零 marker 优先执行回环防护。其他来源使用后台进程缓存与事件来源提示分类；来源状态表不能作为硬件身份证明。
 
-| 路由 | 条件 | 处理 |
+| 来源分类 | 当前处理 |
+| --- | --- |
+| 自身回放 | 原有回环防护，不再次映射或触发快捷键 |
+| 缓存确认的 Deskflow GUI / core | 回到原有本地按键路径，HID 与 CG 共享账本，保持完整映射 |
+| 缓存确认的其他软件进程，或带外部非零 marker 的事件 | 按文字保护及开关策略处理 |
+| 正 PID、marker 0，但缓存未确认来源 | 先执行同形文字保护，其余按键暂沿用原有本地路径 |
+| PID、marker 均为 0 的硬件形态输入 | 沿用原有映射，不猜测具体设备 |
+| 无法读取的键盘事件 | 安全放行原事件 |
+
+Deskflow 缓存匹配 `Deskflow.app/Contents/MacOS/Deskflow` 与 `Deskflow.app/Contents/MacOS/deskflow-core` 两条可执行路径，并记录进程启动代次。缓存每秒刷新，超过三秒的快照不再用于确认进程身份；回调使用非阻塞快照读取，不在每次按键时同步查询进程或文件。缓存未命中、过期或读取忙碌时，正 PID、marker 0 的事件为未知来源，其余非零外部 marker 仍可提供软件来源提示。缓存刷新存在窗口，进程路径、PID 和 marker 均是兼容线索，不是身份认证。
+
+同一正 PID 已归类为软件来源时，其 Enigo marker 100 与 rdev marker 0 归入同一输入来源，避免修饰键和主键被拆成两组。对同一进程已开始的按键序列，来源路由冻结到所有相关按键释放后再更新；已确认的新进程代次另行处理，避免缓存变化在组合中途拆换路径。无正 PID 时使用 marker 分组。一个生产进程中的多个远程连接不能仅凭这些字段进一步区分，来源键只在内存中保存。
+
+已核对的本机 Deskflow 公开版本为 1.27.0.0。官方 v1.27.0 的 [OSXKeyState.cpp](https://github.com/deskflow/deskflow/blob/v1.27.0/src/lib/platform/OSXKeyState.cpp#L599-L648) 先使用 `IOHIDPostEvent`，失败后回退到 CoreGraphics。HID 路径若未提供可归属身份，继续按硬件形态输入映射；CG 回退被缓存识别后也回到同一本地账本，避免 HID 与 CG 在按下和释放之间切换路径造成卡键。隔离元数据条件不代表已抓取真实 Deskflow 会话中的全部字段。
+
+Apple 将 [来源 PID](https://developer.apple.com/documentation/coregraphics/cgeventfield/eventsourceunixprocessid) 定义为事件来源进程 ID，将 [source state](https://developer.apple.com/documentation/coregraphics/cgeventsourcestateid) 定义为事件状态表，软件驱动也可使用 HID 状态表。因此，不能只靠 PID / state 推断所有输入是否来自物理设备。
+
+## RustDesk 文字问题与当前保护边界
+
+此前核对的本机 RustDesk 为 1.5.3，build 71；官方标签对应提交 `95cca3f661f635b3cc85c04935fe8d96d8f432ef`。用户实际键盘模式尚未确认，没有读取连接凭据或个人会话内容。
+
+该版本 Enigo 的 [key_sequence 实现](https://github.com/rustdesk/rustdesk/blob/95cca3f661f635b3cc85c04935fe8d96d8f432ef/libs/enigo/src/macos/macos_impl.rs#L421-L499) 将文字按字素编码为键码 0、仅 Down 的事件，并附加 Unicode；其整个键盘通道使用 marker 100。原先的按键状态机会把连续不同文字当作始终按住的同一个键，抑制后续 Down；新建仅含键码的替代事件还会丢失 Unicode。
+
+当前文字保护在可识别软件来源和缓存尚未确认的来源中、进入按键及路由状态机之前执行；已确认 Deskflow 与硬件形态的输入继续沿用原有映射：
+
+- marker 100 且键码 0 的事件完整原样放行，包括带 Control / Command flags 的事件。
+- 其他软件或未知来源的键码 0 只要含有 Unicode，就完整原样放行，包括 ASCII `a` / `A`、中文和带 Control / Command flags 的形式。
+- 上述文字不进入 held 账本，不触发 A 键规则。文字活动会取消待识别手势，但不释放其他来源仍按住的映射键。
+- 普通软件单键已决定原样放行后，后续重复 Down 保持可输入，不再因同一已透传绑定被统一吞掉；映射或明确消费的绑定仍执行配对保护。
+
+**同形 A / Ctrl+A 的转换受限。** 真实 A 键也使用键码 0，普通键盘事件和显式附加文字的事件可能读出相同 Unicode。软件或未知来源的键码 0 只要带 Unicode，或使用 Enigo marker 100，就优先保留内容，不进入按键账本。因此真实软件 A 的单键替换与相应 Ctrl+A 也可能跳过；这个限制不仅涉及 Legacy，还可能涉及 Translate、Map / rdev。不能宣称这些形式已经转换为 Command+A。已确认 Deskflow 和物理键盘继续原有映射，明确非零键码组合如 Ctrl+C / V / Z 继续按活动规则处理。
+
+此保护是来源和事件形式的兼容策略，不是通用文本识别器。它也保护 marker 0、键码 0 提交 ASCII `a` 的同形事件，避免不配对的 Down 永久占住 A 并干扰后续输入；代价是保留相应真实 A 与快捷键原样。其他工具若改用非零占位键码、硬件形态输入或不同编码，仍需新增依据与回归，不能承诺所有软件的全部文字形式都已覆盖。
+
+| RustDesk 1.5.3 路径 | 已知输入形式 | 本轮处理与边界 |
 | --- | --- | --- |
-| `OwnInjected` | 非零 user data 与本程序 marker 相同，包括自身 marker 恰为 100 的情况 | 沿用回环防护，不再次映射 |
-| `TextInjection` | 自身 marker 判断之后，user data 为 100 的键盘事件 | 原始事件透传，不进入归一化状态跟踪、剪贴板热键或规则引擎 |
-| `Mappable` | 其他可读取的键盘事件，无 PID 或来源状态门槛 | 继续原有归一化、热键和 Windows 映射 |
-| `Unknown` | 无法读取原生键盘事件，或不支持该原生读取的环境 | 安全透传 |
+| Legacy 普通 Chr、Unicode / Seq | Enigo 文字，通常键码 0、仅 Down | 受保护形式原始内容放行，两种开关状态均不进入按键账本 |
+| Legacy A / Ctrl+A | Enigo 的真实键码 0 也与文字同形 | 保守原样放行，不承诺普通 A 替换或 Command+A 转换 |
+| Legacy 其他明确热键、控制键 | Enigo 普通键码及修饰事件 | 可识别按键进入软件快捷键路径，需真实会话验收 |
+| Translate Seq | Enigo 文字 | 同样执行文字保护 |
+| Translate Chr | rdev 成对虚拟键码 | 明确键流按开关处理；键码 0 带 Unicode 的 A / Ctrl+A 保守原样放行 |
+| Map | rdev 成对虚拟键码 | 明确键流按开关处理；同形 A / Ctrl+A 不保证映射或转换 |
 
-`TextInjection` 是本项目的通道路由名称，不表示该通道每个事件都携带 Unicode 文本。路由只依赖已确认的 user data 约定，不读取实际字符，不以虚拟键码 0、PID、来源状态或按键是否成对进行猜测。普通软件按键流即使来源 PID 为正、来源状态为 CombinedSessionState，也保持可映射。
+服务端分派见固定提交的 [input_service.rs](https://github.com/rustdesk/rustdesk/blob/95cca3f661f635b3cc85c04935fe8d96d8f432ef/src/server/input_service.rs)。macOS 的热键判断只包含 Control / Meta，不包含 Alt；Alt+Tab 属于需独立验证的控制键路径。该版本 Translate 的 Unicode 分支自身未处理，本项目不改变 RustDesk 的这一行为。
 
-marker 100 是工程上的兼容约定，不是认证身份，也不唯一属于 RustDesk 或某个进程。其他采用相同 marker 的工具同样会旁路本项目键盘映射。经虚拟 HID 提交、表现与普通硬件一致的事件也不会因“软件来源”而被隔离。
+rdev 锁定版本见 RustDesk 的 [Cargo.lock](https://github.com/rustdesk/rustdesk/blob/95cca3f661f635b3cc85c04935fe8d96d8f432ef/Cargo.lock)，对应 [macOS 模拟实现](https://github.com/rustdesk-org/rdev/blob/0904f23ce496e255461a98848b85c11fa5a62eab/src/macos/simulate.rs)。不能把所有 RustDesk 输入归为 marker 100，也不能把 marker 100 当成 RustDesk 的唯一身份。
 
-本轮只解决已确认的 marker 100 通道兼容问题。未知软件若以其他 marker 发送不配对的 Down，仍可能遇到原有按键状态风险；新版或修改版 RustDesk 改变注入约定后也需要重新验证。本项目不据此承诺修复所有远控或所有文本注入实现。
+## 快捷键、按键释放与失败处理
 
-`TextInjection` / `Unknown` 旁路保留原生 Unicode 载荷、flags 和 Down/Up 形式，不重建键盘事件。旁路不等待运行时互斥锁：回调尝试非阻塞取消本地待识别手势，锁忙碌时以原子标记保留请求，在下次可映射事件进入引擎前处理。不清除仍按住的映射键；自身回放不取消本地手势。普通 Deskflow 和 RustDesk Map 按键继续走原有映射与手势处理。鼠标和滚轮保持既有分支。
+软件来源分别维护归一化、规则绑定、剪贴板 latch 和切换应用状态，避免不同来源拼接手势。最终输出按键由统一所有权协调，普通映射与系统快捷动作都不能提前释放其他来源仍持有的目标键。
+
+透传开启时，活动预设的组合规则与项目功能继续生效，普通单键和单修饰键替换跳过；关闭时完整按键采用完整映射。规则优先级、禁用状态及原有作用域限制仍生效。已按下主键的决定冻结到 Repeat / Up，配置更新不会让原来的释放换用新规则。
+
+Alt+Tab 使用明确的切换应用状态，覆盖按住修饰键、连续 Tab、反向切换和松开收尾，不能仅依赖被跳过的 Option 单键映射。实际组合上的用户规则优先于推导的 Alt+Tab；其他来源活动或文字会结束本项目维持的切换会话，锁忙时保留取消请求直到下次能够安全收尾。Option+V 只消费已受理的 V 序列，已透传的 Option 释放仍应送达；Shift 功能触发时也不能吞掉已送出 Down 对应的 Up。
+
+功能尚未受理时，主键继续使用原事件；完整映射模式下按已生效的修饰键绑定调整 flags，释放时重算当前状态，避免保留已松开的 Command。主键 Down 一旦消费，Repeat / Up 必须按同一决定收尾。注入失败、紧急停用、权限失效、Tap 超时和退出通过降级或集中清理释放项目输出。失去事件连续性时清除可能已过期的本地及软件原始持有记录、手势和已消费尾部；普通暂停或设置更新仍保留需要收尾的序列。真实应用对修饰 flags 的最终响应仍须实机验收。
+
+保留文字或仅修改 flags 的路径必须保留原始载荷。需要注入事件副本时，副本写入本项目 marker 以执行回环防护，不改变原事件的 marker、Unicode 或原生阶段。
 
 ## 诊断与隐私
 
-保留字段名 `external_keyboard_events_passed`，其含义收窄为实际命中 `TextInjection` 或 `Unknown` 键盘旁路的事件数，不再统计所有软件来源。Deskflow、RustDesk Map 等 `Mappable` 事件不因来源 PID 或状态而增加这一计数。它不是字符数，也不能确认目标应用已经收到文本，或证明 RustDesk 当前使用的键盘模式。
+`external_keyboard_events_passed` 统计实际经文字保护或不可读取分支原样放行的键盘事件，不等同于全部软件事件数或字符数。已进入软件快捷键或完整映射的事件不会仅因正 PID 增加这个计数；它不能证明目标应用已收到文字，或确认 RustDesk 当前模式。
 
-`Diagnostics::record_external_keyboard_passed()` 只递增专用计数；调用方分别记录 `events_seen` 和 `events_passed`，避免重复累计。诊断只保留计数与运行状态，不记录实际字符、Unicode 载荷、完整按键序列、来源 PID 或远程凭据。
+诊断保留计数与运行状态，不记录输入文字、完整按键序列或远程凭据。进程身份和来源分组仅用于内存中的兼容处理，不作为持久日志或软件认证。
 
-## 自动回归清单
+## 源码与隔离回归检查点
 
-以下隔离自动回归已通过。原生对象测试不向系统发送键盘事件；Deskflow 和 RustDesk 的真实安装后验收另列下表。
+下表记录本轮实现应覆盖的隔离检查点，不表示真实远程会话已经完成。原生对象测试只创建、读取与释放事件，不向系统投递按键；工作区整体测试结果在下一节单独记录。
 
-| 用例 | 预期结果 | 状态 |
-| --- | --- | --- |
-| 本程序自身 marker，含自身 marker 为 100 | 自身回放优先，不误归为文本注入、不取消手势 | 通过 |
-| 本地物理键盘 Down/Up 与左右修饰键 | 继续原有 Windows 映射及释放配对 | 通过 |
-| Deskflow HID 形态的成对按键 | 继续映射，无残留按键绑定 | 通过 |
-| Deskflow CG 回退形态：marker 0、正 PID、state 0 | 继续映射，不因 PID / state 进入旁路 | 通过 |
-| 其他非 100 marker 的成对软件按键 | 继续映射，不设置全软件来源门槛 | 通过 |
-| RustDesk Map / Translate `Chr` 形态的成对按键 | 继续映射，不因远程软件来源被隔离 | 通过 |
-| marker 100、keycode 0、仅 Down、附不同文本 | 每个原生事件原样透传，无绑定残留或后续吞键 | 通过 |
-| marker 100 的修饰键与热键事件 | 完整通道透传，不混入本项目快捷键和物理状态 | 通过 |
-| 其他工具使用 marker 100 | 同样归入文本通道旁路，符合非唯一身份约定 | 通过 |
-| 不可读取的原生键盘事件 | `Unknown` 安全透传 | 通过 |
-| 文本旁路后接物理或 Deskflow 成对输入 | 后续映射、修饰键和手势状态正常 | 通过 |
-| 运行时锁忙碌或中毒 | 旁路立即返回；忙碌时保留待取消手势请求 | 通过 |
-| 已按住本地映射键时经过文本旁路 | 不清除原按键绑定，之后 Up 正常释放 | 通过 |
-| 非键盘事件 | 沿用鼠标和滚轮既有分支 | 通过 |
-| 旁路计数 | 只统计 `TextInjection` / `Unknown`；seen、passed 不重复累计 | 通过 |
-
-本轮重新执行的验证结果：
-
-| 命令 | 状态 |
+| 用例 | 检查点 |
 | --- | --- |
-| `cargo test --workspace` | 193 项通过，0 失败，3 项原有权限/独占测试忽略 |
-| `cargo check --workspace` | 通过 |
-| `cargo build -p mac-to-windows` | 通过 |
-| `cargo fmt --all -- --check` | 通过 |
-| `node --check ui/app.js`、`node --check ui/clipboard.js` | 通过 |
-| `node --test ui/*.test.js` | 32 项通过 |
-| `git diff --check` | 通过 |
+| 旧配置缺字段、显式关闭、重启和预设切换 | 默认开启且保存用户选择，不自动启动 Windows 模式 |
+| 保存失败、revision 冲突、迟到快照 | 原策略保持，界面状态与后端确认一致 |
+| Deskflow GUI / core、HID / CG 形态 | 共享原有本地账本；缓存未确认、更新、过期时来源序列完整收尾 |
+| 同一正 PID 的 Enigo 与 rdev | 合并输入来源，重启代次变化不串接旧状态 |
+| 软件普通单键 B→N | 开启保留 B，关闭对明确按键流映射 N |
+| 普通软件重复 Down | 原样透传序列不会统一吞掉后续输入 |
+| marker 100、键码 0、连续不同文字 | 两种状态原始内容保留，无占位键绑定 |
+| marker 0、键码 0、ASCII a 或其他 Unicode | 均执行保守保护，不登记永久 A 占位绑定 |
+| Ctrl+C / V / X / Z 与用户组合规则 | 明确按键语义下转换，优先级和禁用有效 |
+| 软件 A / Ctrl+A 与文字同形 | 两态保守原样放行；硬件与已确认 Deskflow 继续原有映射 |
+| Shift、Ctrl+Shift、Option+V | 功能识别、主键消费及修饰键释放完整 |
+| Alt+Tab 持续切换 | 单次、重复、反向、松开、中断及暂停清理 |
+| 本地与多个软件同时持键 | 不拼接手势，不提前释放共享目标键 |
+| 按住时切换开关或规则 | 原序列正常收尾，新按下使用新策略 |
+| 功能受理失败、队列满或注入失败 | 原始输入可恢复，已消费序列收尾正确 |
+| 自身副本回放、文字与未知元数据 | 回环防护优先，文字保持，无状态污染 |
 
-## 人工验收表
+## 本轮验证结果
 
-修正后的真实远程、Deskflow 和前台输入验收均未执行。需记录双方系统及工具版本、实际 RustDesk 键盘模式、MacToWindows 状态和每项结果；不收集实际输入文本、PID、连接 ID 或凭据。用户确认旧安装版可用属于保留行为的基线，不代表新源码已经安装验收。
+本轮自动验证：Rust 工作区 281 项通过、0 失败，3 项原有权限或独占 Event Tap 测试忽略；前端 37 项通过。原生事件链回归只创建、修改和读取对象，输出由测试捕获，不向系统投递按键。真实 RustDesk / Deskflow 会话仍待验收。
+
+| 命令 | 结果 |
+| --- | --- |
+| cargo test --workspace | 281 通过、0 失败、3 忽略 |
+| cargo check --workspace | 通过 |
+| cargo build -p mac-to-windows | 通过 |
+| cargo fmt --all -- --check | 通过 |
+| node --check ui/app.js、node --check ui/clipboard.js | 通过 |
+| node --test ui/*.test.js | 37 通过、0 失败 |
+| git diff --check | 通过 |
+
+## 真实会话验收表
+
+修正后的真实远程与前台输入验收未执行。需分别记录双方系统、工具版本、实际 RustDesk 模式、输入法所在端，以及 Windows 模式和透传开关状态；仅记录结果，不收集真实输入文本、连接凭据或完整按键序列。旧安装版 Deskflow 可用的用户反馈是基线，不代表新源码已安装验收。
 
 | 场景 | 操作与验收点 | 状态 |
 | --- | --- | --- |
-| Deskflow 1.27.0.0，Windows 模式启用 | 对照旧安装版，检查中英文、左右修饰键、Windows 快捷键与按下/释放；继续保持原有映射 | 待执行 |
-| Deskflow HID / CG 回退路径 | 在能够确认所经路径的测试环境分别验收；不为强制回退更改用户权限或安装 | 待执行 |
-| Deskflow，Windows 模式暂停 | 原生输入及释放正常 | 待执行 |
-| 本地物理键盘，Windows 模式启用与暂停 | 检查英文、拼音组字、左右修饰键和快捷键，无既有功能退化 | 待执行 |
-| RustDesk Legacy，Windows 模式启用 | 连续输入英文、中文、标点，确认首字后仍可输入；检查同属 Enigo 通道的热键原样处理 | 待执行 |
-| RustDesk Translate，Windows 模式启用 | 分别检查文本序列与成对 `Chr`；前者透传，后者仍映射，记录实际模式 | 待执行 |
-| RustDesk Map，Windows 模式启用 | 检查英文、远端输入法组字、Windows 快捷键及按下/释放，保持原有映射 | 待执行 |
-| RustDesk 各模式，Windows 模式暂停 | 对照原生远程输入，区分本项目与 RustDesk 自身限制 | 待执行 |
-| 物理、Deskflow、RustDesk 输入交替 | 检查无卡键、手势误触发、残留修饰键或后续映射失效 | 待执行 |
-| 诊断计数与隐私 | marker 100 文本旁路计数增加；Deskflow 普通映射不计旁路；日志无字符、PID 或凭据 | 待执行 |
+| Windows 启用 × 透传开启 / 关闭 | 对照行为表，文字安全、普通单键与组合转换正确 | 待执行 |
+| Windows 暂停 × 透传开启 / 关闭 | 普通输入原样，Ctrl+C / Alt+Tab / Shift 不转换，Option+V 独立功能保留 | 待执行 |
+| Deskflow HID / CG 回退及 GUI / core 重启 | 对照旧版验证完整映射、缓存刷新和正常释放；无法确认的路径保持未验证 | 待执行 |
+| 本地物理键盘 | 中英文、左右修饰键、Windows 快捷键和暂停行为无退化 | 待执行 |
+| RustDesk Legacy | 连续中英文及普通热键；验证同形 A / Ctrl+A 保守透传的边界 | 待执行 |
+| RustDesk Translate / Map | 分别验证文字与明确键流、两种开关状态；同形 A / Ctrl+A 标明原样保留，检查其他组合转换 | 待执行 |
+| 按住主键或修饰键切换开关 / 规则 | 无卡键、孤立 Up、漏释放或重复动作 | 待执行 |
+| 本地与多个软件交替或同时持键 | 来源状态不串接，共享目标和修饰键不被提前释放 | 待执行 |
+| Alt+Tab 持续会话 | 按住 Alt 连续 Tab、反向切换、松开提交、中断和暂停清理 | 待执行 |
+| Option+V、Shift / Ctrl+Shift 及功能失败 | 一次触发、失败仍可输入，已透传 Up 不丢失 | 待执行 |
+| 紧急停用、权限失效、Tap 超时和退出 | 项目输出安全清理，输入能够恢复 | 待执行 |
+| 诊断与隐私 | 计数语义准确，日志没有文字、完整序列或远程凭据 | 待执行 |
 
-本轮不打包、不安装、不发布；保留当前已授权应用，不把源码与隔离测试结果描述为已部署修复。
+本轮不打包、不安装、不发布，现有已授权应用保持原样；实际可用结论以完成后的真实会话验收为准。

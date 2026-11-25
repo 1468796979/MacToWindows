@@ -7,12 +7,16 @@ use std::sync::Arc;
 
 mod clipboard;
 mod input_source;
+mod keyboard_source;
 pub use clipboard::{
     activate_application, frontmost_application, ForegroundApplication, PasteboardBackend,
     PasteboardChange, PasteboardError, PasteboardService,
 };
 pub use input_source::{
     InputSourceCommand, InputSourceError, InputSourceService, InputSourceSnapshot,
+};
+pub use keyboard_source::{
+    KeyboardRoutingState, KeyboardSource, KeyboardSourceCache, KeyboardSourceId, KeyboardSourceKind,
 };
 
 const MARKER_NAMESPACE: u64 = 0x4d54_5700_0000_0000;
@@ -34,6 +38,88 @@ pub enum InjectionError {
 
 pub fn inject_outputs(outputs: &[OutputEvent], marker: u64) -> Result<(), InjectionError> {
     platform::inject_outputs(outputs, marker)
+}
+
+/// Expand a native system action so the runtime can coordinate its modifier
+/// holds with outputs owned by other keyboard sources before injecting it.
+pub fn expand_system_shortcut(
+    shortcut: event_model::SystemShortcut,
+) -> Result<Vec<OutputEvent>, InjectionError> {
+    #[cfg(target_os = "macos")]
+    {
+        platform::shortcut_sequence(shortcut).map(|sequence| {
+            sequence
+                .into_iter()
+                .map(|(code, phase, modifiers)| OutputEvent::Key {
+                    code: PhysicalCode::key(code),
+                    phase,
+                    modifiers,
+                })
+                .collect()
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = shortcut;
+        Err(InjectionError::Unavailable)
+    }
+}
+
+/// Copy a keyboard event and change only its flags and loop marker. The copy
+/// retains Unicode, timestamps, repeat information, and native event type.
+///
+/// # Safety
+/// `source_raw` and `proxy` must be live values from the current callback.
+pub unsafe fn inject_keyboard_with_modifiers(
+    source_raw: RawEventRef,
+    modifiers: event_model::ModifierSet,
+    marker: u64,
+    proxy: RawEventRef,
+) -> Result<(), InjectionError> {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe { platform::inject_keyboard_with_modifiers(source_raw, modifiers, marker, proxy) }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (source_raw, modifiers, marker, proxy);
+        Err(InjectionError::Unavailable)
+    }
+}
+
+/// Change only keyboard flags on an event that will be passed onward by its
+/// current callback; its source marker, payload and native phase stay intact.
+///
+/// # Safety
+/// `input` must borrow the live keyboard event of the current callback.
+pub unsafe fn set_keyboard_modifiers(
+    input: EventTapEvent,
+    modifiers: event_model::ModifierSet,
+) -> Result<(), InjectionError> {
+    #[cfg(target_os = "macos")]
+    {
+        if !matches!(input.event_type(), 10..=12)
+            || input.raw_event().is_null()
+            || !matches!(
+                unsafe { platform::CGEventGetType(input.raw_event()) },
+                10..=12
+            )
+        {
+            return Err(InjectionError::InvalidEvent);
+        }
+        unsafe {
+            platform::CGEventSetFlags(
+                input.raw_event(),
+                platform::keyboard_flags_with_modifiers(input.raw_event(), modifiers),
+            )
+        };
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (input, modifiers);
+        Err(InjectionError::Unavailable)
+    }
 }
 
 /// Inject outputs from inside an event-tap callback.
@@ -188,6 +274,24 @@ pub enum KeyboardEventRoute {
     Unknown,
 }
 
+/// Only non-content facts needed by compatibility routing. Unicode summaries
+/// are not proof that an event represents a physical key or submitted text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyboardMetadata {
+    pub marker: u64,
+    pub process_id: i32,
+    pub source_state: i64,
+    pub keycode: u16,
+    pub phase: event_model::EventPhase,
+    pub modifiers: event_model::ModifierSet,
+    /// Original native flags, including aggregate-only modifier groups.
+    pub raw_flags: u64,
+    /// UTF-16 units observed by a bounded eight-unit read; this is only a
+    /// routing hint, not a character count for diagnostics or text extraction.
+    pub unicode_len: usize,
+    pub unicode_is_ascii_a: bool,
+}
+
 #[cfg(any(target_os = "macos", test))]
 fn classify_keyboard_source(marker: u64, own_marker: u64) -> KeyboardEventRoute {
     if is_own_marker(marker, own_marker) {
@@ -233,6 +337,21 @@ impl EventTapEvent {
 
     pub const fn is_tap_disabled(self) -> bool {
         self.event_type == TAP_DISABLED_BY_TIMEOUT || self.event_type == TAP_DISABLED_BY_USER_INPUT
+    }
+
+    /// Read keyboard metadata without changing or retaining the native event.
+    pub fn keyboard_metadata(self) -> Option<KeyboardMetadata> {
+        if !matches!(self.event_type, 10..=12) || self.raw_event.is_null() {
+            return None;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            platform::keyboard_metadata(self)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
     }
 
     /// Classify keyboard events without modifying or decoding their contents.
@@ -299,6 +418,29 @@ impl EventNormalizer {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (input, self.own_marker);
+            None
+        }
+    }
+
+    /// Normalize an identified software key stream using only this normalizer's
+    /// modifier history. Callers must use a separate instance for each source.
+    /// The text-channel hint is deliberately overridden only at this explicit
+    /// API boundary after the caller has established ordinary key semantics.
+    pub fn normalize_software(
+        &mut self,
+        input: EventTapEvent,
+    ) -> Option<event_model::NormalizedEvent> {
+        if input.is_tap_disabled() {
+            self.reset();
+            return None;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            platform::normalize_software_with_state(input, self.own_marker, &mut self.modifiers)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = input;
             None
         }
     }
@@ -586,11 +728,11 @@ pub mod platform {
             keycode: u16,
             keydown: bool,
         ) -> EventRef;
-        #[cfg(test)]
         fn CGEventSourceCreate(state: i32) -> *mut c_void;
+        fn CGEventSourceSetUserData(source: *mut c_void, user_data: i64);
+        fn CGEventSetSource(event: EventRef, source: *mut c_void);
         #[cfg(test)]
         fn CGEventKeyboardSetUnicodeString(event: EventRef, length: usize, text: *const u16);
-        #[cfg(test)]
         fn CGEventKeyboardGetUnicodeString(
             event: EventRef,
             capacity: usize,
@@ -791,6 +933,117 @@ pub mod platform {
 
     pub fn request_permissions() -> (bool, bool) {
         unsafe { (CGRequestListenEventAccess(), CGRequestPostEventAccess()) }
+    }
+
+    pub(super) fn keyboard_metadata(input: EventTapEvent) -> Option<super::KeyboardMetadata> {
+        if !matches!(input.event_type(), 10..=12) || input.raw_event().is_null() {
+            return None;
+        }
+        let raw = input.raw_event();
+        let mut unicode = [0_u16; 8];
+        let mut unicode_len = 0;
+        if input.event_type() != 12 {
+            unsafe {
+                CGEventKeyboardGetUnicodeString(
+                    raw,
+                    unicode.len(),
+                    &mut unicode_len,
+                    unicode.as_mut_ptr(),
+                );
+            }
+        }
+        let raw_flags = unsafe { CGEventGetFlags(raw) };
+        Some(super::KeyboardMetadata {
+            marker: unsafe {
+                CGEventGetIntegerValueField(raw, EVENT_SOURCE_USER_DATA_FIELD) as u64
+            },
+            process_id: i32::try_from(unsafe {
+                CGEventGetIntegerValueField(raw, EVENT_SOURCE_UNIX_PROCESS_ID_FIELD)
+            })
+            .unwrap_or(0),
+            source_state: unsafe { CGEventGetIntegerValueField(raw, EVENT_SOURCE_STATE_ID_FIELD) },
+            keycode: unsafe { CGEventGetIntegerValueField(raw, 9) as u16 },
+            phase: match input.event_type() {
+                10 if unsafe { CGEventGetIntegerValueField(raw, 8) } != 0 => EventPhase::Repeat,
+                10 => EventPhase::Down,
+                11 => EventPhase::Up,
+                _ => EventPhase::Changed,
+            },
+            modifiers: modifiers_from_flags(raw_flags),
+            raw_flags,
+            unicode_len,
+            unicode_is_ascii_a: unicode_len == 1 && matches!(unicode[0], 65 | 97),
+        })
+    }
+
+    pub(super) fn normalize_software_with_state(
+        input: EventTapEvent,
+        own_marker: u64,
+        state: &mut event_model::ModifierSet,
+    ) -> Option<event_model::NormalizedEvent> {
+        use event_model::{EventKind, EventOrigin};
+        if !matches!(input.event_type(), 10..=12) {
+            return None;
+        }
+        let mut event = normalize_event(input)?;
+        let marker = unsafe {
+            CGEventGetIntegerValueField(input.raw_event(), EVENT_SOURCE_USER_DATA_FIELD) as u64
+        };
+        event.origin = EventOrigin::Injected { marker };
+        if super::is_own_marker(marker, own_marker) {
+            return Some(event);
+        }
+        let flags = unsafe { CGEventGetFlags(input.raw_event()) };
+        let key = match event.code {
+            PhysicalCode::Key(key) => key,
+            _ => return None,
+        };
+        if let Some(&(aggregate, side, _, modifier)) =
+            MODIFIER_KEYS.iter().find(|entry| entry.2 == key)
+        {
+            let down = if event.kind != EventKind::FlagsChanged {
+                event.phase != EventPhase::Up
+            } else if flags & aggregate == 0 {
+                false
+            } else {
+                let group_has_sides = MODIFIER_KEYS
+                    .iter()
+                    .filter(|entry| entry.0 == aggregate)
+                    .any(|entry| flags & entry.1 != 0);
+                if group_has_sides {
+                    flags & side != 0
+                } else {
+                    // Aggregate-only modifier events identify their own key.
+                    // Toggle only that source's side, never query local keys.
+                    !state.contains(modifier)
+                }
+            };
+            if down {
+                state.insert(modifier);
+            } else {
+                state.remove(modifier);
+            }
+            if event.kind == EventKind::FlagsChanged {
+                event.phase = if down {
+                    EventPhase::Down
+                } else {
+                    EventPhase::Up
+                };
+            }
+        } else {
+            // A raw event may contain a modifier held by another source. Do not
+            // synthesize an unseen Down from its combined flags. Conversely,
+            // absent flags allow a lost source modifier to stop affecting input.
+            for group in MODIFIER_KEYS.chunks_exact(2) {
+                if flags & group[0].0 == 0 {
+                    for &(_, _, _, modifier) in group {
+                        state.remove(modifier);
+                    }
+                }
+            }
+        }
+        event.modifiers = *state;
+        Some(event)
     }
 
     pub fn normalize_event(input: EventTapEvent) -> Option<event_model::NormalizedEvent> {
@@ -1065,8 +1318,9 @@ pub mod platform {
     /// # Safety
     /// `event` must be a live CGEventRef owned by the caller.
     pub unsafe fn inject_marked(event: RawEventRef, marker: u64) {
-        CGEventSetIntegerValueField(event, EVENT_SOURCE_USER_DATA_FIELD, marker as i64);
-        CGEventPost(1, event);
+        if set_event_marker(event, marker).is_ok() {
+            unsafe { CGEventPost(1, event) };
+        }
     }
 
     /// Reads the user-data marker from a live CoreGraphics event.
@@ -1079,6 +1333,36 @@ pub mod platform {
 
     pub fn inject_outputs(outputs: &[OutputEvent], marker: u64) -> Result<(), InjectionError> {
         unsafe { inject_outputs_with_context(outputs, marker, ptr::null_mut(), ptr::null_mut()) }
+    }
+
+    fn copy_keyboard_with_modifiers(
+        source: RawEventRef,
+        modifiers: event_model::ModifierSet,
+        marker: u64,
+    ) -> Result<OwnedEvent, InjectionError> {
+        if source.is_null() || !matches!(unsafe { CGEventGetType(source) }, 10..=12) {
+            return Err(InjectionError::InvalidEvent);
+        }
+        let copy = OwnedEvent::new(unsafe { CGEventCreateCopy(source) })?;
+        unsafe {
+            CGEventSetFlags(copy.0, keyboard_flags_with_modifiers(source, modifiers));
+        }
+        copy.mark_checked(marker)?;
+        Ok(copy)
+    }
+
+    pub(super) unsafe fn inject_keyboard_with_modifiers(
+        source: RawEventRef,
+        modifiers: event_model::ModifierSet,
+        marker: u64,
+        proxy: RawEventRef,
+    ) -> Result<(), InjectionError> {
+        if !preflight_permissions().1 {
+            return Err(InjectionError::PermissionDenied);
+        }
+        let copy = copy_keyboard_with_modifiers(source, modifiers, marker)?;
+        unsafe { post_event(copy.0, proxy) };
+        Ok(())
     }
 
     /// # Safety
@@ -1115,6 +1399,23 @@ pub mod platform {
     }
 
     struct OwnedEvent(EventRef);
+
+    fn set_event_marker(event: EventRef, marker: u64) -> Result<(), InjectionError> {
+        if event.is_null() {
+            return Err(InjectionError::InvalidEvent);
+        }
+        // Setting only field 42 is insufficient for a CGEventCreateCopy:
+        // CoreGraphics can retain the cached source's original user data.
+        // Attach a private source carrying our marker without altering the
+        // incoming event or its Unicode/timestamp/phase metadata.
+        let source = OwnedEvent::new(unsafe { CGEventSourceCreate(-1) })?;
+        unsafe {
+            CGEventSourceSetUserData(source.0, marker as i64);
+            CGEventSetSource(event, source.0);
+        }
+        Ok(())
+    }
+
     impl OwnedEvent {
         fn new(raw: EventRef) -> Result<Self, InjectionError> {
             if raw.is_null() {
@@ -1123,10 +1424,15 @@ pub mod platform {
                 Ok(Self(raw))
             }
         }
+        #[cfg(test)]
         fn mark(&self, marker: u64) {
             unsafe {
                 CGEventSetIntegerValueField(self.0, EVENT_SOURCE_USER_DATA_FIELD, marker as i64);
             }
+        }
+
+        fn mark_checked(&self, marker: u64) -> Result<(), InjectionError> {
+            set_event_marker(self.0, marker)
         }
     }
     impl Drop for OwnedEvent {
@@ -1181,7 +1487,7 @@ pub mod platform {
                             CGEventSetIntegerValueField(event.0, pixel, value.round() as i64);
                         }
                     }
-                    event.mark(marker);
+                    event.mark_checked(marker)?;
                     batch.push(event);
                 }
                 OutputEvent::ScrollTransform { invert_x, invert_y } => {
@@ -1212,7 +1518,7 @@ pub mod platform {
                             }
                         }
                     }
-                    event.mark(marker);
+                    event.mark_checked(marker)?;
                     batch.push(event);
                 }
                 OutputEvent::SystemShortcut(shortcut) => {
@@ -1247,7 +1553,7 @@ pub mod platform {
                 CGEventSetIntegerValueField(event.0, 8, 1);
             }
         }
-        event.mark(marker);
+        event.mark_checked(marker)?;
         Ok(event)
     }
 
@@ -1300,11 +1606,11 @@ pub mod platform {
         unsafe {
             CGEventSetIntegerValueField(event.0, 3, i64::from(number));
         }
-        event.mark(marker);
+        event.mark_checked(marker)?;
         Ok(event)
     }
 
-    fn shortcut_sequence(
+    pub(super) fn shortcut_sequence(
         shortcut: event_model::SystemShortcut,
     ) -> Result<Vec<(u16, EventPhase, event_model::ModifierSet)>, InjectionError> {
         use event_model::{ModifierSet as M, SystemShortcut as S};
@@ -1360,7 +1666,7 @@ pub mod platform {
         }
     }
 
-    fn flags_for_modifiers(modifiers: event_model::ModifierSet) -> u64 {
+    pub(super) fn flags_for_modifiers(modifiers: event_model::ModifierSet) -> u64 {
         use event_model::ModifierSet as M;
         let mut flags = 0;
         for (semantic, aggregate, side) in [
@@ -1378,6 +1684,18 @@ pub mod platform {
             }
         }
         flags
+    }
+
+    pub(super) fn keyboard_flags_with_modifiers(
+        source: EventRef,
+        modifiers: event_model::ModifierSet,
+    ) -> u64 {
+        let mapped_mask = MODIFIER_KEYS
+            .iter()
+            .fold(0, |mask, (aggregate, side, _, _)| mask | aggregate | side);
+        // Caps Lock, Fn, numeric-pad and other unmodelled native flags are not
+        // part of a Ctrl/Alt/Command transformation and must survive it.
+        (unsafe { CGEventGetFlags(source) } & !mapped_mask) | flags_for_modifiers(modifiers)
     }
 
     #[cfg(test)]
@@ -1405,6 +1723,269 @@ pub mod platform {
                 CGEventSetIntegerValueField(raw.0, EVENT_SOURCE_STATE_ID_FIELD, 1);
             }
             raw
+        }
+
+        #[test]
+        fn keyboard_metadata_is_a_non_content_summary_and_does_not_mutate_source() {
+            for (text, expected_a) in [("a", true), ("A", true), ("中", false), ("ab", false)] {
+                let source = OwnedEvent::new(unsafe { CGEventSourceCreate(0) }).unwrap();
+                let raw = OwnedEvent::new(unsafe { CGEventCreateKeyboardEvent(source.0, 0, true) })
+                    .unwrap();
+                let unicode: Vec<_> = text.encode_utf16().collect();
+                unsafe {
+                    CGEventSetFlags(raw.0, 0x0004_0001);
+                    CGEventKeyboardSetUnicodeString(raw.0, unicode.len(), unicode.as_ptr());
+                }
+                raw.mark(100);
+                let metadata = EventTapEvent::new(10, raw.0).keyboard_metadata().unwrap();
+                assert_eq!(metadata.marker, 100);
+                assert_eq!(metadata.process_id, std::process::id() as i32);
+                assert_eq!(metadata.source_state, 0);
+                assert_eq!(metadata.keycode, 0);
+                assert_eq!(metadata.phase, EventPhase::Down);
+                assert_eq!(metadata.modifiers, M::LEFT_CONTROL);
+                assert_eq!(metadata.unicode_len, unicode.len());
+                assert_eq!(metadata.unicode_is_ascii_a, expected_a);
+                let mut copied = [0_u16; 16];
+                let mut length = 0;
+                unsafe {
+                    CGEventKeyboardGetUnicodeString(
+                        raw.0,
+                        copied.len(),
+                        &mut length,
+                        copied.as_mut_ptr(),
+                    )
+                };
+                assert_eq!(&copied[..length], unicode.as_slice());
+                assert_eq!(unsafe { CGEventGetFlags(raw.0) }, 0x0004_0001);
+            }
+        }
+
+        #[test]
+        fn software_normalizer_tracks_its_source_without_importing_local_modifiers() {
+            let mut normalizer = super::super::EventNormalizer::new(99);
+            let control = software_keyboard_raw(59, 0x0004_0001 | 0x0008_0020);
+            unsafe { CGEventSetIntegerValueField(control.0, EVENT_SOURCE_USER_DATA_FIELD, 100) };
+            let down = normalizer
+                .normalize_software(EventTapEvent::new(12, control.0))
+                .unwrap();
+            assert_eq!(down.phase, EventPhase::Down);
+            assert_eq!(down.modifiers, M::LEFT_CONTROL);
+            assert_eq!(
+                down.origin,
+                event_model::EventOrigin::Injected { marker: 100 }
+            );
+            let copy = software_keyboard_raw(8, 0x0004_0001 | 0x0008_0020);
+            unsafe { CGEventSetIntegerValueField(copy.0, EVENT_SOURCE_USER_DATA_FIELD, 100) };
+            assert_eq!(
+                normalizer
+                    .normalize_software(EventTapEvent::new(10, copy.0))
+                    .unwrap()
+                    .modifiers,
+                M::LEFT_CONTROL
+            );
+            let release = keyboard_raw(59, 0x0008_0020);
+            let up = normalizer
+                .normalize_software(EventTapEvent::new(12, release.0))
+                .unwrap();
+            assert_eq!(up.phase, EventPhase::Up);
+            assert_eq!(up.modifiers, M::NONE);
+            let mut other_source = super::super::EventNormalizer::new(99);
+            assert_eq!(
+                other_source
+                    .normalize_software(EventTapEvent::new(10, copy.0))
+                    .unwrap()
+                    .modifiers,
+                M::NONE
+            );
+        }
+
+        #[test]
+        fn aggregate_only_software_modifier_sides_use_the_source_history() {
+            let mut normalizer = super::super::EventNormalizer::new(99);
+            for (code, flags, phase, modifiers) in [
+                (56, 0x0002_0000, EventPhase::Down, M::LEFT_SHIFT),
+                (
+                    60,
+                    0x0002_0000,
+                    EventPhase::Down,
+                    M::LEFT_SHIFT | M::RIGHT_SHIFT,
+                ),
+                (56, 0x0002_0000, EventPhase::Up, M::RIGHT_SHIFT),
+                (60, 0, EventPhase::Up, M::NONE),
+            ] {
+                let raw = keyboard_raw(code, flags);
+                let event = normalizer
+                    .normalize_software(EventTapEvent::new(12, raw.0))
+                    .unwrap();
+                assert_eq!(event.phase, phase);
+                assert_eq!(event.modifiers, modifiers);
+            }
+        }
+
+        #[test]
+        fn own_replays_and_tap_reset_cannot_seed_software_modifier_state() {
+            let mut normalizer = super::super::EventNormalizer::new(99);
+            let own = software_keyboard_raw(59, 0x0004_0001);
+            own.mark(99);
+            normalizer
+                .normalize_software(EventTapEvent::new(12, own.0))
+                .unwrap();
+            let copy = software_keyboard_raw(8, 0x0004_0001);
+            assert_eq!(
+                normalizer
+                    .normalize_software(EventTapEvent::new(10, copy.0))
+                    .unwrap()
+                    .modifiers,
+                M::NONE
+            );
+            let control = software_keyboard_raw(59, 0x0004_0001);
+            normalizer
+                .normalize_software(EventTapEvent::new(12, control.0))
+                .unwrap();
+            assert!(normalizer
+                .normalize_software(EventTapEvent::new(TAP_DISABLED_BY_TIMEOUT, ptr::null_mut()))
+                .is_none());
+            assert_eq!(
+                normalizer
+                    .normalize_software(EventTapEvent::new(10, copy.0))
+                    .unwrap()
+                    .modifiers,
+                M::NONE
+            );
+        }
+
+        #[test]
+        fn keyboard_flag_transform_preserves_unicode_repeat_and_source_event() {
+            let raw = keyboard_raw(0, 0x0004_0001);
+            let unicode: Vec<_> = "Hello中文".encode_utf16().collect();
+            unsafe {
+                CGEventSetIntegerValueField(raw.0, 8, 1);
+                CGEventKeyboardSetUnicodeString(raw.0, unicode.len(), unicode.as_ptr());
+            }
+            let copy = copy_keyboard_with_modifiers(raw.0, M::LEFT_COMMAND, 99).unwrap();
+            let mut actual = [0_u16; 16];
+            let mut length = 0;
+            unsafe {
+                CGEventKeyboardGetUnicodeString(
+                    copy.0,
+                    actual.len(),
+                    &mut length,
+                    actual.as_mut_ptr(),
+                )
+            };
+            assert_eq!(&actual[..length], unicode.as_slice());
+            assert_eq!(unsafe { CGEventGetIntegerValueField(copy.0, 8) }, 1);
+            assert_eq!(
+                unsafe { CGEventGetIntegerValueField(copy.0, EVENT_SOURCE_USER_DATA_FIELD) },
+                99
+            );
+            assert_eq!(
+                unsafe { CGEventGetFlags(copy.0) },
+                flags_for_modifiers(M::LEFT_COMMAND)
+            );
+            assert_eq!(unsafe { CGEventGetFlags(raw.0) }, 0x0004_0001);
+            assert_eq!(unsafe { CGEventGetTimestamp(copy.0) }, unsafe {
+                CGEventGetTimestamp(raw.0)
+            });
+        }
+
+        #[test]
+        fn copied_keyboard_replaces_a_materialized_foreign_source_marker() {
+            let raw = software_keyboard_raw(8, 0x0004_0001);
+            raw.mark(100);
+            assert_eq!(
+                unsafe { CGEventGetIntegerValueField(raw.0, EVENT_SOURCE_USER_DATA_FIELD) },
+                100
+            );
+            let copy = copy_keyboard_with_modifiers(raw.0, M::LEFT_COMMAND, 99).unwrap();
+            assert_eq!(
+                unsafe { CGEventGetIntegerValueField(copy.0, EVENT_SOURCE_USER_DATA_FIELD) },
+                99
+            );
+            assert_eq!(
+                unsafe { CGEventGetIntegerValueField(raw.0, EVENT_SOURCE_USER_DATA_FIELD) },
+                100
+            );
+        }
+
+        #[test]
+        fn in_place_keyboard_flags_keep_marker_unicode_and_native_phase() {
+            let raw = software_keyboard_raw(0, 0x0004_0001);
+            let units: Vec<_> = "中文".encode_utf16().collect();
+            unsafe { CGEventKeyboardSetUnicodeString(raw.0, units.len(), units.as_ptr()) };
+            raw.mark(100);
+            let before = unsafe { (CGEventGetType(raw.0), CGEventGetTimestamp(raw.0)) };
+            unsafe {
+                super::super::set_keyboard_modifiers(EventTapEvent::new(11, raw.0), M::LEFT_COMMAND)
+            }
+            .unwrap();
+            assert_eq!(
+                unsafe { (CGEventGetType(raw.0), CGEventGetTimestamp(raw.0)) },
+                before
+            );
+            assert_eq!(
+                unsafe { CGEventGetIntegerValueField(raw.0, EVENT_SOURCE_USER_DATA_FIELD) },
+                100
+            );
+            assert_eq!(unicode_units(raw.0), units);
+            assert_eq!(
+                unsafe { CGEventGetFlags(raw.0) },
+                flags_for_modifiers(M::LEFT_COMMAND)
+            );
+            assert_eq!(
+                unsafe {
+                    super::super::set_keyboard_modifiers(EventTapEvent::new(22, raw.0), M::NONE)
+                },
+                Err(InjectionError::InvalidEvent)
+            );
+        }
+
+        #[test]
+        fn keyboard_modifier_transforms_keep_caps_fn_and_numeric_flags() {
+            let extra = 0x0001_0000 | 0x0080_0000 | 0x0020_0000;
+            let raw = software_keyboard_raw(8, flags_for_modifiers(M::LEFT_CONTROL) | extra);
+            let copy = copy_keyboard_with_modifiers(raw.0, M::LEFT_COMMAND, 99).unwrap();
+            assert_eq!(
+                unsafe { CGEventGetFlags(copy.0) },
+                flags_for_modifiers(M::LEFT_COMMAND) | extra
+            );
+            unsafe {
+                super::super::set_keyboard_modifiers(EventTapEvent::new(11, raw.0), M::LEFT_SHIFT)
+            }
+            .unwrap();
+            assert_eq!(
+                unsafe { CGEventGetFlags(raw.0) },
+                flags_for_modifiers(M::LEFT_SHIFT) | extra
+            );
+        }
+
+        #[test]
+        fn expanded_system_shortcut_exposes_all_modifier_transitions() {
+            use event_model::SystemShortcut;
+            let output =
+                super::super::expand_system_shortcut(SystemShortcut::SwitchApplication).unwrap();
+            assert_eq!(output.len(), 4);
+            assert!(matches!(
+                output[0],
+                OutputEvent::Key {
+                    code: PhysicalCode::Key(55),
+                    phase: EventPhase::Down,
+                    ..
+                }
+            ));
+            assert!(matches!(
+                output[3],
+                OutputEvent::Key {
+                    code: PhysicalCode::Key(55),
+                    phase: EventPhase::Up,
+                    ..
+                }
+            ));
+            assert_eq!(
+                super::super::expand_system_shortcut(SystemShortcut::ShowClipboard),
+                Err(InjectionError::InvalidEvent)
+            );
         }
 
         #[test]

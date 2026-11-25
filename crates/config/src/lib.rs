@@ -120,6 +120,8 @@ pub struct AppConfig {
     pub active_profile: String,
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default = "default_software_input_passthrough")]
+    pub software_input_passthrough: bool,
     #[serde(default = "default_panic_hotkey")]
     pub panic_hotkey: Vec<String>,
     #[serde(default)]
@@ -152,6 +154,10 @@ fn default_schema_version() -> u32 {
 }
 fn default_active_profile() -> String {
     "windows_physical".to_owned()
+}
+
+fn default_software_input_passthrough() -> bool {
+    true
 }
 
 fn default_panic_hotkey() -> Vec<String> {
@@ -684,6 +690,7 @@ pub fn default_config() -> AppConfig {
         schema_version: CURRENT_SCHEMA_VERSION,
         active_profile: "windows_physical".into(),
         enabled: false,
+        software_input_passthrough: true,
         panic_hotkey: default_panic_hotkey(),
         mouse: MouseConfig::default(),
         system_shortcuts: SystemShortcutsConfig::default(),
@@ -840,6 +847,33 @@ mod tests {
         let config = default_config();
         let text = export_toml(&config).unwrap();
         let decoded = import_toml(&text).unwrap();
+        assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn software_passthrough_defaults_on_for_existing_configs() {
+        let config = default_config();
+        assert!(config.software_input_passthrough);
+        let text = export_toml(&config)
+            .unwrap()
+            .replace("software_input_passthrough = true\n", "");
+        let decoded = import_toml(&text).unwrap();
+        assert!(decoded.software_input_passthrough);
+        assert!(!decoded.enabled);
+        let legacy =
+            import_toml("enabled = false\nactive_profile = \"custom\"\n[profiles.custom]\n")
+                .unwrap();
+        assert!(legacy.software_input_passthrough);
+    }
+
+    #[test]
+    fn disabled_software_passthrough_survives_export_and_profile_change() {
+        let mut config = default_config();
+        config.software_input_passthrough = false;
+        config.active_profile = "custom".into();
+        let decoded = import_toml(&export_toml(&config).unwrap()).unwrap();
+        assert!(!decoded.software_input_passthrough);
+        assert_eq!(decoded.active_profile, "custom");
         assert_eq!(decoded, config);
     }
 

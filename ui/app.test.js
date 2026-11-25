@@ -8,7 +8,7 @@ const deferred = () => { let resolve, reject; const promise = new Promise((yes, 
 function snapshot(revision = 0, changes = {}) {
   return {
     config_revision: revision, active_profile: "custom", profiles: ["custom", "windows_physical", "Imported"],
-    show_desktop_shortcut: "key:103", config_error: null,
+    show_desktop_shortcut: "key:103", software_input_passthrough: true, config_error: null,
     rules: [{ id: "rule-id", name: "Imported rule", category: "keyboard_rules", trigger: "key:11", action: "key:12", enabled: true, priority: 100, app_bundle_id: null, editable: true }],
     runtime: { status: "Disabled", permission: "Granted", listen_access: true, post_access: true, tap_state: "Running", events_seen: 1, injection_failures: 0, input_source: "ABC", clipboard_status: "正常", last_error: null, pending_releases: 0 },
     ...changes,
@@ -78,6 +78,81 @@ async function appUi({ initial = snapshot(), invoke, connected = true } = {}) {
 }
 
 const toggleFor = (ui, index = 0) => ui.get("rules").children[index].children[2];
+
+test("software passthrough renders the confirmed policy and defaults on for an older snapshot", async () => {
+  const old = snapshot(); delete old.software_input_passthrough;
+  const legacyUi = await appUi({ initial: old });
+  assert.equal(legacyUi.get("software-input-passthrough").attributes["aria-checked"], "true");
+  assert.equal(legacyUi.get("software-input-passthrough").disabled, false);
+  const disabledUi = await appUi({ initial: snapshot(1, { software_input_passthrough: false }) });
+  assert.equal(disabledUi.get("software-input-passthrough").attributes["aria-checked"], "false");
+  assert.match(disabledUi.get("software-input-passthrough-state").textContent, /已关闭.*文字仍受保护/);
+});
+
+test("software passthrough waits for saving and does not enable Windows mode", async () => {
+  const saved = deferred();
+  const ui = await appUi({ invoke(command, args) {
+    if (command === "settings_snapshot") return snapshot(4);
+    assert.equal(command, "set_software_input_passthrough");
+    assert.deepEqual(JSON.parse(JSON.stringify(args)), { enabled: false, expectedRevision: 4 });
+    return saved.promise;
+  } });
+  await ui.get("software-input-passthrough").click();
+  await settle();
+  assert.equal(ui.get("software-input-passthrough").disabled, true);
+  assert.equal(ui.get("software-input-passthrough").attributes["aria-checked"], "true");
+  await ui.get("software-input-passthrough").click();
+  assert.equal(ui.calls.filter(({ command }) => command === "set_software_input_passthrough").length, 1);
+  saved.resolve(snapshot(5, { software_input_passthrough: false }));
+  await ui.idle();
+  assert.equal(ui.get("software-input-passthrough").disabled, false);
+  assert.equal(ui.get("software-input-passthrough").attributes["aria-checked"], "false");
+  assert.equal(ui.current().runtime.status, "Disabled");
+  assert.equal(ui.calls.some(({ command }) => command === "toggle_mode"), false);
+});
+
+test("failed passthrough writes restore the confirmed policy and expose the error", async () => {
+  const ui = await appUi({ invoke(command) {
+    if (command === "settings_snapshot") return snapshot(3);
+    throw new Error("保存配置失败：disk full");
+  } });
+  await ui.get("software-input-passthrough").click();
+  await ui.idle();
+  assert.equal(ui.current().software_input_passthrough, true);
+  assert.equal(ui.get("software-input-passthrough").attributes["aria-checked"], "true");
+  assert.equal(ui.get("software-input-passthrough").disabled, false);
+  assert.match(ui.get("settings-feedback").textContent, /disk full/);
+});
+
+test("an older delayed snapshot cannot undo a saved passthrough choice", async () => {
+  const delayed = deferred(); let reads = 0;
+  const ui = await appUi({ invoke(command, args) {
+    if (command === "settings_snapshot") return ++reads === 1 ? snapshot(4) : delayed.promise;
+    assert.equal(command, "set_software_input_passthrough");
+    assert.equal(args.expectedRevision, 4);
+    return snapshot(5, { software_input_passthrough: false });
+  } });
+  const focus = ui.event("focus");
+  await settle();
+  await ui.get("software-input-passthrough").click();
+  await ui.idle();
+  delayed.resolve(snapshot(4));
+  await focus;
+  assert.equal(ui.current().software_input_passthrough, false);
+  assert.equal(ui.get("software-input-passthrough").attributes["aria-checked"], "false");
+});
+
+test("the passthrough switch stays unavailable until configuration has loaded", async () => {
+  const initial = deferred();
+  const ui = await appUi({ invoke: () => initial.promise });
+  assert.equal(ui.get("software-input-passthrough").disabled, true);
+  assert.match(ui.get("software-input-passthrough-state").textContent, /正在读取/);
+  await ui.get("software-input-passthrough").click();
+  assert.equal(ui.calls.length, 1);
+  initial.resolve(snapshot());
+  await settle();
+  assert.equal(ui.get("software-input-passthrough").disabled, false);
+});
 
 test("the actual settings snapshot supplies profiles, rules and safe text", async () => {
   const malicious = '<img src=x onerror="bad()">';

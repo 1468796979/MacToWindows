@@ -6,6 +6,7 @@ use macos_adapter::{
 };
 use rule_engine::{CompiledRules, RuleEngine};
 use serde::Serialize;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -14,7 +15,15 @@ use std::thread::JoinHandle;
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 mod clipboard;
+mod output_ownership;
 mod settings;
+mod software_keyboard;
+#[cfg(test)]
+mod software_keyboard_tests;
+#[cfg(all(test, target_os = "macos"))]
+mod software_native_tests;
+use output_ownership::{InputStream, OutputOwner, OutputOwnership};
+use software_keyboard::{SoftwareResult, SoftwareSession};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum RuntimeStatus {
@@ -125,6 +134,10 @@ impl ClipboardHotkeyLatch {
 
 pub struct RuntimeController {
     engine: RuleEngine,
+    active_rules: CompiledRules,
+    software: HashMap<macos_adapter::KeyboardSourceId, SoftwareSession>,
+    output_ownership: OutputOwnership,
+    output_transaction: u64,
     adapter: SafeAdapter,
     input_source: Option<InputSourceService>,
     clipboard: Option<Arc<clipboard::ClipboardManager>>,
@@ -239,11 +252,15 @@ impl EventRuntime {
                         });
                     let mut normalizer = macos_adapter::EventNormalizer::new(marker);
                     let mut clipboard_hotkey = ClipboardHotkeyLatch::default();
+                    let keyboard_sources = macos_adapter::KeyboardSourceCache::start();
+                    let mut keyboard_routes = macos_adapter::KeyboardRoutingState::default();
                     let tap = macos_adapter::EventTap::create(event_mask(), move |raw| {
                         if raw.is_tap_disabled() {
                             normalizer.reset();
                             clipboard_hotkey.reset();
+                            keyboard_routes.reset();
                             if let Ok(mut controller) = callback_runtime.lock() {
+                                controller.reset_keyboard_continuity();
                                 if controller.status == RuntimeStatus::Running {
                                     controller.degrade_with(
                                         "Event Tap 已被系统禁用，请重新启用映射".into(),
@@ -253,12 +270,22 @@ impl EventRuntime {
                             }
                             return macos_adapter::EventTapAction::Pass;
                         }
-                        if let Some(action) = route_keyboard_input(
+                        if let Some(action) = route_keyboard_source(
                             raw,
                             marker,
+                            &keyboard_sources,
+                            &mut keyboard_routes,
                             &callback_runtime,
                             &diagnostics,
                             &external_keyboard_pending,
+                            |outputs, own| unsafe {
+                                macos_adapter::inject_outputs_with_context(
+                                    outputs,
+                                    own,
+                                    raw.proxy(),
+                                    raw.raw_event(),
+                                )
+                            },
                         ) {
                             return action;
                         }
@@ -276,14 +303,32 @@ impl EventRuntime {
                         let decision = callback_runtime
                             .lock()
                             .map(|mut controller| {
-                                controller.process_event_marked(&event, |outputs, marker| unsafe {
-                                    macos_adapter::inject_outputs_with_context(
-                                        outputs,
-                                        marker,
-                                        raw.proxy(),
-                                        raw.raw_event(),
-                                    )
-                                })
+                                let decision = controller.process_event_marked(
+                                    &event,
+                                    |outputs, marker| unsafe {
+                                        macos_adapter::inject_outputs_with_context(
+                                            outputs,
+                                            marker,
+                                            raw.proxy(),
+                                            raw.raw_event(),
+                                        )
+                                    },
+                                );
+                                if decision == Decision::Pass {
+                                    if let Some(metadata) = raw.keyboard_metadata() {
+                                        let flags =
+                                            controller.output_ownership.modifiers_with_preserved(
+                                                InputStream::Local,
+                                                metadata.modifiers,
+                                            );
+                                        if flags != metadata.modifiers {
+                                            let _ = unsafe {
+                                                macos_adapter::set_keyboard_modifiers(raw, flags)
+                                            };
+                                        }
+                                    }
+                                }
+                                decision
                             })
                             .unwrap_or(Decision::Pass);
                         if decision == Decision::Suppress {
@@ -370,6 +415,130 @@ impl EventRuntime {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn route_keyboard_source<F>(
+    raw: macos_adapter::EventTapEvent,
+    marker: u64,
+    sources: &macos_adapter::KeyboardSourceCache,
+    routes: &mut macos_adapter::KeyboardRoutingState,
+    runtime: &Mutex<RuntimeController>,
+    diagnostics: &Diagnostics,
+    pending: &AtomicBool,
+    inject: F,
+) -> Option<macos_adapter::EventTapAction>
+where
+    F: FnMut(&[OutputEvent], u64) -> Result<(), InjectionError>,
+{
+    if !matches!(raw.event_type(), 10..=12) {
+        return None;
+    }
+    let Some(metadata) = raw.keyboard_metadata() else {
+        return route_keyboard_input(raw, marker, runtime, diagnostics, pending);
+    };
+    route_keyboard_classified(
+        raw,
+        metadata,
+        sources.classify(&metadata, marker),
+        marker,
+        routes,
+        runtime,
+        diagnostics,
+        pending,
+        inject,
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn route_keyboard_classified<F>(
+    raw: macos_adapter::EventTapEvent,
+    metadata: macos_adapter::KeyboardMetadata,
+    source: macos_adapter::KeyboardSource,
+    marker: u64,
+    routes: &mut macos_adapter::KeyboardRoutingState,
+    runtime: &Mutex<RuntimeController>,
+    diagnostics: &Diagnostics,
+    pending: &AtomicBool,
+    mut inject: F,
+) -> Option<macos_adapter::EventTapAction>
+where
+    F: FnMut(&[OutputEvent], u64) -> Result<(), InjectionError>,
+{
+    use macos_adapter::{EventTapAction, KeyboardSourceKind};
+    if source.kind == KeyboardSourceKind::OwnInjected {
+        return route_keyboard_input(raw, marker, runtime, diagnostics, pending);
+    }
+    let effective = routes.current_source(&metadata, source);
+    if matches!(
+        effective.kind,
+        KeyboardSourceKind::Software | KeyboardSourceKind::Unknown
+    ) && software_keyboard::protects_text(&metadata)
+    {
+        pass_external_keyboard(runtime, diagnostics, pending);
+        if let Ok(mut controller) = runtime.try_lock() {
+            controller.observe_text_source(source.id, &mut inject);
+        }
+        return Some(EventTapAction::Pass);
+    }
+    let observed_identity = source.id;
+    let source = routes.route(&metadata, source);
+    match source.kind {
+        KeyboardSourceKind::HardwareLike | KeyboardSourceKind::OwnInjected => {
+            route_keyboard_input(raw, marker, runtime, diagnostics, pending)
+        }
+        // Deskflow can change injection paths between the Down and Up of
+        // one key. Both paths must share the legacy HID/local key ledger.
+        KeyboardSourceKind::Deskflow | KeyboardSourceKind::Unknown => None,
+        KeyboardSourceKind::Software => {
+            let result = runtime
+                .lock()
+                .map(|mut controller| {
+                    let mut identity = source.id;
+                    if identity.process_start == 0 {
+                        identity.process_start = observed_identity.process_start;
+                    }
+                    let mut result =
+                        controller.process_software_raw(identity, raw, false, &mut inject);
+                    if result.decision == Decision::Pass {
+                        let base = result.original_modifiers.unwrap_or(metadata.modifiers);
+                        let flags = base | controller.software_preserved_modifiers(identity);
+                        if flags != metadata.modifiers {
+                            result.original_modifiers = Some(flags);
+                        }
+                    }
+                    result
+                })
+                .unwrap_or(SoftwareResult {
+                    decision: Decision::Pass,
+                    original_modifiers: None,
+                });
+            if let Some(modifiers) = result.original_modifiers {
+                // The original event keeps its keycode, phase and text payload.
+                let _ = unsafe { macos_adapter::set_keyboard_modifiers(raw, modifiers) };
+            }
+            Some(if result.decision == Decision::Suppress {
+                EventTapAction::Suppress
+            } else {
+                EventTapAction::Pass
+            })
+        }
+    }
+}
+
+fn pass_external_keyboard(
+    runtime: &Mutex<RuntimeController>,
+    diagnostics: &Diagnostics,
+    pending: &AtomicBool,
+) {
+    diagnostics.record_seen();
+    diagnostics.record_passed();
+    diagnostics.record_external_keyboard_passed();
+    pending.store(true, Ordering::Release);
+    if let Ok(mut controller) = runtime.try_lock() {
+        // An entry with an injector must also finish pending switch sessions.
+        controller.interrupt_keyboard_gestures();
+    }
+}
+
 /// Keep known text-injection channels out of every physical-key state machine.
 /// Ordinary keycode streams (including Deskflow) keep their existing mappings.
 /// Returning Pass preserves the original CGEvent and its Unicode payload.
@@ -390,13 +559,7 @@ fn route_keyboard_input(
             Some(EventTapAction::Pass)
         }
         KeyboardEventRoute::TextInjection | KeyboardEventRoute::Unknown => {
-            diagnostics.record_seen();
-            diagnostics.record_passed();
-            diagnostics.record_external_keyboard_passed();
-            external_keyboard_pending.store(true, Ordering::Release);
-            if let Ok(mut controller) = runtime.try_lock() {
-                controller.consume_external_keyboard_activity();
-            }
+            pass_external_keyboard(runtime, diagnostics, external_keyboard_pending);
             // Neither a busy nor a poisoned runtime may delay remote text.
             Some(EventTapAction::Pass)
         }
@@ -437,7 +600,11 @@ impl RuntimeController {
         #[cfg(not(test))]
         let input_source = InputSourceService::start().ok();
         Self {
-            engine: RuleEngine::new(rules),
+            engine: RuleEngine::new(rules.clone()),
+            active_rules: rules,
+            software: HashMap::new(),
+            output_ownership: OutputOwnership::default(),
+            output_transaction: 0,
             adapter,
             input_source,
             clipboard: None,
@@ -491,15 +658,36 @@ impl RuntimeController {
     }
 
     fn install_config(&mut self, config: AppConfig, rules: CompiledRules) {
-        self.engine.replace_rules(rules);
+        self.replace_active_rules(rules);
         self.profile = config.active_profile.clone();
         self.config = Some(config);
         self.config_revision += 1;
     }
 
     fn transition(&mut self, status: RuntimeStatus) -> Vec<OutputEvent> {
+        if matches!(
+            status,
+            RuntimeStatus::PermissionRequired | RuntimeStatus::Stopped
+        ) {
+            self.reset_keyboard_continuity();
+        }
         let mut releases = std::mem::take(&mut self.pending_releases);
-        for output in self.engine.release_all() {
+        let local = self.engine.release_all();
+        let mut all = self
+            .output_ownership
+            .filter(OutputOwner::Mapped(InputStream::Local), &local);
+        for (id, session) in &mut self.software {
+            let stream = InputStream::Software(*id);
+            all.extend(
+                self.output_ownership
+                    .filter(OutputOwner::Mapped(stream), &session.engine.release_all()),
+            );
+            all.extend(self.output_ownership.filter(
+                OutputOwner::ApplicationSwitch(stream),
+                &session.switcher.release(event_model::ModifierSet::NONE),
+            ));
+        }
+        for output in all {
             if !releases.contains(&output) {
                 releases.push(output);
             }
@@ -595,7 +783,7 @@ impl RuntimeController {
                 self.status = RuntimeStatus::Running;
             }
             RuntimeCommand::Disable => return Ok(self.transition(RuntimeStatus::Disabled)),
-            RuntimeCommand::ReplaceRules(rules) => self.engine.replace_rules(rules),
+            RuntimeCommand::ReplaceRules(rules) => self.replace_active_rules(rules),
             RuntimeCommand::ReplaceConfig(config) => {
                 config
                     .validate_desktop()
@@ -624,8 +812,11 @@ impl RuntimeController {
                 return Ok(self.permissions_refreshed(permission));
             }
             RuntimeCommand::ReleaseAll => {
-                let mut outputs = std::mem::take(&mut self.pending_releases);
-                outputs.extend(self.engine.release_all());
+                let status = self.status.clone();
+                let outputs = self.transition(status.clone());
+                if status == RuntimeStatus::Running {
+                    let _ = self.adapter.start();
+                }
                 return Ok(outputs);
             }
             RuntimeCommand::Shutdown => return Ok(self.transition(RuntimeStatus::Stopped)),
@@ -663,6 +854,13 @@ impl RuntimeController {
             return Decision::Pass;
         }
         self.consume_external_keyboard_activity();
+        for session in self.software.values_mut() {
+            session.engine.interrupt_gestures();
+        }
+        if !self.close_software_switchers(None, &mut inject) {
+            self.diagnostics.record_passed();
+            return Decision::Pass;
+        }
         if is_emergency_hotkey(event) {
             let outputs = self.transition(RuntimeStatus::Disabled);
             let _ = self.flush_with(&outputs, &mut inject);
@@ -670,6 +868,7 @@ impl RuntimeController {
             return Decision::Pass;
         }
         if self.status != RuntimeStatus::Running {
+            self.output_ownership.native_pass(InputStream::Local, event);
             self.diagnostics.record_passed();
             return Decision::Pass;
         }
@@ -698,6 +897,10 @@ impl RuntimeController {
         let decision = self.engine.handle(event);
         match decision {
             Decision::Pass => {
+                if !self.output_ownership.native_pass(InputStream::Local, event) {
+                    self.diagnostics.record_suppressed();
+                    return Decision::Suppress;
+                }
                 self.diagnostics.record_passed();
                 Decision::Pass
             }
@@ -705,7 +908,9 @@ impl RuntimeController {
                 self.diagnostics.record_suppressed();
                 Decision::Suppress
             }
-            Decision::Emit(outputs) => match self.dispatch_outputs(
+            Decision::Emit(outputs) => match self.dispatch_outputs_for(
+                InputStream::Local,
+                OutputOwner::Mapped(InputStream::Local),
                 &outputs,
                 self.engine.modifiers_for_event(event),
                 &mut inject,
@@ -725,14 +930,22 @@ impl RuntimeController {
         }
     }
 
-    fn consume_external_keyboard_activity(&mut self) {
+    fn consume_external_keyboard_activity(&mut self) -> bool {
         if self.external_keyboard_pending.swap(false, Ordering::AcqRel) {
             self.engine.interrupt_gestures();
+            for session in self.software.values_mut() {
+                session.engine.interrupt_gestures();
+            }
+            true
+        } else {
+            false
         }
     }
 
-    fn dispatch_outputs<F>(
-        &self,
+    fn dispatch_outputs_for<F>(
+        &mut self,
+        stream: InputStream,
+        owner: OutputOwner,
         outputs: &[OutputEvent],
         restore_flags: event_model::ModifierSet,
         mut inject: F,
@@ -741,6 +954,7 @@ impl RuntimeController {
         F: FnMut(&[OutputEvent], u64) -> Result<(), InjectionError>,
     {
         let mut regular = Vec::new();
+        let mut ownership = self.output_ownership.clone();
         let mut restore_modifiers = false;
         let mut input_source_error = None;
         for output in outputs {
@@ -781,20 +995,38 @@ impl RuntimeController {
                     restore_modifiers = true;
                     let config = self.config.clone().unwrap_or_default();
                     match config.show_desktop_output() {
-                        Ok(outputs) => regular.extend(outputs),
+                        Ok(outputs) => {
+                            self.output_transaction = self.output_transaction.wrapping_add(1);
+                            regular.extend(ownership.filter(
+                                OutputOwner::Transient(stream, self.output_transaction),
+                                &outputs,
+                            ));
+                        }
                         Err(error) => {
                             input_source_error = Some(InjectionError::Failed(error.to_string()))
                         }
                     }
                 }
+                OutputEvent::SystemShortcut(shortcut) => {
+                    restore_modifiers = true;
+                    self.output_transaction = self.output_transaction.wrapping_add(1);
+                    match macos_adapter::expand_system_shortcut(*shortcut) {
+                        Ok(outputs) => regular.extend(ownership.filter(
+                            OutputOwner::Transient(stream, self.output_transaction),
+                            &outputs,
+                        )),
+                        Err(error) => input_source_error = Some(error),
+                    }
+                }
                 other => {
-                    restore_modifiers |= matches!(other, OutputEvent::SystemShortcut(_));
-                    regular.push(other.clone());
+                    regular.extend(ownership.filter(owner, std::slice::from_ref(other)));
                 }
             }
         }
         if restore_modifiers {
-            regular.extend(event_model::modifier_restore_outputs(restore_flags));
+            regular.extend(event_model::modifier_restore_outputs(
+                ownership.modifiers_with_preserved(stream, restore_flags),
+            ));
         }
         if let Some(error) = input_source_error {
             // The event tap must fall back to the original event when the
@@ -803,8 +1035,11 @@ impl RuntimeController {
             // returning Pass below would duplicate that release.
             Err(error)
         } else if !regular.is_empty() {
-            inject(&regular, self.adapter.own_marker())
+            inject(&regular, self.adapter.own_marker())?;
+            self.output_ownership = ownership;
+            Ok(())
         } else {
+            self.output_ownership = ownership;
             Ok(())
         }
     }
@@ -976,6 +1211,7 @@ pub fn run() {
             commands::settings_snapshot,
             commands::set_rule_enabled,
             commands::set_show_desktop_shortcut,
+            commands::set_software_input_passthrough,
             commands::set_profile,
             commands::release_all,
             commands::emergency_disable,
@@ -1214,6 +1450,23 @@ pub mod commands {
         })
         .await
         .map_err(|e| e.to_string())?
+    }
+
+    #[tauri::command]
+    pub async fn set_software_input_passthrough(
+        app: tauri::AppHandle,
+        enabled: bool,
+        expected_revision: u64,
+    ) -> Result<settings::SettingsSnapshot, String> {
+        tauri::async_runtime::spawn_blocking(move || {
+            settings::set_software_input_passthrough(
+                &app.state::<AppState>(),
+                expected_revision,
+                enabled,
+            )
+        })
+        .await
+        .map_err(|error| error.to_string())?
     }
 
     #[tauri::command]
@@ -1766,8 +2019,16 @@ mod tests {
         );
         assert!(matches!(
             delivered.first(),
-            Some(OutputEvent::SystemShortcut(SystemShortcut::HardRefresh))
+            Some(OutputEvent::Key {
+                code: PhysicalCode::Key(55),
+                phase: EventPhase::Down,
+                ..
+            })
         ));
+        assert!(delivered.iter().any(|event| matches!(event,
+            OutputEvent::Key { code: PhysicalCode::Key(15), phase: EventPhase::Down, modifiers }
+                if modifiers.contains(ModifierSet::LEFT_COMMAND | ModifierSet::LEFT_SHIFT)
+                    && !modifiers.contains(ModifierSet::LEFT_CONTROL))));
         assert!(delivered.iter().any(|event| matches!(
             event,
             OutputEvent::Key {
