@@ -86,7 +86,7 @@ impl Diagnostics {
     pub fn record_passed(&self) {
         Self::inc(&self.events_passed);
     }
-    /// Counts an external software keyboard event passed through unchanged.
+    /// Counts a keyboard event passed through the text/unknown input bypass.
     /// The caller records `seen` and `passed` separately to avoid double counting.
     pub fn record_external_keyboard_passed(&self) {
         Self::inc(&self.external_keyboard_events_passed);

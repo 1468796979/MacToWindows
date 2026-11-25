@@ -15,7 +15,8 @@ pub use input_source::{
     InputSourceCommand, InputSourceError, InputSourceService, InputSourceSnapshot,
 };
 
-static MARKER_COUNTER: AtomicU64 = AtomicU64::new(1);
+const MARKER_NAMESPACE: u64 = 0x4d54_5700_0000_0000;
+static MARKER_COUNTER: AtomicU64 = AtomicU64::new(MARKER_NAMESPACE | 1);
 pub fn next_marker() -> u64 {
     MARKER_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
@@ -172,29 +173,29 @@ pub enum EventTapAction {
     Suppress,
 }
 
-/// Keyboard source routing uses CoreGraphics metadata rather than keycodes or
-/// character payloads. Unknown and software sources must retain their original
-/// events; only the hardware-like PID-0/HID source enters physical key tracking.
+/// RustDesk Enigo marks its entire keyboard injection channel, including
+/// modifiers and text packets. This is a compatibility hint, not a device ID.
+pub const RUSTDESK_ENIGO_MARKER: u64 = 100;
+
+/// Preserve legacy mapping for Deskflow and ordinary paired injected keys.
+/// Only own replays, the known Enigo channel, and unreadable handles bypass it;
+/// neither process IDs nor character payloads determine mapping eligibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyboardEventRoute {
-    Hardware,
+    Mappable,
     OwnInjected,
-    External,
+    TextInjection,
+    Unknown,
 }
 
 #[cfg(any(target_os = "macos", test))]
-fn classify_keyboard_source(
-    marker: u64,
-    own_marker: u64,
-    source_pid: i64,
-    source_state: i64,
-) -> KeyboardEventRoute {
+fn classify_keyboard_source(marker: u64, own_marker: u64) -> KeyboardEventRoute {
     if is_own_marker(marker, own_marker) {
         KeyboardEventRoute::OwnInjected
-    } else if marker == 0 && source_pid == 0 && source_state == 1 {
-        KeyboardEventRoute::Hardware
+    } else if marker == RUSTDESK_ENIGO_MARKER {
+        KeyboardEventRoute::TextInjection
     } else {
-        KeyboardEventRoute::External
+        KeyboardEventRoute::Mappable
     }
 }
 
@@ -235,14 +236,14 @@ impl EventTapEvent {
     }
 
     /// Classify keyboard events without modifying or decoding their contents.
-    /// PID/state metadata is an interoperability convention, not an unforgeable
-    /// device identity. Software using a virtual HID may be indistinguishable.
+    /// A valid unmarked software event remains eligible for legacy mapping;
+    /// null handles and unsupported platforms are explicitly unknown.
     pub fn keyboard_route(self, own_marker: u64) -> Option<KeyboardEventRoute> {
         if !matches!(self.event_type, 10..=12) {
             return None;
         }
         if self.raw_event.is_null() {
-            return Some(KeyboardEventRoute::External);
+            return Some(KeyboardEventRoute::Unknown);
         }
         #[cfg(target_os = "macos")]
         {
@@ -252,36 +253,18 @@ impl EventTapEvent {
                     platform::EVENT_SOURCE_USER_DATA_FIELD,
                 )
             } as u64;
-            // Marked input never needs a hardware-state lookup or process query.
-            let route = if marker != 0 {
-                classify_keyboard_source(marker, own_marker, 0, 0)
-            } else {
-                let pid = unsafe {
-                    platform::CGEventGetIntegerValueField(
-                        self.raw_event,
-                        platform::EVENT_SOURCE_UNIX_PROCESS_ID_FIELD,
-                    )
-                };
-                let state = unsafe {
-                    platform::CGEventGetIntegerValueField(
-                        self.raw_event,
-                        platform::EVENT_SOURCE_STATE_ID_FIELD,
-                    )
-                };
-                classify_keyboard_source(marker, own_marker, pid, state)
-            };
-            Some(route)
+            Some(classify_keyboard_source(marker, own_marker))
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = own_marker;
-            Some(KeyboardEventRoute::External)
+            Some(KeyboardEventRoute::Unknown)
         }
     }
 }
 
-/// Physical modifier state belongs to one tap and is never updated by this
-/// process's replacement events or other software keyboard sources.
+/// Modifier tracking belongs to one tap and is never updated by this process's
+/// replacement events or packets from the known text-injection channel.
 pub struct EventNormalizer {
     own_marker: u64,
     modifiers: event_model::ModifierSet,
@@ -822,16 +805,9 @@ pub mod platform {
         let event_type = input.event_type();
         let marker =
             unsafe { CGEventGetIntegerValueField(raw, EVENT_SOURCE_USER_DATA_FIELD) as u64 };
-        let keyboard_is_hardware = if matches!(event_type, 10..=12) {
-            let pid =
-                unsafe { CGEventGetIntegerValueField(raw, EVENT_SOURCE_UNIX_PROCESS_ID_FIELD) };
-            let state = unsafe { CGEventGetIntegerValueField(raw, EVENT_SOURCE_STATE_ID_FIELD) };
-            super::classify_keyboard_source(marker, 0, pid, state)
-                == super::KeyboardEventRoute::Hardware
-        } else {
-            marker == 0
-        };
-        let origin = if keyboard_is_hardware {
+        let origin = if matches!(event_type, 10..=12) && marker == super::RUSTDESK_ENIGO_MARKER {
+            EventOrigin::TextInjection { marker }
+        } else if marker == 0 {
             EventOrigin::Hardware
         } else {
             EventOrigin::Injected { marker }
@@ -1027,10 +1003,15 @@ pub mod platform {
     {
         use event_model::{EventKind, EventOrigin, ModifierSet, PhysicalCode};
         let mut event = normalize_event(input)?;
-        let software_keyboard = matches!(event.kind, EventKind::Keyboard | EventKind::FlagsChanged)
-            && matches!(event.origin, EventOrigin::Injected { .. });
-        let own_event = matches!(event.origin, EventOrigin::Injected { marker } if super::is_own_marker(marker, own_marker));
-        if software_keyboard || own_event {
+        if let Some(marker) = event.origin.injected_marker() {
+            if super::is_own_marker(marker, own_marker) {
+                // A caller or legacy instance can still use own marker 100.
+                // Own replay overrides the stateless channel interpretation.
+                event.origin = EventOrigin::Injected { marker };
+                return Some(event);
+            }
+        }
+        if matches!(event.origin, EventOrigin::TextInjection { .. }) {
             return Some(event);
         }
         let flags = unsafe { CGEventGetFlags(input.raw_event()) };
@@ -1506,55 +1487,133 @@ pub mod platform {
         }
 
         #[test]
-        fn foreign_synthetic_modifiers_do_not_query_or_update_physical_state() {
+        fn known_text_channel_does_not_query_or_update_modifier_state() {
             let raw = software_keyboard_raw(8, 0x0004_0000);
-            raw.mark(100);
+            raw.mark(super::super::RUSTDESK_ENIGO_MARKER);
             let mut state = M::LEFT_OPTION;
             let event = normalize_with_state(EventTapEvent::new(10, raw.0), 99, &mut state, |_| {
-                panic!("foreign events must not query hardware")
+                panic!("known text input must not query hardware")
+            })
+            .unwrap();
+            assert_eq!(
+                event.origin,
+                event_model::EventOrigin::TextInjection { marker: 100 }
+            );
+            assert_eq!(state, M::LEFT_OPTION);
+        }
+
+        #[test]
+        fn ordinary_foreign_keyboards_keep_legacy_side_flag_handling() {
+            for (flags, expected) in [(0x0004_0001, Some(M::LEFT_CONTROL)), (0x0004_0000, None)] {
+                let raw = software_keyboard_raw(8, flags);
+                raw.mark(101);
+                let mut state = M::LEFT_SHIFT;
+                let event =
+                    normalize_with_state(EventTapEvent::new(10, raw.0), 99, &mut state, |_| {
+                        panic!("foreign missing-side flags must not query hardware")
+                    });
+                if let Some(expected) = expected {
+                    let event = event.unwrap();
+                    assert_eq!(
+                        event.origin,
+                        event_model::EventOrigin::Injected { marker: 101 }
+                    );
+                    assert_eq!(event.modifiers, expected);
+                    assert_eq!(state, expected);
+                } else {
+                    assert!(event.is_none());
+                    assert_eq!(state, M::LEFT_SHIFT);
+                }
+            }
+        }
+
+        #[test]
+        fn native_keyboard_routes_keep_deskflow_hid_and_cg_sources_mappable() {
+            use super::super::KeyboardEventRoute::{Mappable, OwnInjected, TextInjection};
+            use event_model::EventOrigin;
+            for event_type in [10, 11, 12] {
+                for (marker, pid, source_state, expected_route, expected_origin) in [
+                    (0, 0, 1, Mappable, EventOrigin::Hardware),
+                    (
+                        0,
+                        i64::from(std::process::id()),
+                        0,
+                        Mappable,
+                        EventOrigin::Hardware,
+                    ),
+                    (
+                        0,
+                        i64::from(std::process::id()),
+                        1,
+                        Mappable,
+                        EventOrigin::Hardware,
+                    ),
+                    (
+                        0,
+                        i64::from(std::process::id()),
+                        12345,
+                        Mappable,
+                        EventOrigin::Hardware,
+                    ),
+                    (
+                        101,
+                        i64::from(std::process::id()),
+                        0,
+                        Mappable,
+                        EventOrigin::Injected { marker: 101 },
+                    ),
+                    (
+                        100,
+                        i64::from(std::process::id()),
+                        0,
+                        TextInjection,
+                        EventOrigin::TextInjection { marker: 100 },
+                    ),
+                    (
+                        99,
+                        i64::from(std::process::id()),
+                        1,
+                        OwnInjected,
+                        EventOrigin::Injected { marker: 99 },
+                    ),
+                ] {
+                    // Each fixture is immutable after its first source-field read.
+                    let raw = software_keyboard_raw(0, 0);
+                    raw.mark(marker);
+                    unsafe {
+                        CGEventSetIntegerValueField(raw.0, EVENT_SOURCE_UNIX_PROCESS_ID_FIELD, pid);
+                        CGEventSetIntegerValueField(
+                            raw.0,
+                            EVENT_SOURCE_STATE_ID_FIELD,
+                            source_state,
+                        );
+                    }
+                    let input = EventTapEvent::new(event_type, raw.0);
+                    assert_eq!(input.keyboard_route(99), Some(expected_route));
+                    assert_eq!(normalize_event(input).unwrap().origin, expected_origin);
+                }
+            }
+        }
+
+        #[test]
+        fn own_marker_100_takes_priority_in_standalone_normalization() {
+            let raw = software_keyboard_raw(58, 0x0008_0020);
+            raw.mark(100);
+            let input = EventTapEvent::new(12, raw.0);
+            assert_eq!(
+                input.keyboard_route(100),
+                Some(super::super::KeyboardEventRoute::OwnInjected)
+            );
+            let mut state = M::RIGHT_CONTROL;
+            let event = normalize_with_state(input, 100, &mut state, |_| {
+                panic!("own marker must not query hardware")
             })
             .unwrap();
             assert_eq!(
                 event.origin,
                 event_model::EventOrigin::Injected { marker: 100 }
             );
-            assert_eq!(state, M::LEFT_OPTION);
-        }
-
-        #[test]
-        fn native_keyboard_route_reads_source_fields_and_distinguishes_own_marker() {
-            let raw = keyboard_raw(0, 0);
-            for event_type in [10, 11, 12] {
-                let input = EventTapEvent::new(event_type, raw.0);
-                assert_eq!(
-                    input.keyboard_route(99),
-                    Some(super::super::KeyboardEventRoute::Hardware)
-                );
-                // Event source metadata can be cached after its first read;
-                // classify fresh, immutable events rather than rewriting it.
-                for (marker, expected) in [
-                    (100, super::super::KeyboardEventRoute::External),
-                    (99, super::super::KeyboardEventRoute::OwnInjected),
-                ] {
-                    let software = software_keyboard_raw(0, 0);
-                    software.mark(marker);
-                    let input = EventTapEvent::new(event_type, software.0);
-                    assert_eq!(input.keyboard_route(99), Some(expected));
-                }
-            }
-            let unknown = keyboard_raw(0, 0);
-            unsafe {
-                CGEventSetIntegerValueField(unknown.0, EVENT_SOURCE_STATE_ID_FIELD, 0);
-            }
-            let input = EventTapEvent::new(10, unknown.0);
-            assert_eq!(
-                input.keyboard_route(99),
-                Some(super::super::KeyboardEventRoute::External)
-            );
-            assert_eq!(
-                normalize_event(input).unwrap().origin,
-                event_model::EventOrigin::Injected { marker: 0 }
-            );
+            assert_eq!(state, M::RIGHT_CONTROL);
         }
 
         fn unicode_units(raw: EventRef) -> Vec<u16> {
@@ -1571,11 +1630,10 @@ pub mod platform {
         }
 
         #[test]
-        fn software_unicode_and_source_metadata_remain_intact_without_hardware_queries() {
-            // In particular, source state 1 alone does not make an event
-            // physical: user-space events retain the creating process's PID.
+        fn known_text_unicode_and_source_metadata_remain_intact_without_hardware_queries() {
+            // Bypass the known channel without examining its Unicode payload.
             let source = OwnedEvent::new(unsafe { CGEventSourceCreate(1) }).unwrap();
-            for marker in [0, 100] {
+            for marker in [super::super::RUSTDESK_ENIGO_MARKER] {
                 for text in ["a", "b", "中", "🙂", "Hello中文"] {
                     let raw =
                         OwnedEvent::new(unsafe { CGEventCreateKeyboardEvent(source.0, 0, true) })
@@ -1607,14 +1665,17 @@ pub mod platform {
                     let input = EventTapEvent::new(10, raw.0);
                     assert_eq!(
                         input.keyboard_route(99),
-                        Some(super::super::KeyboardEventRoute::External)
+                        Some(super::super::KeyboardEventRoute::TextInjection)
                     );
                     let mut state = M::RIGHT_SHIFT;
                     let event = normalize_with_state(input, 99, &mut state, |_| {
                         panic!("software input must not query physical key state")
                     })
                     .unwrap();
-                    assert_eq!(event.origin, event_model::EventOrigin::Injected { marker });
+                    assert_eq!(
+                        event.origin,
+                        event_model::EventOrigin::TextInjection { marker }
+                    );
                     assert_eq!(event.code, PhysicalCode::key(0));
                     assert_eq!(event.phase, EventPhase::Down);
                     assert_eq!(state, M::RIGHT_SHIFT);
@@ -1625,24 +1686,57 @@ pub mod platform {
         }
 
         #[test]
-        fn unmarked_software_flags_changed_does_not_pollute_modifier_tracking() {
-            let source = OwnedEvent::new(unsafe { CGEventSourceCreate(1) }).unwrap();
+        fn deskflow_cg_fallback_flags_changed_keeps_legacy_modifier_tracking() {
+            let source = OwnedEvent::new(unsafe { CGEventSourceCreate(0) }).unwrap();
             let raw =
                 OwnedEvent::new(unsafe { CGEventCreateKeyboardEvent(source.0, 58, true) }).unwrap();
             unsafe {
-                CGEventSetFlags(raw.0, 0x0008_0000);
+                CGEventSetFlags(raw.0, 0x0008_0020);
             }
             let input = EventTapEvent::new(12, raw.0);
+            assert_eq!(
+                input.keyboard_route(99),
+                Some(super::super::KeyboardEventRoute::Mappable)
+            );
+            assert_eq!(
+                unsafe { CGEventGetIntegerValueField(raw.0, EVENT_SOURCE_UNIX_PROCESS_ID_FIELD) },
+                i64::from(std::process::id())
+            );
+            assert_eq!(
+                unsafe { CGEventGetIntegerValueField(raw.0, EVENT_SOURCE_STATE_ID_FIELD) },
+                0
+            );
             let mut state = M::LEFT_CONTROL;
             let event = normalize_with_state(input, 99, &mut state, |_| {
-                panic!("external flagsChanged must not query physical state")
+                panic!("complete side flags do not need fallback")
             })
             .unwrap();
+            assert_eq!(event.origin, event_model::EventOrigin::Hardware);
+            assert_eq!(event.modifiers, M::LEFT_OPTION);
+            assert_eq!(state, M::LEFT_OPTION);
+        }
+
+        #[test]
+        fn unmarked_unicode_a_remains_eligible_for_legacy_mapping() {
+            let raw = software_keyboard_raw(0, 0);
+            let units: Vec<u16> = "a".encode_utf16().collect();
+            unsafe {
+                CGEventKeyboardSetUnicodeString(raw.0, units.len(), units.as_ptr());
+            }
+            let input = EventTapEvent::new(10, raw.0);
             assert_eq!(
-                event.origin,
-                event_model::EventOrigin::Injected { marker: 0 }
+                input.keyboard_route(99),
+                Some(super::super::KeyboardEventRoute::Mappable)
             );
-            assert_eq!(state, M::LEFT_CONTROL);
+            let mut state = M::LEFT_SHIFT;
+            let event = normalize_with_state(input, 99, &mut state, |_| {
+                panic!("no modifier fallback needed")
+            })
+            .unwrap();
+            assert_eq!(event.origin, event_model::EventOrigin::Hardware);
+            assert_eq!(event.code, PhysicalCode::key(0));
+            assert_eq!(state, M::NONE);
+            assert_eq!(unicode_units(raw.0), units);
         }
 
         #[test]
@@ -1683,6 +1777,12 @@ pub mod platform {
                 CGEventSetFlags(raw.0, 0x0004_0000);
             }
             raw.mark(100);
+            let input = EventTapEvent::new(1, raw.0);
+            assert_eq!(input.keyboard_route(99), None);
+            assert_eq!(
+                normalize_event(input).unwrap().origin,
+                event_model::EventOrigin::Injected { marker: 100 }
+            );
             let mut state = M::LEFT_SHIFT;
             assert!(normalize_with_state(
                 EventTapEvent::new(1, raw.0),

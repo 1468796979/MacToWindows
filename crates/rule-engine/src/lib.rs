@@ -436,7 +436,7 @@ impl RuleEngine {
 
     pub fn handle(&mut self, event: &NormalizedEvent) -> event_model::Decision {
         if matches!(event.kind, EventKind::Keyboard | EventKind::FlagsChanged)
-            && matches!(event.origin, event_model::EventOrigin::Injected { .. })
+            && matches!(event.origin, event_model::EventOrigin::TextInjection { .. })
         {
             return event_model::Decision::Pass;
         }
@@ -1972,13 +1972,13 @@ mod tests {
     }
 
     #[test]
-    fn injected_down_only_events_pass_without_registering_or_matching_a_key() {
+    fn text_injection_down_only_events_pass_without_registering_or_matching_a_key() {
         for marker in [0, 100] {
             let mut engine = RuleEngine::new(
                 CompiledRules::compile(vec![replacement("local-a", 0, 1, 10)]).unwrap(),
             );
             let external = NormalizedEvent {
-                origin: EventOrigin::Injected { marker },
+                origin: EventOrigin::TextInjection { marker },
                 ..key(0, EventPhase::Down)
             };
             for _ in 0..4 {
@@ -2012,7 +2012,7 @@ mod tests {
     }
 
     #[test]
-    fn injected_events_cannot_change_local_holds_even_with_the_same_keycode() {
+    fn text_injection_cannot_change_local_holds_even_with_the_same_keycode() {
         let mut engine = RuleEngine::new(
             CompiledRules::compile(vec![replacement("local-a", 0, 1, 10)]).unwrap(),
         );
@@ -2030,7 +2030,7 @@ mod tests {
                 modifier(59, ModifierSet::LEFT_CONTROL, 3),
             ] {
                 let external = NormalizedEvent {
-                    origin: EventOrigin::Injected { marker },
+                    origin: EventOrigin::TextInjection { marker },
                     ..event
                 };
                 assert_eq!(engine.handle(&external), event_model::Decision::Pass);
@@ -2050,12 +2050,12 @@ mod tests {
     }
 
     #[test]
-    fn injected_entry_guard_does_not_cancel_a_pending_local_shift_tap() {
+    fn text_injection_entry_guard_does_not_cancel_a_pending_local_shift_tap() {
         let mut engine = RuleEngine::new(CompiledRules::compile(vec![]).unwrap());
         engine.set_pinyin_active(true);
         engine.handle(&modifier(56, ModifierSet::LEFT_SHIFT, 1));
         let external = NormalizedEvent {
-            origin: EventOrigin::Injected { marker: 100 },
+            origin: EventOrigin::TextInjection { marker: 100 },
             ..key(0, EventPhase::Down)
         };
         assert_eq!(engine.handle(&external), event_model::Decision::Pass);
@@ -2167,5 +2167,142 @@ mod tests {
             matches!(engine.handle(&modifier(56, ModifierSet::NONE, 100)), event_model::Decision::Emit(ref outputs)
             if outputs.contains(&OutputEvent::SystemShortcut(event_model::SystemShortcut::TogglePinyinEnglish)))
         );
+    }
+
+    #[test]
+    fn ordinary_injected_keycode_streams_still_map_and_pair_releases() {
+        for marker in [0, 123] {
+            let mut engine = RuleEngine::new(
+                CompiledRules::compile(vec![replacement("deskflow-a", 0, 1, 10)]).unwrap(),
+            );
+            let down = NormalizedEvent {
+                origin: EventOrigin::Injected { marker },
+                ..key(0, EventPhase::Down)
+            };
+            assert_eq!(
+                engine.handle(&down),
+                event_model::Decision::Emit(vec![OutputEvent::Key {
+                    code: PhysicalCode::key(1),
+                    phase: EventPhase::Down,
+                    modifiers: ModifierSet::NONE,
+                }])
+            );
+            assert!(engine.state().physical_down(PhysicalCode::key(0)));
+            assert_eq!(engine.state().logical_down_count(PhysicalCode::key(1)), 1);
+            let repeat = NormalizedEvent {
+                phase: EventPhase::Repeat,
+                ..down.clone()
+            };
+            assert_eq!(
+                engine.handle(&repeat),
+                event_model::Decision::Emit(vec![OutputEvent::Key {
+                    code: PhysicalCode::key(1),
+                    phase: EventPhase::Repeat,
+                    modifiers: ModifierSet::NONE,
+                }])
+            );
+            let up = NormalizedEvent {
+                phase: EventPhase::Up,
+                ..down
+            };
+            assert_eq!(
+                engine.handle(&up),
+                event_model::Decision::Emit(vec![OutputEvent::Key {
+                    code: PhysicalCode::key(1),
+                    phase: EventPhase::Up,
+                    modifiers: ModifierSet::NONE,
+                }])
+            );
+            assert!(!engine.state().physical_down(PhysicalCode::key(0)));
+            assert_eq!(engine.state().logical_down_count(PhysicalCode::key(1)), 0);
+        }
+    }
+
+    #[test]
+    fn ordinary_injected_control_copy_still_matches_shortcut_rule() {
+        for marker in [0, 123] {
+            let mut copy = replacement("deskflow-copy", 8, 8, 200);
+            copy.trigger = Trigger::Chord {
+                modifiers: ModifierSet::LEFT_CONTROL,
+                key: PhysicalCode::key(8),
+                phase: EventPhase::Down,
+            };
+            copy.action = Action::Replace(vec![OutputEvent::Key {
+                code: PhysicalCode::key(8),
+                phase: EventPhase::Down,
+                modifiers: ModifierSet::LEFT_COMMAND,
+            }]);
+            let mut engine = RuleEngine::new(CompiledRules::compile(vec![copy]).unwrap());
+            let down = NormalizedEvent {
+                origin: EventOrigin::Injected { marker },
+                modifiers: ModifierSet::LEFT_CONTROL,
+                ..key(8, EventPhase::Down)
+            };
+            assert_eq!(
+                engine.handle(&down),
+                event_model::Decision::Emit(vec![OutputEvent::Key {
+                    code: PhysicalCode::key(8),
+                    phase: EventPhase::Down,
+                    modifiers: ModifierSet::LEFT_COMMAND,
+                }])
+            );
+            let up = NormalizedEvent {
+                phase: EventPhase::Up,
+                ..down
+            };
+            assert_eq!(
+                engine.handle(&up),
+                event_model::Decision::Emit(vec![OutputEvent::Key {
+                    code: PhysicalCode::key(8),
+                    phase: EventPhase::Up,
+                    modifiers: ModifierSet::LEFT_COMMAND,
+                }])
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_injected_modifiers_can_form_input_source_gestures() {
+        for marker in [0, 123] {
+            let mut engine =
+                RuleEngine::new(CompiledRules::compile(vec![modifier_chord_rule()]).unwrap());
+            for event in [
+                modifier(59, ModifierSet::LEFT_CONTROL, 1),
+                modifier(56, ModifierSet::LEFT_SHIFT, 2),
+            ] {
+                let event = NormalizedEvent {
+                    origin: EventOrigin::Injected { marker },
+                    ..event
+                };
+                assert_eq!(engine.handle(&event), event_model::Decision::Pass);
+            }
+            let shift_up = NormalizedEvent {
+                origin: EventOrigin::Injected { marker },
+                ..modifier(56, ModifierSet::NONE, 3)
+            };
+            assert!(
+                matches!(engine.handle(&shift_up), event_model::Decision::Emit(ref outputs)
+                if outputs.contains(&OutputEvent::SystemShortcut(event_model::SystemShortcut::SwitchInputSource)))
+            );
+            let control_up = NormalizedEvent {
+                origin: EventOrigin::Injected { marker },
+                ..modifier(59, ModifierSet::NONE, 4)
+            };
+            assert_eq!(engine.handle(&control_up), event_model::Decision::Pass);
+            engine.set_pinyin_active(true);
+            let shift_down = NormalizedEvent {
+                origin: EventOrigin::Injected { marker },
+                ..modifier(56, ModifierSet::LEFT_SHIFT, 5)
+            };
+            engine.handle(&shift_down);
+            let shift_up = NormalizedEvent {
+                origin: EventOrigin::Injected { marker },
+                ..modifier(56, ModifierSet::NONE, 6)
+            };
+            assert!(
+                matches!(engine.handle(&shift_up), event_model::Decision::Emit(ref outputs)
+                if outputs.contains(&OutputEvent::SystemShortcut(event_model::SystemShortcut::TogglePinyinEnglish)))
+            );
+        }
     }
 }

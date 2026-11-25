@@ -159,8 +159,24 @@ pub struct AppContext {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum EventOrigin {
+    /// Legacy unmarked key stream, including injectors such as Deskflow.
+    /// This is mapping provenance, not proof of a physical device identity.
     Hardware,
+    /// A marked event that remains eligible for keycode mapping. The runtime
+    /// separately filters its own injected marker to prevent feedback loops.
     Injected { marker: u64 },
+    /// An upstream text channel explicitly known to be unsafe for the physical
+    /// key ledger. This classification does not infer whether Unicode is present.
+    TextInjection { marker: u64 },
+}
+
+impl EventOrigin {
+    pub fn injected_marker(self) -> Option<u64> {
+        match self {
+            Self::Injected { marker } | Self::TextInjection { marker } => Some(marker),
+            Self::Hardware => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -399,5 +415,25 @@ mod tests {
             Some(&Modifier::RightWindows)
         );
         assert_eq!(map.get(&Modifier::RightCommand), Some(&Modifier::RightAlt));
+    }
+
+    #[test]
+    fn event_origin_marker_helper_and_text_channel_round_trip() {
+        for (origin, marker) in [
+            (EventOrigin::Hardware, None),
+            (EventOrigin::Injected { marker: 0 }, Some(0)),
+            (EventOrigin::Injected { marker: 123 }, Some(123)),
+            (EventOrigin::TextInjection { marker: 0 }, Some(0)),
+            (EventOrigin::TextInjection { marker: 100 }, Some(100)),
+        ] {
+            assert_eq!(origin.injected_marker(), marker);
+            let json = serde_json::to_string(&origin).unwrap();
+            assert_eq!(serde_json::from_str::<EventOrigin>(&json).unwrap(), origin);
+        }
+        // Existing serialized ordinary injections retain their previous meaning.
+        assert_eq!(
+            serde_json::from_str::<EventOrigin>(r#"{"Injected":{"marker":100}}"#).unwrap(),
+            EventOrigin::Injected { marker: 100 }
+        );
     }
 }

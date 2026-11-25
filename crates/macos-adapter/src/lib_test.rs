@@ -8,28 +8,37 @@ mod tests {
     use event_model::{ModifierSet, MouseButton, PhysicalCode, ScrollAxis};
 
     #[test]
-    fn keyboard_routing_admits_only_unmarked_pid_zero_hid_sources() {
+    fn keyboard_routing_preserves_legacy_mapping_except_the_known_text_channel() {
         use super::super::classify_keyboard_source as classify;
-        use KeyboardEventRoute::{External, Hardware, OwnInjected};
-        for (marker, own, pid, state, expected) in [
-            (0, 99, 0, 1, Hardware),
-            (0, 0, 0, 1, Hardware),
-            (99, 99, 123, 1, OwnInjected),
-            (99, 99, 0, 0, OwnInjected),
-            (100, 99, 0, 1, External),
-            (100, 99, 123, 0, External),
-            (0, 99, 123, 1, External),
-            (0, 99, 123, 0, External),
-            (0, 99, 123, 12345, External),
-            (0, 99, 0, 0, External),
-            (0, 99, 0, -1, External),
-            (0, 99, 0, 12345, External),
-            (0, 99, -1, 1, External),
+        use KeyboardEventRoute::{Mappable, OwnInjected, TextInjection};
+        for (marker, own, expected) in [
+            (0, 99, Mappable),
+            (0, 0, Mappable),
+            (99, 99, OwnInjected),
+            (100, 100, OwnInjected),
+            (100, 99, TextInjection),
+            (1, 99, Mappable),
+            (101, 99, Mappable),
+            (u64::MAX, 99, Mappable),
         ] {
             assert_eq!(
-                classify(marker, own, pid, state),
+                classify(marker, own),
                 expected,
-                "marker={marker}, own={own}, pid={pid}, state={state}"
+                "marker={marker}, own={own}"
+            );
+        }
+    }
+
+    #[test]
+    fn own_markers_are_unique_and_outside_the_text_injection_namespace() {
+        let first = next_marker();
+        let second = next_marker();
+        assert_ne!(first, second);
+        for marker in [first, second] {
+            assert_ne!(marker, super::super::RUSTDESK_ENIGO_MARKER);
+            assert_eq!(
+                marker & 0xffff_ff00_0000_0000,
+                super::super::MARKER_NAMESPACE
             );
         }
     }
@@ -39,7 +48,7 @@ mod tests {
         for event_type in [10, 11, 12] {
             assert_eq!(
                 EventTapEvent::new(event_type, std::ptr::null_mut()).keyboard_route(99),
-                Some(KeyboardEventRoute::External)
+                Some(KeyboardEventRoute::Unknown)
             );
         }
         for event_type in [1, 22, super::super::TAP_DISABLED_BY_TIMEOUT] {

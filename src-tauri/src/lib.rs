@@ -69,7 +69,7 @@ impl ClipboardHotkeyLatch {
     pub fn handle(&mut self, event: &NormalizedEvent) -> Option<ClipboardHotkeyAction> {
         if event.kind == event_model::EventKind::FlagsChanged
             && event.source == event_model::DeviceSource::Keyboard
-            && matches!(event.origin, event_model::EventOrigin::Hardware)
+            && !matches!(event.origin, event_model::EventOrigin::TextInjection { .. })
             && matches!(event.code, event_model::PhysicalCode::Key(58 | 61))
         {
             self.option_state_seen = true;
@@ -90,7 +90,7 @@ impl ClipboardHotkeyLatch {
         }
         if event.source != event_model::DeviceSource::Keyboard
             || event.code != event_model::PhysicalCode::key(9)
-            || !matches!(event.origin, event_model::EventOrigin::Hardware)
+            || matches!(event.origin, event_model::EventOrigin::TextInjection { .. })
         {
             return None;
         }
@@ -370,9 +370,9 @@ impl EventRuntime {
     }
 }
 
-/// Keep software keyboard input out of every physical-key state machine,
-/// including the clipboard hotkey latch. Returning Pass preserves the original
-/// CGEvent and its Unicode payload; no replacement event is needed.
+/// Keep known text-injection channels out of every physical-key state machine.
+/// Ordinary keycode streams (including Deskflow) keep their existing mappings.
+/// Returning Pass preserves the original CGEvent and its Unicode payload.
 #[cfg(target_os = "macos")]
 fn route_keyboard_input(
     raw: macos_adapter::EventTapEvent,
@@ -383,13 +383,13 @@ fn route_keyboard_input(
 ) -> Option<macos_adapter::EventTapAction> {
     use macos_adapter::{EventTapAction, KeyboardEventRoute};
     match raw.keyboard_route(marker)? {
-        KeyboardEventRoute::Hardware => None,
+        KeyboardEventRoute::Mappable => None,
         KeyboardEventRoute::OwnInjected => {
             diagnostics.record_seen();
             diagnostics.record_passed();
             Some(EventTapAction::Pass)
         }
-        KeyboardEventRoute::External => {
+        KeyboardEventRoute::TextInjection | KeyboardEventRoute::Unknown => {
             diagnostics.record_seen();
             diagnostics.record_passed();
             diagnostics.record_external_keyboard_passed();
@@ -645,20 +645,22 @@ impl RuntimeController {
         F: FnMut(&[OutputEvent], u64) -> Result<(), InjectionError>,
     {
         self.diagnostics.record_seen();
-        if let event_model::EventOrigin::Injected { marker } = event.origin {
+        if let Some(marker) = event.origin.injected_marker() {
             if self.adapter.should_filter_marker(marker) {
                 self.diagnostics.record_passed();
                 return Decision::Pass;
             }
-            if matches!(
+        }
+        if matches!(event.origin, event_model::EventOrigin::TextInjection { .. })
+            && matches!(
                 event.kind,
                 event_model::EventKind::Keyboard | event_model::EventKind::FlagsChanged
-            ) {
-                self.engine.interrupt_gestures();
-                self.diagnostics.record_external_keyboard_passed();
-                self.diagnostics.record_passed();
-                return Decision::Pass;
-            }
+            )
+        {
+            self.engine.interrupt_gestures();
+            self.diagnostics.record_external_keyboard_passed();
+            self.diagnostics.record_passed();
+            return Decision::Pass;
         }
         self.consume_external_keyboard_activity();
         if is_emergency_hotkey(event) {
@@ -1938,20 +1940,22 @@ mod tests {
     }
 
     #[test]
-    fn all_injected_keyboard_markers_bypass_rule_engine_without_injection() {
+    fn own_outputs_and_text_injection_bypass_mapping_without_injection() {
         let mut controller = controller_with_rule();
         controller.apply(RuntimeCommand::Enable).unwrap();
         let own = controller.adapter.own_marker();
-        let own_event = NormalizedEvent {
-            origin: event_model::EventOrigin::Injected { marker: own },
-            ..key()
-        };
-        assert_eq!(
-            controller.process_event(&own_event, |_| Err(InjectionError::Unavailable)),
-            Decision::Pass
-        );
+        for origin in [
+            EventOrigin::Injected { marker: own },
+            EventOrigin::TextInjection { marker: own },
+        ] {
+            let own_event = NormalizedEvent { origin, ..key() };
+            assert_eq!(
+                controller.process_event(&own_event, |_| panic!("own replay must bypass mapping")),
+                Decision::Pass
+            );
+        }
         let foreign_event = NormalizedEvent {
-            origin: event_model::EventOrigin::Injected {
+            origin: event_model::EventOrigin::TextInjection {
                 marker: own.wrapping_add(1),
             },
             ..key()
@@ -1962,7 +1966,7 @@ mod tests {
         );
         for _ in 0..4 {
             let unmarked = NormalizedEvent {
-                origin: EventOrigin::Injected { marker: 0 },
+                origin: EventOrigin::TextInjection { marker: 0 },
                 ..key()
             };
             assert_eq!(
@@ -1982,11 +1986,92 @@ mod tests {
             0
         );
         let snapshot = controller.diagnostics().snapshot();
-        assert_eq!(snapshot.events_seen, 6);
-        assert_eq!(snapshot.events_passed, 6);
+        assert_eq!(snapshot.events_seen, 7);
+        assert_eq!(snapshot.events_passed, 7);
         assert_eq!(snapshot.external_keyboard_events_passed, 5);
         assert_eq!(snapshot.events_injected, 0);
         assert_eq!(controller.status(), &RuntimeStatus::Running);
+    }
+
+    #[test]
+    fn ordinary_injected_keyboard_streams_keep_windows_copy_paste_undo_and_select_all() {
+        for origin in [
+            EventOrigin::Hardware,
+            EventOrigin::Injected { marker: 0 },
+            EventOrigin::Injected { marker: 77 },
+        ] {
+            let mut controller = RuntimeController::from_config(AppConfig::default()).unwrap();
+            controller.apply(RuntimeCommand::Enable).unwrap();
+            let mut delivered = Vec::new();
+            for (code, phase, modifiers, kind) in std::iter::once((
+                59,
+                EventPhase::Changed,
+                ModifierSet::LEFT_CONTROL,
+                EventKind::FlagsChanged,
+            ))
+            .chain([8, 9, 6, 0].into_iter().flat_map(|code| {
+                [
+                    (
+                        code,
+                        EventPhase::Down,
+                        ModifierSet::LEFT_CONTROL,
+                        EventKind::Keyboard,
+                    ),
+                    (
+                        code,
+                        EventPhase::Up,
+                        ModifierSet::LEFT_CONTROL,
+                        EventKind::Keyboard,
+                    ),
+                ]
+            }))
+            .chain(std::iter::once((
+                59,
+                EventPhase::Changed,
+                ModifierSet::NONE,
+                EventKind::FlagsChanged,
+            ))) {
+                let event = NormalizedEvent {
+                    origin,
+                    ..keyboard_event(code, phase, modifiers, kind)
+                };
+                let decision = controller.process_event(&event, |outputs| {
+                    delivered.extend_from_slice(outputs);
+                    Ok(())
+                });
+                assert_eq!(
+                    decision,
+                    if code == 59 {
+                        Decision::Pass
+                    } else {
+                        Decision::Suppress
+                    }
+                );
+            }
+            let expected: Vec<_> = [8, 9, 6, 0]
+                .into_iter()
+                .flat_map(|code| {
+                    [EventPhase::Down, EventPhase::Up].map(|phase| OutputEvent::Key {
+                        code: PhysicalCode::key(code),
+                        phase,
+                        modifiers: ModifierSet::LEFT_COMMAND,
+                    })
+                })
+                .collect();
+            assert_eq!(delivered, expected);
+            assert_eq!(
+                controller
+                    .diagnostics()
+                    .snapshot()
+                    .external_keyboard_events_passed,
+                0
+            );
+            assert_eq!(controller.status(), &RuntimeStatus::Running);
+            assert!(!controller
+                .engine
+                .state()
+                .physical_down(PhysicalCode::key(59)));
+        }
     }
 
     #[test]
@@ -1999,7 +2084,7 @@ mod tests {
         );
         for phase in [EventPhase::Down, EventPhase::Down, EventPhase::Up] {
             let remote = NormalizedEvent {
-                origin: EventOrigin::Injected { marker: 0 },
+                origin: EventOrigin::TextInjection { marker: 0 },
                 phase,
                 ..key()
             };
@@ -2062,7 +2147,7 @@ mod tests {
         for code in [0, 9, 53] {
             let remote = NormalizedEvent {
                 code: PhysicalCode::key(code),
-                origin: EventOrigin::Injected { marker: 0 },
+                origin: EventOrigin::TextInjection { marker: 0 },
                 modifiers: ModifierSet::LEFT_CONTROL
                     | ModifierSet::LEFT_OPTION
                     | ModifierSet::LEFT_COMMAND,
@@ -2122,7 +2207,7 @@ mod tests {
             Decision::Pass
         );
         let remote = NormalizedEvent {
-            origin: EventOrigin::Injected { marker: 0 },
+            origin: EventOrigin::TextInjection { marker: 0 },
             ..key()
         };
         assert_eq!(
@@ -2281,7 +2366,7 @@ mod tests {
     }
 
     #[test]
-    fn software_keyboard_cannot_activate_or_release_local_clipboard_hotkey_latch() {
+    fn text_injection_cannot_activate_or_release_local_clipboard_hotkey_latch() {
         let mut latch = ClipboardHotkeyLatch::default();
         let option = keyboard_event(
             58,
@@ -2297,7 +2382,7 @@ mod tests {
         };
         for marker in [0, 100] {
             let remote = NormalizedEvent {
-                origin: EventOrigin::Injected { marker },
+                origin: EventOrigin::TextInjection { marker },
                 ..v.clone()
             };
             assert_eq!(latch.handle(&remote), None);
@@ -2306,7 +2391,7 @@ mod tests {
         assert_eq!(latch.handle(&v), Some(ClipboardHotkeyAction::Show));
         let remote_up = NormalizedEvent {
             phase: EventPhase::Up,
-            origin: EventOrigin::Injected { marker: 0 },
+            origin: EventOrigin::TextInjection { marker: 0 },
             ..v.clone()
         };
         assert_eq!(latch.handle(&remote_up), None);
@@ -2449,6 +2534,15 @@ mod tests {
                 Self(raw)
             }
 
+            fn stroke(event_type: u32, code: u16, pid: i64, state: i64, flags: u64) -> Self {
+                let raw = Self::new(event_type, 0, pid, state, "");
+                unsafe {
+                    CGEventSetIntegerValueField(raw.0, 9, i64::from(code));
+                    CGEventSetFlags(raw.0, flags);
+                }
+                raw
+            }
+
             fn text(&self) -> Vec<u16> {
                 let mut text = [0; 128];
                 let mut length = 0;
@@ -2471,7 +2565,161 @@ mod tests {
         }
 
         #[test]
-        fn raw_software_keyboard_route_preserves_payload_and_local_binding() {
+        fn deskflow_keycode_paths_keep_windows_shortcuts_while_enigo_text_passes() {
+            // Metadata-shaped objects cover both the HID-like route and the
+            // positive-PID CGEvent fallback. This does not post an HID event.
+            for (pid, state) in [(0, 1), (4321, 0), (4321, 1)] {
+                let mut controller = RuntimeController::from_config(AppConfig::default()).unwrap();
+                controller.apply(RuntimeCommand::Enable).unwrap();
+                let own = controller.own_marker();
+                let diagnostics = controller.diagnostics();
+                let pending = Arc::clone(&controller.external_keyboard_pending);
+                let runtime = Mutex::new(controller);
+                let mut normalizer = macos_adapter::EventNormalizer::new(own);
+                let mut delivered = Vec::new();
+                let steps = std::iter::once((12, 59, 0x0004_0001))
+                    .chain(
+                        [8, 9, 6, 0]
+                            .into_iter()
+                            .flat_map(|code| [(10, code, 0x0004_0001), (11, code, 0x0004_0001)]),
+                    )
+                    .chain(std::iter::once((12, 59, 0)));
+                for (event_type, code, flags) in steps {
+                    let raw = Keyboard::stroke(event_type, code, pid, state, flags);
+                    let input = EventTapEvent::new(event_type, raw.0);
+                    assert_eq!(
+                        route_keyboard_input(input, own, &runtime, &diagnostics, &pending),
+                        None
+                    );
+                    let event = normalizer
+                        .normalize(input)
+                        .expect("Deskflow keycode stream must normalize");
+                    assert_eq!(event.origin, EventOrigin::Hardware);
+                    let decision = runtime.lock().unwrap().process_event(&event, |outputs| {
+                        delivered.extend_from_slice(outputs);
+                        Ok(())
+                    });
+                    assert_eq!(
+                        decision,
+                        if code == 59 {
+                            Decision::Pass
+                        } else {
+                            Decision::Suppress
+                        }
+                    );
+                    if event_type == 12 && flags != 0 {
+                        for text in ["a", "b", "中"] {
+                            let text_raw = Keyboard::new(10, 100, 9876, 0, text);
+                            assert_eq!(
+                                route_keyboard_input(
+                                    EventTapEvent::new(10, text_raw.0),
+                                    own,
+                                    &runtime,
+                                    &diagnostics,
+                                    &pending
+                                ),
+                                Some(EventTapAction::Pass)
+                            );
+                            assert_eq!(text_raw.text(), text.encode_utf16().collect::<Vec<_>>());
+                            let controller = runtime.lock().unwrap();
+                            assert!(controller
+                                .engine
+                                .state()
+                                .physical_down(PhysicalCode::key(59)));
+                            assert!(!controller
+                                .engine
+                                .state()
+                                .physical_down(PhysicalCode::key(0)));
+                        }
+                    }
+                }
+                let expected: Vec<_> = [8, 9, 6, 0]
+                    .into_iter()
+                    .flat_map(|code| {
+                        [EventPhase::Down, EventPhase::Up].map(|phase| OutputEvent::Key {
+                            code: PhysicalCode::key(code),
+                            phase,
+                            modifiers: ModifierSet::LEFT_COMMAND,
+                        })
+                    })
+                    .collect();
+                assert_eq!(delivered, expected);
+                assert_eq!(diagnostics.snapshot().external_keyboard_events_passed, 3);
+                assert_eq!(runtime.lock().unwrap().status(), &RuntimeStatus::Running);
+            }
+        }
+
+        #[test]
+        fn deskflow_fallback_keeps_alt_tab_modifier_mapping_and_clipboard_hotkey() {
+            let mut controller = RuntimeController::from_config(AppConfig::default()).unwrap();
+            controller.apply(RuntimeCommand::Enable).unwrap();
+            let own = controller.own_marker();
+            let mut normalizer = macos_adapter::EventNormalizer::new(own);
+            let mut delivered = Vec::new();
+            for (event_type, code, flags) in [
+                (12, 58, 0x0008_0020),
+                (10, 48, 0x0008_0020),
+                (11, 48, 0x0008_0020),
+                (12, 58, 0),
+            ] {
+                let raw = Keyboard::stroke(event_type, code, 4321, 0, flags);
+                let event = normalizer
+                    .normalize(EventTapEvent::new(event_type, raw.0))
+                    .unwrap();
+                assert_eq!(event.origin, EventOrigin::Hardware);
+                controller.process_event(&event, |outputs| {
+                    delivered.extend_from_slice(outputs);
+                    Ok(())
+                });
+            }
+            assert_eq!(
+                delivered,
+                vec![
+                    OutputEvent::Key {
+                        code: PhysicalCode::key(55),
+                        phase: EventPhase::Down,
+                        modifiers: ModifierSet::LEFT_WINDOWS
+                    },
+                    OutputEvent::Key {
+                        code: PhysicalCode::key(48),
+                        phase: EventPhase::Down,
+                        modifiers: ModifierSet::LEFT_WINDOWS
+                    },
+                    OutputEvent::Key {
+                        code: PhysicalCode::key(48),
+                        phase: EventPhase::Up,
+                        modifiers: ModifierSet::LEFT_WINDOWS
+                    },
+                    OutputEvent::Key {
+                        code: PhysicalCode::key(55),
+                        phase: EventPhase::Up,
+                        modifiers: ModifierSet::NONE
+                    },
+                ]
+            );
+            let mut latch = ClipboardHotkeyLatch::default();
+            for (event_type, code, expected) in [
+                (12, 58, None),
+                (10, 9, Some(ClipboardHotkeyAction::Show)),
+                (11, 9, Some(ClipboardHotkeyAction::Suppress)),
+            ] {
+                let raw = Keyboard::stroke(event_type, code, 4321, 0, 0x0008_0020);
+                let event = normalizer
+                    .normalize(EventTapEvent::new(event_type, raw.0))
+                    .unwrap();
+                assert_eq!(latch.handle(&event), expected);
+            }
+            assert_eq!(
+                controller
+                    .diagnostics()
+                    .snapshot()
+                    .external_keyboard_events_passed,
+                0
+            );
+        }
+
+        #[test]
+        fn raw_enigo_text_route_preserves_payload_and_local_binding() {
             let mut controller = controller_with_rule();
             controller.apply(RuntimeCommand::Enable).unwrap();
             controller.process_event(&key(), |_| Ok(()));
@@ -2479,14 +2727,14 @@ mod tests {
             let diagnostics = controller.diagnostics();
             let pending = Arc::clone(&controller.external_keyboard_pending);
             let runtime = Mutex::new(controller);
-            let foreign_marker = if own == 100 { 101 } else { 100 };
+            let foreign_marker = 100;
             let mut count = 0;
             for (marker, pid, state) in [
                 (foreign_marker, 4321, 0),
-                (0, 4321, 0),
-                (0, 4321, 1),
-                (0, 0, 0),
-                (0, -1, 1),
+                (foreign_marker, 4321, 1),
+                (foreign_marker, 0, 0),
+                (foreign_marker, 0, 1),
+                (foreign_marker, -1, 1),
             ] {
                 for event_type in [10, 11, 12] {
                     for text in ["a", "b", "中", "e\u{301}", "👨‍👩‍👧‍👦"] {
@@ -2636,7 +2884,7 @@ mod tests {
         }
 
         #[test]
-        fn raw_external_input_does_not_wait_for_busy_runtime_and_defers_gesture_cancellation() {
+        fn raw_text_input_does_not_wait_for_busy_runtime_and_defers_gesture_cancellation() {
             let mut controller = RuntimeController::from_config(AppConfig::default()).unwrap();
             controller.apply(RuntimeCommand::Enable).unwrap();
             let control = keyboard_event(
@@ -2658,7 +2906,7 @@ mod tests {
             let callback_pending = Arc::clone(&pending);
             let (tx, rx) = std::sync::mpsc::sync_channel(1);
             let thread = std::thread::spawn(move || {
-                let raw = Keyboard::new(10, 0, 4321, 0, "中文");
+                let raw = Keyboard::new(10, 100, 4321, 0, "中文");
                 let action = route_keyboard_input(
                     EventTapEvent::new(10, raw.0),
                     marker,
@@ -2697,7 +2945,7 @@ mod tests {
         }
 
         #[test]
-        fn raw_external_input_passes_even_when_runtime_lock_is_poisoned() {
+        fn raw_text_input_passes_even_when_runtime_lock_is_poisoned() {
             let controller = controller_with_rule();
             let marker = controller.own_marker();
             let diagnostics = controller.diagnostics();
@@ -2707,7 +2955,7 @@ mod tests {
                 let _guard = runtime.lock().unwrap();
                 panic!("poison test runtime");
             }));
-            let raw = Keyboard::new(10, 0, 4321, 0, "中文");
+            let raw = Keyboard::new(10, 100, 4321, 0, "中文");
             assert_eq!(
                 route_keyboard_input(
                     EventTapEvent::new(10, raw.0),

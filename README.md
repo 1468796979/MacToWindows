@@ -24,7 +24,7 @@ MacToWindows 是一个面向 Windows 用户的 macOS 全局键鼠语义层。工
 
 剪贴板保存失败时，当前内存记录仍可查看，服务会自动重试保存。关闭面板或成功粘贴不会清除尚未恢复的保存错误。“清空历史”沿用现有备份策略，不删除 `.bak` 文件。
 
-RustDesk 等软件键盘输入原样透传，常规物理键盘继续映射；来源识别边界、诊断计数及待执行验收见[软件键盘输入兼容性说明](docs/rustdesk-input-compatibility.md)。
+Deskflow、本地键盘及 RustDesk Map 等普通成对按键继续执行 Windows 映射；RustDesk 1.5.3 已确认的 Enigo marker 100 键盘通道原样透传。兼容边界、旁路计数及待执行验收见[输入兼容性说明](docs/rustdesk-input-compatibility.md)。
 
 ## 验证
 
