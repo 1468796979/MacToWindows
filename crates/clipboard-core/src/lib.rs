@@ -150,6 +150,10 @@ pub enum LoadOutcome {
         path: PathBuf,
     },
     RecoveredBackup(ClipboardHistory),
+    RecoveredRemoval {
+        history: ClipboardHistory,
+        pending: Option<io::Error>,
+    },
 }
 
 impl LoadOutcome {
@@ -157,9 +161,16 @@ impl LoadOutcome {
         match self {
             Self::Loaded(history)
             | Self::RecoveredBackup(history)
+            | Self::RecoveredRemoval { history, .. }
             | Self::RecoveredCorrupt { history, .. } => history,
         }
     }
+}
+
+#[derive(Debug)]
+pub enum RemovalOutcome {
+    Saved,
+    Pending(io::Error),
 }
 
 // Flatten the history so a manually restored backup remains a normal history file.
@@ -179,6 +190,10 @@ impl ClipboardStore {
 
     pub fn load_or_recover(path: impl AsRef<Path>) -> Result<LoadOutcome, StoreError> {
         let path = path.as_ref();
+        if let Some((history, data)) = read_removal(path)? {
+            let pending = finish_removal(path, &history, &data, &mut sync_directory).err();
+            return Ok(LoadOutcome::RecoveredRemoval { history, pending });
+        }
         let corrupt = match fs::read(path) {
             Ok(contents) => match decode_history(&contents) {
                 Ok(history) => return Ok(LoadOutcome::Loaded(history)),
@@ -238,37 +253,11 @@ impl ClipboardStore {
         path: impl AsRef<Path>,
         history: &ClipboardHistory,
     ) -> Result<(), StoreError> {
-        Self::save_with_backup(path.as_ref(), history, false)
-    }
-
-    pub fn save_after_removal(
-        path: impl AsRef<Path>,
-        history: &ClipboardHistory,
-    ) -> Result<(), StoreError> {
-        Self::save_with_backup(path.as_ref(), history, true)
-    }
-
-    fn save_with_backup(
-        path: &Path,
-        history: &ClipboardHistory,
-        removed: bool,
-    ) -> Result<(), StoreError> {
-        let previous = match fs::read(path) {
-            Ok(contents) => Some(decode_history(&contents)?),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(StoreError::Io(error)),
-        };
-        // An acknowledged clear or delete must remain in effect when only the backup survives.
-        let recovery_history = match &previous {
-            Some(previous) if !removed => previous,
-            _ => history,
-        };
-        let backup = RecoveryBackup {
-            recovery_version: RECOVERY_VERSION,
-            history: recovery_history,
-        };
+        let path = path.as_ref();
+        complete_previous_removal(path)?;
+        let previous = read_history(path)?;
+        let backup_data = encode_backup(previous.as_ref().unwrap_or(history))?;
         let data = serde_json::to_vec_pretty(history)?;
-        let backup_data = serde_json::to_vec_pretty(&backup)?;
         let staged = stage_file(path, &data)?;
         let result = (|| {
             write_atomic(&path.with_extension("bak"), &backup_data)?;
@@ -280,6 +269,80 @@ impl ClipboardStore {
         }
         Ok(result?)
     }
+
+    pub fn save_after_removal(
+        path: impl AsRef<Path>,
+        history: &ClipboardHistory,
+    ) -> Result<RemovalOutcome, StoreError> {
+        Self::save_removal(path.as_ref(), history, sync_directory)
+    }
+
+    fn save_removal(
+        path: &Path,
+        history: &ClipboardHistory,
+        mut sync: impl FnMut(&Path) -> io::Result<()>,
+    ) -> Result<RemovalOutcome, StoreError> {
+        complete_previous_removal(path)?;
+        read_history(path)?;
+        let data = serde_json::to_vec_pretty(history)?;
+        let pending = path.with_extension("removal");
+        let staged = stage_file(&pending, &data)?;
+        if let Err(error) = fs::rename(&staged, &pending) {
+            let _ = fs::remove_file(&staged);
+            return Err(error.into());
+        }
+        // Once published, the journal wins over either historical file.
+        // The directory sync must succeed before either file is replaced.
+        Ok(match finish_removal(path, history, &data, &mut sync) {
+            Ok(()) => RemovalOutcome::Saved,
+            Err(error) => RemovalOutcome::Pending(error),
+        })
+    }
+}
+
+fn read_history(path: &Path) -> Result<Option<ClipboardHistory>, StoreError> {
+    match fs::read(path) {
+        Ok(contents) => Ok(Some(decode_history(&contents)?)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn encode_backup(history: &ClipboardHistory) -> Result<Vec<u8>, serde_json::Error> {
+    serde_json::to_vec_pretty(&RecoveryBackup {
+        recovery_version: RECOVERY_VERSION,
+        history,
+    })
+}
+
+fn read_removal(path: &Path) -> Result<Option<(ClipboardHistory, Vec<u8>)>, StoreError> {
+    match fs::read(path.with_extension("removal")) {
+        Ok(data) => Ok(Some((decode_history(&data)?, data))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn complete_previous_removal(path: &Path) -> Result<(), StoreError> {
+    if let Some((history, data)) = read_removal(path)? {
+        finish_removal(path, &history, &data, &mut sync_directory)?;
+    }
+    Ok(())
+}
+
+fn finish_removal(
+    path: &Path,
+    history: &ClipboardHistory,
+    data: &[u8],
+    sync: &mut impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
+    let pending = path.with_extension("removal");
+    // A previous attempt may have published the record without syncing it.
+    sync(&pending)?;
+    write_atomic_with_sync(&path.with_extension("bak"), &encode_backup(history)?, sync)?;
+    write_atomic_with_sync(path, data, sync)?;
+    fs::remove_file(&pending)?;
+    sync(&pending)
 }
 
 fn decode_history(contents: &[u8]) -> Result<ClipboardHistory, StoreError> {
@@ -307,8 +370,16 @@ fn stage_file(path: &Path, data: &[u8]) -> io::Result<PathBuf> {
 }
 
 fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
+    write_atomic_with_sync(path, data, &mut sync_directory)
+}
+
+fn write_atomic_with_sync(
+    path: &Path,
+    data: &[u8],
+    sync: &mut impl FnMut(&Path) -> io::Result<()>,
+) -> io::Result<()> {
     let staged = stage_file(path, data)?;
-    let result = fs::rename(&staged, path).and_then(|_| sync_directory(path));
+    let result = fs::rename(&staged, path).and_then(|_| sync(path));
     if result.is_err() {
         let _ = fs::remove_file(&staged);
     }
@@ -345,6 +416,51 @@ mod tests {
             "mactowindows-clipboard-{name}-{}",
             std::process::id()
         ))
+    }
+
+    #[test]
+    fn removal_commit_is_recovered_at_each_directory_sync_boundary() {
+        use super::RemovalOutcome;
+        for fail_at in 1..=4 {
+            let path = temp_path(&format!("remove-sync-failure-{fail_at}.json"));
+            let mut original = ClipboardHistory::default();
+            original.ingest("old".into(), 1);
+            ClipboardStore::save_atomic(&path, &original).unwrap();
+            let mut removed = original.clone();
+            removed.clear();
+            let mut syncs = 0;
+            let result = ClipboardStore::save_removal(&path, &removed, |file| {
+                syncs += 1;
+                if syncs == fail_at {
+                    Err(std::io::Error::other("simulated directory sync failure"))
+                } else {
+                    super::sync_directory(file)
+                }
+            })
+            .unwrap();
+            assert!(matches!(result, RemovalOutcome::Pending(_)));
+            if fail_at == 1 {
+                assert_eq!(super::read_history(&path).unwrap(), Some(original));
+            }
+            if fail_at == 2 {
+                fs::write(&path, "damaged current history").unwrap();
+            }
+            assert_eq!(
+                ClipboardStore::load_or_recover(&path).unwrap().history(),
+                removed
+            );
+            assert!(!path.with_extension("removal").exists());
+            let mut later = removed.clone();
+            later.ingest("new".into(), 2);
+            ClipboardStore::save_atomic(&path, &later).unwrap();
+            fs::remove_file(&path).unwrap();
+            assert_eq!(
+                ClipboardStore::load_or_recover(&path).unwrap().history(),
+                removed
+            );
+            fs::remove_file(&path).unwrap();
+            fs::remove_file(path.with_extension("bak")).unwrap();
+        }
     }
 
     #[test]

@@ -24,11 +24,15 @@ MacToWindows 是一个面向 Windows 用户的 macOS 全局键鼠语义层。工
 
 启用 Windows 模式后，内置预设会把 Ctrl+S 转成 Command+S，适用于 VS Code 等应用。左 Ctrl、右 Ctrl 和两侧同时按住均可触发。保存规则使用 `exact_chord:`（如 `exact_chord:left_control+key:1`），只有修饰键完全匹配才会转换。Ctrl+Shift+S 等其他组合沿用原有行为。升级时会为采用内置快捷键且没有自定义覆盖的旧预设补齐此规则。首次写回时，`config.toml.bak` 保留升级前的配置。后续保存会轮换备份，计划回退到不支持 `exact_chord:` 的版本时请另存一份升级前的配置。
 
+内置预设中的左 Ctrl+Shift+Z 和左 Ctrl+Shift+V 分别输出 Command+Shift+Z 和 Command+Shift+V。可用 `modified:left_command|left_shift+key:6` 配置带修饰键的输出。
+
 设置页显示规则优先级以及相同触发条件下的覆盖关系。可以在添加规则时指定优先级，也可以从规则列表修改已保存的优先级。
 
 鼠标映射支持按钮、释放和拖动；滚轮反转保留原事件精度及惯性信息。`shortcut:show_desktop` 使用设置页中配置的系统输出快捷键，默认 `key:103`（F11），需与 macOS 的“显示桌面”绑定一致。锁屏和关闭窗口分别使用 Control+Command+Q、Command+W。
 
-剪贴板保存失败时，当前内存记录仍可查看，服务会自动重试保存。关闭面板或成功粘贴不会清除尚未恢复的保存错误。清空历史和删除条目会同步更新可自动恢复的 `.bak` 备份。主文件损坏或缺失时，应用会恢复带新版恢复标记的有效备份。缺少该标记的旧备份会保存在 `clipboard-history.manual-recovery` 中，面板会提示该位置。确认备份内容后，可退出应用并在保留当前文件的前提下，将需要恢复的备份复制为 `clipboard-history.json`。
+设置页的“滚轮方向”可选跟随系统、自然和非自然，在 Windows 模式启用时生效。逐轴滚轮规则优先。旧配置升级后默认跟随系统。使用 TOML 显式配置时，在 `[mouse]` 中同时设置 `scroll_mode_initialized = true` 和对应的 `scroll_mode` 值（`system`、`natural` 或 `non_natural`）。
+
+剪贴板保存失败时，当前内存记录仍可查看，服务会自动重试保存。关闭面板或成功粘贴不会清除尚未恢复的保存错误。清空历史和删除条目会同步更新可自动恢复的 `.bak` 备份。若更新中断，应用会优先恢复已提交的 `.removal` 记录，再同步主文件和备份。主文件损坏或缺失时，应用会恢复带新版恢复标记的有效备份。缺少该标记的旧备份会保存在 `clipboard-history.manual-recovery` 中，面板会提示该位置。确认备份内容后，可退出应用并在保留当前文件的前提下，将需要恢复的备份复制为 `clipboard-history.json`。
 
 ## 软件输入透传
 

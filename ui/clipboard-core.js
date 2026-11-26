@@ -7,6 +7,8 @@
     return {
       entries: Array.isArray(snapshot?.entries) ? snapshot.entries : [],
       panelOpen: Boolean(snapshot?.panel_open ?? snapshot?.panelOpen),
+      panelSession: snapshot?.panel_session ?? 0,
+      revision: snapshot?.revision ?? 0,
       lastError: snapshot?.last_error ?? snapshot?.lastError ?? null,
       operationError: snapshot?.operation_error ?? snapshot?.operationError ?? null,
     };

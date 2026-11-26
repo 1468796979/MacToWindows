@@ -555,6 +555,19 @@ impl RuleEngine {
         self.handle_with_policy(event, KeyboardMappingPolicy::Full)
     }
 
+    /// A rejected one-shot action posted no output. Keep the original press
+    /// and its remaining events together even if the configuration changes.
+    pub fn pass_rejected_shortcut(&mut self, event: &NormalizedEvent) -> bool {
+        if effective_phase(event) != EventPhase::Down {
+            return false;
+        }
+        self.pass_event(event);
+        if let Some(binding) = self.state.bindings.get_mut(&event.code) {
+            binding.raw_passthrough = true;
+        }
+        true
+    }
+
     /// Report whether the source keeps its native target, even when its flags
     /// need rewriting. A held source keeps this identity until release.
     pub fn handle_with_binding(
@@ -624,6 +637,15 @@ impl RuleEngine {
         &mut self,
         event: &NormalizedEvent,
         policy: KeyboardMappingPolicy,
+    ) -> event_model::Decision {
+        self.handle_with_scroll_default(event, policy, false)
+    }
+
+    pub fn handle_with_scroll_default(
+        &mut self,
+        event: &NormalizedEvent,
+        policy: KeyboardMappingPolicy,
+        invert_unmapped_scroll: bool,
     ) -> event_model::Decision {
         if matches!(event.kind, EventKind::Keyboard | EventKind::FlagsChanged)
             && matches!(event.origin, event_model::EventOrigin::TextInjection { .. })
@@ -838,7 +860,7 @@ impl RuleEngine {
             return event_model::Decision::Pass;
         }
         if event.kind == EventKind::Scroll {
-            return self.handle_scroll(event);
+            return self.handle_scroll(event, invert_unmapped_scroll);
         }
         let rule = self
             .rules
@@ -908,7 +930,7 @@ impl RuleEngine {
         }
     }
 
-    fn handle_scroll(&self, event: &NormalizedEvent) -> Decision {
+    fn handle_scroll(&self, event: &NormalizedEvent, invert_unmapped_scroll: bool) -> Decision {
         use ScrollAxisTransform::{Invert, Keep, Remove};
 
         let moved = |axis| match &event.scroll {
@@ -938,6 +960,7 @@ impl RuleEngine {
                     Remove
                 }
                 Some(Action::InvertScroll) => Invert,
+                None if invert_unmapped_scroll => Invert,
                 Some(Action::Pass) | None => Keep,
             };
             has_native_axis |= transform != Remove;
@@ -1236,7 +1259,10 @@ fn repeat_outputs(outputs: &[OutputEvent]) -> Vec<OutputEvent> {
                 phase: EventPhase::Repeat,
                 modifiers: *modifiers,
             }),
-            OutputEvent::MouseButton { .. } => None,
+            OutputEvent::SystemShortcut(event_model::SystemShortcut::SwitchApplication) => {
+                Some(output.clone())
+            }
+            OutputEvent::MouseButton { .. } | OutputEvent::SystemShortcut(_) => None,
             other => Some(other.clone()),
         })
         .collect()
@@ -1445,6 +1471,77 @@ mod tests {
                 invert_y: true,
             }])
         );
+        let pass_vertical = Rule {
+            id: "vertical-pass".into(),
+            enabled: true,
+            priority: 1,
+            scope: RuleScope::Global,
+            trigger: Trigger::Scroll {
+                axis: ScrollAxis::Vertical,
+            },
+            action: Action::Pass,
+        };
+        let mut engine = RuleEngine::new(CompiledRules::compile(vec![pass_vertical]).unwrap());
+        assert_eq!(
+            engine.handle_with_scroll_default(&event, KeyboardMappingPolicy::Full, true),
+            Decision::Emit(vec![OutputEvent::ScrollTransform {
+                invert_x: true,
+                invert_y: false
+            }])
+        );
+        assert_eq!(engine.handle(&event), Decision::Pass);
+    }
+
+    #[test]
+    fn display_desktop_is_one_action_until_the_source_key_is_released() {
+        use event_model::SystemShortcut;
+        let mut rule = replacement("show-desktop", 96, 1, 1);
+        rule.action = Action::Replace(vec![OutputEvent::SystemShortcut(
+            SystemShortcut::ShowDesktop,
+        )]);
+        let mut engine = RuleEngine::new(CompiledRules::compile(vec![rule]).unwrap());
+        let run = Decision::Emit(vec![OutputEvent::SystemShortcut(
+            SystemShortcut::ShowDesktop,
+        )]);
+        assert_eq!(engine.handle(&key(96, EventPhase::Down)), run);
+        for phase in [EventPhase::Repeat, EventPhase::Repeat, EventPhase::Up] {
+            assert_eq!(engine.handle(&key(96, phase)), Decision::Suppress);
+        }
+        assert_eq!(engine.handle(&key(96, EventPhase::Down)), run);
+    }
+
+    #[test]
+    fn modifier_can_be_the_main_key_of_a_chord_in_both_input_paths() {
+        let control = ModifierSet::LEFT_CONTROL;
+        let shift = ModifierSet::LEFT_SHIFT;
+        let mut rule = replacement("modifier-main-key", 56, 11, 1);
+        rule.trigger = Trigger::Key {
+            code: PhysicalCode::key(56),
+            modifiers: ModifierMatcher {
+                required: control | shift,
+                exact: true,
+            },
+            phase: EventPhase::Down,
+        };
+        let rules = CompiledRules::compile(vec![rule]).unwrap();
+        for normalized_phases in [false, true] {
+            let mut engine = RuleEngine::new(rules.clone());
+            let mut event = modifier(59, control, 1);
+            if normalized_phases {
+                event.phase = EventPhase::Down;
+            }
+            engine.handle(&event);
+            event.code = PhysicalCode::key(56);
+            event.modifiers = control | shift;
+            assert!(matches!(engine.handle(&event), Decision::Emit(outputs)
+                if matches!(outputs.as_slice(), [OutputEvent::Key { code: PhysicalCode::Key(11), phase: EventPhase::Down, .. }])));
+            event.modifiers = control;
+            if normalized_phases {
+                event.phase = EventPhase::Up;
+            }
+            assert!(matches!(engine.handle(&event), Decision::Emit(outputs)
+                if matches!(outputs.as_slice(), [OutputEvent::Key { code: PhysicalCode::Key(11), phase: EventPhase::Up, .. }])));
+        }
     }
 
     #[test]

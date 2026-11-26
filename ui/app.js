@@ -111,7 +111,7 @@ function renderStatus() {
 
 function renderSettings() {
   const busy = state.writesPending > 0 || !state.snapshot;
-  for (const id of ["toggle-mode", "profile-select", "add-rule", "import-config", "export-config", "permission-button", "show-desktop-save", "rule-submit", "software-input-passthrough"]) {
+  for (const id of ["toggle-mode", "profile-select", "add-rule", "import-config", "export-config", "permission-button", "show-desktop-save", "rule-submit", "software-input-passthrough", "scroll-mode"]) {
     $(id).disabled = busy;
   }
   const select = $("profile-select");
@@ -124,6 +124,7 @@ function renderSettings() {
     select.append(option);
   }
   select.value = state.snapshot?.active_profile || "";
+  $("scroll-mode").value = state.snapshot?.scroll_mode || "system";
   if (state.desktopDraftVersion === state.savedDesktopDraftVersion) {
     $("show-desktop-shortcut").value = state.snapshot?.show_desktop_shortcut || "";
   }
@@ -203,6 +204,10 @@ $("toggle-mode").addEventListener("click", () => runtimeMutation("toggle_mode").
 $("profile-select").addEventListener("change", (event) => {
   const profile = event.target.value;
   mutateSettings("set_profile", () => ({ profile })).catch(() => {});
+});
+$("scroll-mode").addEventListener("change", (event) => {
+  const mode = event.target.value;
+  mutateSettings("set_scroll_mode", () => ({ mode })).catch(() => {});
 });
 $("software-input-passthrough").addEventListener("click", () => {
   if (!state.snapshot || state.writesPending > 0) return;

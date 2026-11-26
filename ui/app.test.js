@@ -84,6 +84,23 @@ async function appUi({ initial = snapshot(), invoke, connected = true } = {}) {
 
 const toggleFor = (ui, index = 0) => ui.get("rules").children[index].children[2];
 
+test("scroll direction follows the system until a new mode is saved", async () => {
+  const ui = await appUi({ invoke(command, args) {
+    if (command === "settings_snapshot") return snapshot(3);
+    assert.equal(command, "set_scroll_mode");
+    assert.equal(args.mode, "non_natural");
+    assert.equal(args.expectedRevision, 3);
+    return snapshot(4, { scroll_mode: args.mode });
+  } });
+  const select = ui.get("scroll-mode");
+  assert.equal(select.value, "system");
+  select.value = "non_natural";
+  await select.fire("change");
+  await ui.idle();
+  assert.equal(select.value, "non_natural");
+  assert.equal(ui.current().runtime.status, "Disabled");
+});
+
 test("software passthrough renders the confirmed policy and defaults on for an older snapshot", async () => {
   const old = snapshot(); delete old.software_input_passthrough;
   const legacyUi = await appUi({ initial: old });

@@ -1392,19 +1392,26 @@ impl RuntimeController {
                 });
                 pass_after_effects = true;
             }
-            if let Err(error) = self.dispatch_outputs_for(
+            match self.dispatch_outputs_for(
                 stream,
                 owner,
                 &effects,
                 session.engine.modifiers_for_event(event),
                 &mut inject,
             ) {
-                session.engine.restore(checkpoint);
-                session.switcher = switch_checkpoint;
-                self.software.insert(id, session);
-                self.degrade_with(format!("软件快捷键处理失败：{error}"), &mut inject);
-                self.diagnostics.record_passed();
-                return self.software_fallback(id, event);
+                Ok(rejected) => {
+                    pass_after_effects |= rejected
+                        && super::clipboard_only(&effects)
+                        && session.engine.pass_rejected_shortcut(event);
+                }
+                Err(error) => {
+                    session.engine.restore(checkpoint);
+                    session.switcher = switch_checkpoint;
+                    self.software.insert(id, session);
+                    self.degrade_with(format!("软件快捷键处理失败：{error}"), &mut inject);
+                    self.diagnostics.record_passed();
+                    return self.software_fallback(id, event);
+                }
             }
             decision = if pass_after_effects {
                 Decision::Pass

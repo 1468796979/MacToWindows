@@ -372,6 +372,29 @@ impl EventTapEvent {
         }
     }
 
+    /// Read the inversion applied by macOS to this scroll-wheel event.
+    ///
+    /// # Safety
+    /// The native event must remain alive for the duration of this call.
+    #[cfg(target_os = "macos")]
+    pub unsafe fn scroll_inverted_from_device(self) -> Option<bool> {
+        use objc2_app_kit::{NSEvent, NSEventType};
+
+        if self.event_type != 22 {
+            return None;
+        }
+        let event = unsafe {
+            self.raw_event
+                .cast::<objc2_core_graphics::CGEvent>()
+                .as_ref()
+        }?;
+        objc2::rc::autoreleasepool(|_| {
+            let scroll = NSEvent::eventWithCGEvent(event)?;
+            (scroll.r#type() == NSEventType::ScrollWheel)
+                .then(|| scroll.isDirectionInvertedFromDevice())
+        })
+    }
+
     /// Classify keyboard events without modifying or decoding their contents.
     /// A valid unmarked software event remains eligible for legacy mapping;
     /// null handles and unsupported platforms are explicitly unknown.
@@ -1289,7 +1312,7 @@ pub mod platform {
     where
         F: Fn(u16) -> bool,
     {
-        use event_model::{EventKind, EventOrigin, ModifierSet, PhysicalCode};
+        use event_model::EventOrigin;
         let mut event = normalize_event(input)?;
         if let Some(marker) = event.origin.injected_marker() {
             if super::is_own_marker(marker, own_marker) {
@@ -1326,25 +1349,9 @@ pub mod platform {
             }
         }
         *state = complete;
-        event.modifiers = if event.kind == EventKind::FlagsChanged {
-            if let PhysicalCode::Key(code) = event.code {
-                MODIFIER_KEYS
-                    .iter()
-                    .find(|(_, _, key, _)| *key == code)
-                    .map(|(_, _, _, modifier)| {
-                        if complete.contains(*modifier) {
-                            *modifier
-                        } else {
-                            ModifierSet::NONE
-                        }
-                    })
-                    .unwrap_or(complete)
-            } else {
-                complete
-            }
-        } else {
-            complete
-        };
+        // The current side is identified by the key code. The full snapshot
+        // is needed when matching an ordinary or exact chord on a modifier.
+        event.modifiers = complete;
         Some(event)
     }
 
@@ -2123,9 +2130,9 @@ pub mod platform {
                         (
                             second_code,
                             aggregate | first_bit | second_bit,
-                            second_modifier,
+                            first_modifier | second_modifier,
                         ),
-                        (first_code, aggregate | second_bit, M::NONE),
+                        (first_code, aggregate | second_bit, second_modifier),
                         (second_code, 0, M::NONE),
                     ] {
                         let raw = keyboard_raw(code, flags);

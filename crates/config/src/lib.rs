@@ -86,18 +86,47 @@ pub type DeviceRule = Rule;
 pub struct MouseConfig {
     #[serde(default = "default_scroll_mode")]
     pub scroll_mode: String,
+    #[serde(default)]
+    scroll_mode_initialized: bool,
 }
 
 impl Default for MouseConfig {
     fn default() -> Self {
         Self {
             scroll_mode: default_scroll_mode(),
+            scroll_mode_initialized: true,
         }
     }
 }
 
 fn default_scroll_mode() -> String {
-    "non_natural".into()
+    "system".into()
+}
+
+impl MouseConfig {
+    fn valid_mode(&self) -> bool {
+        matches!(
+            self.scroll_mode.as_str(),
+            "system" | "natural" | "non_natural"
+        )
+    }
+
+    fn migrate_scroll_mode(&mut self) -> bool {
+        if self.scroll_mode_initialized && self.valid_mode() {
+            return false;
+        }
+        self.scroll_mode = default_scroll_mode();
+        self.scroll_mode_initialized = true;
+        true
+    }
+
+    pub fn desired_scroll_inversion(&self) -> Option<bool> {
+        match self.scroll_mode.as_str() {
+            "natural" => Some(true),
+            "non_natural" => Some(false),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -225,6 +254,11 @@ impl AppConfig {
         if !self.profiles.contains_key(&self.active_profile) {
             return Err(ConfigError::UnknownProfile(self.active_profile.clone()));
         }
+        if !self.mouse.valid_mode() {
+            return Err(ConfigError::InvalidRule(
+                "mouse.scroll_mode must be system, natural, or non_natural".into(),
+            ));
+        }
         for (category, rules) in [
             ("keyboard_rules", &self.keyboard_rules),
             ("mouse_rules", &self.mouse_rules),
@@ -326,6 +360,77 @@ impl AppConfig {
         true
     }
 
+    pub fn upgrade_default_edit_shortcuts(&mut self) -> bool {
+        let mut upgraded = false;
+        for id in BUILT_IN_PROFILE_IDS {
+            let Some(profile) = self.profiles.get_mut(id) else {
+                continue;
+            };
+            for (trigger, action) in LEGACY_STOCK_EDIT_SHORTCUTS {
+                let key = trigger.strip_prefix("chord:left_control+").unwrap();
+                if !matches!(key, "key:6" | "key:9") {
+                    continue;
+                }
+                let name = format!("{trigger} → {action}");
+                let Some(index) = profile.keyboard_rules.iter().position(|rule| {
+                    rule.name == name && rule.trigger == trigger && rule.action == action
+                }) else {
+                    continue;
+                };
+                let exact = format!("exact_chord:left_control+{key}");
+                let original_id = profile.keyboard_rules[index].id.clone();
+                let explicit_override = |trigger: &str| {
+                    let Some(Trigger::Key {
+                        code,
+                        modifiers,
+                        phase,
+                    }) = parse_trigger(trigger)
+                    else {
+                        return false;
+                    };
+                    global_profile_rules(profile).any(|rule| {
+                        rule.id != original_id
+                            && parse_trigger(&rule.trigger).is_some_and(|existing| {
+                                !matches!(&existing, Trigger::Key { modifiers, .. } if modifiers.required == ModifierSet::NONE)
+                                    && matches_key_input(&existing, code, modifiers.required, phase)
+                            })
+                    })
+                };
+                let original = &profile.keyboard_rules[index];
+                let exact_trigger = parse_trigger(&exact);
+                let plain_conflict = global_profile_rules(profile).any(|rule| {
+                    rule.enabled
+                        && rule.id != original_id
+                        && rule.priority == original.priority
+                        && parse_trigger(&rule.trigger) == exact_trigger
+                        && parse_action(&rule.action) != parse_action(action)
+                });
+                let mut variants = Vec::new();
+                for shift in ["left_shift", "right_shift", "left_shift|right_shift"] {
+                    let trigger = format!("exact_chord:left_control|{shift}+{key}");
+                    if !explicit_override(&trigger) {
+                        let action = format!("modified:left_command|{shift}+{key}");
+                        variants.push(Rule {
+                            name: format!("{trigger} → {action}"),
+                            trigger,
+                            action,
+                            priority: original.priority,
+                            enabled: original.enabled,
+                            ..Rule::default()
+                        });
+                    }
+                }
+                let original = &mut profile.keyboard_rules[index];
+                original.trigger = exact;
+                original.name = format!("{} → {}", original.trigger, original.action);
+                original.enabled &= !plain_conflict;
+                profile.keyboard_rules.extend(variants);
+                upgraded = true;
+            }
+        }
+        upgraded
+    }
+
     pub fn show_desktop_output(&self) -> Result<Vec<OutputEvent>, ConfigError> {
         let (key, modifiers) = match parse_trigger(&self.system_shortcuts.show_desktop) {
             Some(Trigger::Key {
@@ -403,11 +508,16 @@ fn global_profile_rules(profile: &Profile) -> impl Iterator<Item = &Rule> {
 
 fn has_legacy_stock_keyboard_rules(profile: &Profile) -> bool {
     let contains_rule = |(trigger, action): (&str, &str), enabled_only: bool| {
+        let exact = trigger
+            .strip_prefix("chord:")
+            .map(|chord| format!("exact_chord:{chord}"));
         let trigger = parse_trigger(trigger);
+        let exact = exact.as_deref().and_then(parse_trigger);
         let action = parse_action(action);
         global_profile_rules(profile).any(|rule| {
             (!enabled_only || rule.enabled)
-                && parse_trigger(&rule.trigger) == trigger
+                && (parse_trigger(&rule.trigger) == trigger
+                    || exact.is_some() && parse_trigger(&rule.trigger) == exact)
                 && parse_action(&rule.action) == action
         })
     };
@@ -636,6 +746,14 @@ fn parse_action(value: &str) -> Option<Action> {
     if value == "invert_scroll" {
         return Some(Action::InvertScroll);
     }
+    if let Some(chord) = value.strip_prefix("modified:") {
+        let (modifiers, key) = chord.split_once('+')?;
+        return Some(Action::Replace(vec![OutputEvent::Key {
+            code: parse_code(key)?,
+            phase: EventPhase::Down,
+            modifiers: parse_modifiers(modifiers)?,
+        }]));
+    }
     if let Some(key) = value.strip_prefix("command:") {
         return Some(Action::Replace(vec![OutputEvent::Key {
             code: parse_code(key)?,
@@ -857,7 +975,7 @@ pub fn default_config() -> AppConfig {
         }
         profiles.insert(id.into(), independent);
     }
-    AppConfig {
+    let mut config = AppConfig {
         schema_version: CURRENT_SCHEMA_VERSION,
         active_profile: "windows_physical".into(),
         enabled: false,
@@ -872,19 +990,24 @@ pub fn default_config() -> AppConfig {
         app_rules: Vec::new(),
         device_rules: Vec::new(),
         profiles,
-    }
+    };
+    config.upgrade_default_edit_shortcuts();
+    config
 }
 
 pub fn import_toml(input: &str) -> Result<AppConfig, ConfigError> {
-    let config = parse_toml(input)?;
+    let mut config = parse_toml(input)?;
     config.validate()?;
+    config.mouse.migrate_scroll_mode();
     Ok(config)
 }
 
 /// Load saved settings from releases that accepted scroll reversal on a key
 /// or button. Preserve those entries for editing without enabling them.
-pub fn import_saved_toml(input: &str) -> Result<(AppConfig, Vec<String>), ConfigError> {
+pub fn import_saved_toml(input: &str) -> Result<(AppConfig, bool, Vec<String>), ConfigError> {
     let mut config = parse_toml(input)?;
+    let invalid_scroll_mode = !config.mouse.valid_mode();
+    let upgraded_scroll = config.mouse.migrate_scroll_mode();
     let mut disabled = Vec::new();
     for (profile_id, profile) in &mut config.profiles {
         for (category, rules) in [
@@ -913,7 +1036,17 @@ pub fn import_saved_toml(input: &str) -> Result<(AppConfig, Vec<String>), Config
         }
     }
     config.validate()?;
-    Ok((config, disabled))
+    let mut warnings = Vec::new();
+    if !disabled.is_empty() {
+        warnings.push(format!(
+            "已停用触发键无效的滚轮反转规则（{}）",
+            disabled.join("、")
+        ));
+    }
+    if invalid_scroll_mode {
+        warnings.push("mouse.scroll_mode 无效，滚动方向已恢复为跟随系统".into());
+    }
+    Ok((config, upgraded_scroll, warnings))
 }
 
 fn parse_toml(input: &str) -> Result<AppConfig, ConfigError> {
@@ -1179,14 +1312,89 @@ mod tests {
             config.panic_hotkey,
             vec!["left_control", "left_option", "left_command", "escape"]
         );
-        assert_eq!(config.mouse.scroll_mode, "non_natural");
+        assert_eq!(config.mouse.scroll_mode, "system");
     }
 
     #[test]
     fn active_profile_compiles_to_rule_snapshot() {
         let config = default_config();
         let compiled = config.compile_active_profile().unwrap();
-        assert_eq!(compiled.rules().len(), 18);
+        assert_eq!(compiled.rules().len(), 24);
+    }
+
+    #[test]
+    fn edit_upgrade_keeps_stock_identity_and_respects_shift_override() {
+        let mut config = default_config();
+        let profile = config.profiles.get_mut("custom").unwrap();
+        profile
+            .keyboard_rules
+            .retain(|rule| !rule.action.starts_with("modified:"));
+        let old = profile
+            .keyboard_rules
+            .iter_mut()
+            .find(|rule| rule.trigger == "exact_chord:left_control+key:6")
+            .unwrap();
+        old.trigger = "chord:left_control+key:6".into();
+        old.name = "chord:left_control+key:6 → command:key:6".into();
+        old.priority = 198;
+        let id = old.id.clone();
+        let override_rule = Rule {
+            trigger: "chord:left_control|right_shift+key:6".into(),
+            action: "suppress".into(),
+            ..Rule::default()
+        };
+        profile.keyboard_rules.push(override_rule.clone());
+        assert!(config.upgrade_default_edit_shortcuts());
+        assert!(!config.upgrade_default_edit_shortcuts());
+        config.validate().unwrap();
+        let rules = &config.profiles["custom"].keyboard_rules;
+        assert!(rules.contains(&override_rule));
+        let migrated = rules.iter().find(|rule| rule.id == id).unwrap();
+        assert_eq!(migrated.trigger, "exact_chord:left_control+key:6");
+        assert_eq!(migrated.priority, 198);
+        assert!(rules
+            .iter()
+            .any(|rule| rule.action == "modified:left_command|left_shift+key:6"));
+        assert!(!rules
+            .iter()
+            .any(|rule| rule.action == "modified:left_command|right_shift+key:6"));
+    }
+
+    #[test]
+    fn old_scroll_configuration_follows_system_and_explicit_modes_round_trip() {
+        let mut config = default_config();
+        config.mouse.scroll_mode = "non_natural".into();
+        let old = export_toml(&config)
+            .unwrap()
+            .replace("scroll_mode_initialized = true\n", "");
+        let (upgraded, changed, warnings) = import_saved_toml(&old).unwrap();
+        assert!(changed && warnings.is_empty());
+        assert_eq!(upgraded.mouse.desired_scroll_inversion(), None);
+        assert_eq!(upgraded.profiles, config.profiles);
+        assert_eq!(import_toml(&old).unwrap(), upgraded);
+        for (mode, inversion) in [("natural", true), ("non_natural", false)] {
+            config.mouse.scroll_mode = mode.into();
+            let saved = export_toml(&config).unwrap();
+            assert_eq!(
+                import_toml(&saved)
+                    .unwrap()
+                    .mouse
+                    .desired_scroll_inversion(),
+                Some(inversion)
+            );
+            let invalid = saved.replace(
+                &format!("scroll_mode = \"{mode}\""),
+                "scroll_mode = \"invalid\"",
+            );
+            assert!(import_toml(&invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("mouse.scroll_mode"));
+            let (recovered, changed, warnings) = import_saved_toml(&invalid).unwrap();
+            assert!(changed && !warnings.is_empty());
+            assert_eq!(recovered.mouse.desired_scroll_inversion(), None);
+            assert_eq!(recovered.profiles, config.profiles);
+        }
     }
 
     #[test]
@@ -1663,7 +1871,7 @@ mod tests {
                 action: "key:13".into(),
                 ..Rule::default()
             });
-        assert_eq!(config.compile_active_profile().unwrap().rules().len(), 19);
+        assert_eq!(config.compile_active_profile().unwrap().rules().len(), 25);
         assert_eq!(config.profiles["windows_physical"], original_windows);
         let windows_ids: HashSet<_> = original_windows
             .keyboard_rules

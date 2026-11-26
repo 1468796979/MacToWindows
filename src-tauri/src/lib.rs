@@ -111,14 +111,13 @@ impl ClipboardHotkeyLatch {
                     .modifiers
                     .contains(event_model::ModifierSet::RIGHT_OPTION)
         };
+        let extra_modifiers =
+            event.modifiers.bits() & !event_model::ModifierSet::LEFT_OPTION.bits();
         match event.phase {
-            event_model::EventPhase::Down if left_option_active => {
-                if self.active {
-                    Some(ClipboardHotkeyAction::Suppress)
-                } else {
-                    self.active = true;
-                    Some(ClipboardHotkeyAction::Show)
-                }
+            event_model::EventPhase::Down if self.active => Some(ClipboardHotkeyAction::Suppress),
+            event_model::EventPhase::Down if left_option_active && extra_modifiers == 0 => {
+                self.active = true;
+                Some(ClipboardHotkeyAction::Show)
             }
             event_model::EventPhase::Repeat if self.active => Some(ClipboardHotkeyAction::Suppress),
             event_model::EventPhase::Up if self.active => {
@@ -175,10 +174,20 @@ impl NativeKeyboardKeys {
         let phase = match (event.kind, event.phase) {
             (EventKind::FlagsChanged, EventPhase::Changed) => match event.code {
                 PhysicalCode::Key(54..=56 | 58..=62) => {
-                    if event.modifiers == ModifierSet::NONE {
-                        EventPhase::Up
-                    } else {
+                    let side = match event.code {
+                        PhysicalCode::Key(54) => ModifierSet::RIGHT_COMMAND,
+                        PhysicalCode::Key(55) => ModifierSet::LEFT_COMMAND,
+                        PhysicalCode::Key(56) => ModifierSet::LEFT_SHIFT,
+                        PhysicalCode::Key(58) => ModifierSet::LEFT_OPTION,
+                        PhysicalCode::Key(59) => ModifierSet::LEFT_CONTROL,
+                        PhysicalCode::Key(60) => ModifierSet::RIGHT_SHIFT,
+                        PhysicalCode::Key(61) => ModifierSet::RIGHT_OPTION,
+                        _ => ModifierSet::RIGHT_CONTROL,
+                    };
+                    if event.modifiers.contains(side) {
                         EventPhase::Down
+                    } else {
+                        EventPhase::Up
                     }
                 }
                 _ => return bypass && !already_bound,
@@ -1040,7 +1049,19 @@ impl RuntimeController {
         self.process_event_marked(event, |outputs, _marker| inject(outputs))
     }
 
-    pub fn process_event_marked<F>(&mut self, event: &NormalizedEvent, mut inject: F) -> Decision
+    pub fn process_event_marked<F>(&mut self, event: &NormalizedEvent, inject: F) -> Decision
+    where
+        F: FnMut(&[OutputEvent], u64) -> Result<(), InjectionError>,
+    {
+        self.process_event_with_scroll_default(event, false, inject)
+    }
+
+    fn process_event_with_scroll_default<F>(
+        &mut self,
+        event: &NormalizedEvent,
+        invert_unmapped_scroll: bool,
+        mut inject: F,
+    ) -> Decision
     where
         F: FnMut(&[OutputEvent], u64) -> Result<(), InjectionError>,
     {
@@ -1092,9 +1113,19 @@ impl RuntimeController {
             .unwrap_or(false);
         self.engine.set_pinyin_active(pinyin_toggle_available);
         let checkpoint = self.engine.checkpoint();
-        let (decision, binding_kind) = self
-            .engine
-            .handle_with_binding_kind(event, KeyboardMappingPolicy::Full);
+        let (decision, binding_kind) = if event.kind == event_model::EventKind::Scroll {
+            (
+                self.engine.handle_with_scroll_default(
+                    event,
+                    KeyboardMappingPolicy::Full,
+                    invert_unmapped_scroll,
+                ),
+                rule_engine::BindingKind::Native,
+            )
+        } else {
+            self.engine
+                .handle_with_binding_kind(event, KeyboardMappingPolicy::Full)
+        };
         match decision {
             Decision::Pass => self.pass_local_event(event),
             Decision::Suppress => {
@@ -1115,7 +1146,16 @@ impl RuntimeController {
                     self.engine.modifiers_for_event(event),
                     &mut inject,
                 ) {
-                    Ok(()) => {
+                    Ok(true) if clipboard_only(&outputs) => {
+                        if self.engine.pass_rejected_shortcut(event)
+                            || event.kind == event_model::EventKind::Scroll
+                        {
+                            return self.pass_local_event(event);
+                        }
+                        self.diagnostics.record_suppressed();
+                        Decision::Suppress
+                    }
+                    Ok(_) => {
                         self.diagnostics.record_injected();
                         self.diagnostics.record_suppressed();
                         Decision::Suppress
@@ -1173,7 +1213,17 @@ impl RuntimeController {
         let decision = if forward_hotkey {
             self.pass_unmapped_local_keyboard(event, &mut inject)
         } else {
-            self.process_event_marked(event, &mut inject)
+            let invert_unmapped_scroll = self.status == RuntimeStatus::Running
+                && event.kind == event_model::EventKind::Scroll
+                && self
+                    .config
+                    .as_ref()
+                    .and_then(|config| config.mouse.desired_scroll_inversion())
+                    .is_some_and(|desired| {
+                        unsafe { raw.scroll_inverted_from_device() }
+                            .is_some_and(|actual| actual != desired)
+                    });
+            self.process_event_with_scroll_default(event, invert_unmapped_scroll, &mut inject)
         };
         if decision == Decision::Pass {
             if let Some(metadata) = raw.keyboard_metadata() {
@@ -1255,7 +1305,7 @@ impl RuntimeController {
         outputs: &[OutputEvent],
         restore_flags: event_model::ModifierSet,
         mut inject: F,
-    ) -> Result<(), InjectionError>
+    ) -> Result<bool, InjectionError>
     where
         F: FnMut(&[OutputEvent], u64) -> Result<(), InjectionError>,
     {
@@ -1263,6 +1313,7 @@ impl RuntimeController {
         let mut ownership = self.output_ownership.clone();
         let mut restore_modifiers = false;
         let mut dispatch_error = None;
+        let mut clipboard_rejected = false;
         for output in outputs {
             match output {
                 OutputEvent::SystemShortcut(SystemShortcut::SwitchInputSource) => {
@@ -1272,13 +1323,10 @@ impl RuntimeController {
                     self.request_input_source(InputSourceCommand::TogglePinyinEnglish);
                 }
                 OutputEvent::SystemShortcut(SystemShortcut::ShowClipboard) => {
-                    if let Some(manager) = &self.clipboard {
-                        if !manager.try_show() {
-                            dispatch_error = Some(InjectionError::Unavailable);
-                        }
-                    } else {
-                        dispatch_error = Some(InjectionError::Unavailable);
-                    }
+                    clipboard_rejected |= !self
+                        .clipboard
+                        .as_ref()
+                        .is_some_and(|manager| manager.try_show());
                 }
                 OutputEvent::SystemShortcut(SystemShortcut::ShowDesktop) => {
                     restore_modifiers = true;
@@ -1313,15 +1361,18 @@ impl RuntimeController {
             // Give the original event back to the caller without posting
             // any synthetic events from the rejected batch.
             Err(error)
-        } else if !regular.is_empty() {
-            inject(&regular, self.adapter.own_marker())?;
-            self.output_ownership = ownership;
-            Ok(())
         } else {
+            if !regular.is_empty() {
+                inject(&regular, self.adapter.own_marker())?;
+            }
             self.output_ownership = ownership;
-            Ok(())
+            Ok(clipboard_rejected)
         }
     }
+}
+
+fn clipboard_only(outputs: &[OutputEvent]) -> bool {
+    outputs == [OutputEvent::SystemShortcut(SystemShortcut::ShowClipboard)]
 }
 
 fn prepare_cleanup_outputs<F>(
@@ -1519,6 +1570,7 @@ pub fn run() {
             commands::set_show_desktop_shortcut,
             commands::set_software_input_passthrough,
             commands::set_profile,
+            commands::set_scroll_mode,
             commands::release_all,
             commands::emergency_disable,
             commands::add_rule,
@@ -1579,6 +1631,7 @@ pub fn run() {
                 app.handle().clone(),
                 clipboard_history_path(),
                 state.runtime_marker(),
+                Arc::clone(&state.event_runtime.clipboard_focused),
             )
             .map_err(|error| error.to_string())?;
             state.set_clipboard(Arc::clone(&manager));
@@ -1803,6 +1856,22 @@ pub mod commands {
     }
 
     #[tauri::command]
+    pub async fn set_scroll_mode(
+        app: tauri::AppHandle,
+        mode: String,
+        expected_revision: u64,
+    ) -> Result<settings::SettingsSnapshot, String> {
+        tauri::async_runtime::spawn_blocking(move || {
+            settings::mutate(&app.state::<AppState>(), expected_revision, |config| {
+                config.mouse.scroll_mode = mode;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|error| error.to_string())?
+    }
+
+    #[tauri::command]
     pub async fn set_rule_enabled(
         app: tauri::AppHandle,
         profile_id: String,
@@ -1991,12 +2060,15 @@ pub mod commands {
     pub async fn select_clipboard_item(
         state: tauri::State<'_, AppState>,
         id: u64,
+        session: u64,
     ) -> Result<(), String> {
         let manager = state
             .clipboard()
             .ok_or_else(|| "剪贴板服务尚未启动".to_owned())?;
         tauri::async_runtime::spawn_blocking(move || {
-            manager.select(id).map_err(|error| error.to_string())
+            manager
+                .select(id, session)
+                .map_err(|error| error.to_string())
         })
         .await
         .map_err(|error| format!("剪贴板操作线程失败：{error}"))?
@@ -2031,27 +2103,16 @@ pub mod commands {
 
     #[tauri::command]
     pub async fn close_clipboard_panel(
-        app: tauri::AppHandle,
         state: tauri::State<'_, AppState>,
+        session: u64,
     ) -> Result<(), String> {
-        let handle = app.clone();
-        let _ = app.run_on_main_thread(move || {
-            if let Some(window) = handle.get_webview_window("clipboard") {
-                let _ = window.hide();
-            }
-            // Hiding the last window alone leaves the Tauri application
-            // active. macOS can then keep MacToWindows as the frontmost app,
-            // which makes the next clipboard capture lose its real target.
-            // Hide the application as well so the previous app remains
-            // frontmost after dismissing the panel.
-            #[cfg(target_os = "macos")]
-            let _ = handle.hide();
-        });
         let manager = state
             .clipboard()
             .ok_or_else(|| "剪贴板服务尚未启动".to_owned())?;
         tauri::async_runtime::spawn_blocking(move || {
-            manager.close_panel().map_err(|error| error.to_string())
+            manager
+                .close_panel(session)
+                .map_err(|error| error.to_string())
         })
         .await
         .map_err(|error| format!("剪贴板操作线程失败：{error}"))?
@@ -2096,6 +2157,7 @@ pub mod commands {
                 let mut imported =
                     mac_to_windows_config::import_toml(&contents).map_err(|e| e.to_string())?;
                 imported.upgrade_default_save_shortcuts();
+                imported.upgrade_default_edit_shortcuts();
                 *candidate = imported;
                 Ok(())
             })
@@ -3225,6 +3287,127 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_hotkey_ignores_additional_modifiers_and_keeps_the_accepted_release() {
+        for extra in [
+            ModifierSet::LEFT_SHIFT,
+            ModifierSet::LEFT_CONTROL,
+            ModifierSet::RIGHT_COMMAND,
+        ] {
+            let mut latch = ClipboardHotkeyLatch::default();
+            let down = keyboard_event(
+                9,
+                EventPhase::Down,
+                ModifierSet::LEFT_OPTION | extra,
+                EventKind::Keyboard,
+            );
+            assert!(latch
+                .delivery(&down, || panic!("not the clipboard chord"))
+                .is_none());
+            let down = NormalizedEvent {
+                modifiers: ModifierSet::LEFT_OPTION,
+                ..down
+            };
+            assert_eq!(
+                latch.delivery(&down, || true),
+                Some(ClipboardHotkeyDelivery::Suppress)
+            );
+            let up = NormalizedEvent {
+                phase: EventPhase::Up,
+                modifiers: extra,
+                ..down
+            };
+            assert_eq!(
+                latch.delivery(&up, || unreachable!()),
+                Some(ClipboardHotkeyDelivery::Suppress)
+            );
+        }
+    }
+
+    #[test]
+    fn stock_shift_edit_shortcuts_preserve_shift_in_the_keyboard_output() {
+        for code in [6, 9] {
+            for shift in [
+                ModifierSet::LEFT_SHIFT,
+                ModifierSet::RIGHT_SHIFT,
+                ModifierSet::LEFT_SHIFT | ModifierSet::RIGHT_SHIFT,
+            ] {
+                let mut controller = RuntimeController::from_config(AppConfig::default()).unwrap();
+                controller.apply(RuntimeCommand::Enable).unwrap();
+                for phase in [EventPhase::Down, EventPhase::Repeat, EventPhase::Up] {
+                    let event = keyboard_event(
+                        code,
+                        phase,
+                        ModifierSet::LEFT_CONTROL | shift,
+                        EventKind::Keyboard,
+                    );
+                    assert_eq!(
+                        controller.process_event(&event, |outputs| {
+                            assert_eq!(
+                                outputs,
+                                &[OutputEvent::Key {
+                                    code: PhysicalCode::key(code),
+                                    phase,
+                                    modifiers: ModifierSet::LEFT_COMMAND | shift
+                                }]
+                            );
+                            Ok(())
+                        }),
+                        Decision::Suppress
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_custom_clipboard_press_preserves_the_original_sequence_and_mode() {
+        let mut config = AppConfig::default();
+        config
+            .profiles
+            .get_mut("windows_physical")
+            .unwrap()
+            .keyboard_rules
+            .push(mac_to_windows_config::Rule {
+                trigger: "key:96".into(),
+                action: "shortcut:show_clipboard".into(),
+                ..Default::default()
+            });
+        let mut controller = RuntimeController::from_config(config).unwrap();
+        controller.apply(RuntimeCommand::Enable).unwrap();
+        let (manager, release_queue) = clipboard::ClipboardManager::with_full_test_queue();
+        controller.set_clipboard(manager);
+        for phase in [EventPhase::Down, EventPhase::Repeat, EventPhase::Up] {
+            let event = keyboard_event(96, phase, ModifierSet::NONE, EventKind::Keyboard);
+            assert_eq!(
+                controller.process_event(&event, |_| panic!("nothing can be posted")),
+                Decision::Pass
+            );
+        }
+        release_queue();
+        assert_eq!(controller.status(), &RuntimeStatus::Running);
+        let copy = keyboard_event(
+            8,
+            EventPhase::Down,
+            ModifierSet::LEFT_CONTROL,
+            EventKind::Keyboard,
+        );
+        assert_eq!(
+            controller.process_event(&copy, |outputs| {
+                assert!(matches!(
+                    outputs,
+                    [OutputEvent::Key {
+                        code: PhysicalCode::Key(8),
+                        modifiers: ModifierSet::LEFT_COMMAND,
+                        ..
+                    }]
+                ));
+                Ok(())
+            }),
+            Decision::Suppress
+        );
+    }
+
+    #[test]
     fn text_injection_cannot_activate_or_release_local_clipboard_hotkey_latch() {
         let mut latch = ClipboardHotkeyLatch::default();
         let option = keyboard_event(
@@ -3302,8 +3485,18 @@ mod tests {
         assert_eq!(latch.handle(&right_down), None);
         assert_eq!(latch.handle(&v), None);
         assert_eq!(latch.handle(&right_up), None);
-        assert_eq!(latch.handle(&v), Some(ClipboardHotkeyAction::Show));
+        let left_v = NormalizedEvent {
+            modifiers: ModifierSet::LEFT_OPTION,
+            ..v
+        };
+        assert_eq!(latch.handle(&left_v), Some(ClipboardHotkeyAction::Show));
         assert_eq!(latch.handle(&left_up), None);
+        let v_up = NormalizedEvent {
+            phase: EventPhase::Up,
+            modifiers: ModifierSet::NONE,
+            ..left_v
+        };
+        assert_eq!(latch.handle(&v_up), Some(ClipboardHotkeyAction::Suppress));
         let plain = NormalizedEvent {
             code: PhysicalCode::key(9),
             modifiers: ModifierSet::NONE,

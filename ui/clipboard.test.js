@@ -3,7 +3,7 @@ const assert = require("node:assert/strict");
 const { normalizeSnapshot, previewText, moveSelection } = require("./clipboard-core.js");
 
 test("normalizeSnapshot supplies safe defaults for an empty history", () => {
-  assert.deepEqual(normalizeSnapshot(), { entries: [], panelOpen: false, lastError: null, operationError: null });
+  assert.deepEqual(normalizeSnapshot(), { entries: [], panelOpen: false, panelSession: 0, revision: 0, lastError: null, operationError: null });
 });
 
 test("previewText collapses whitespace and clips long content", () => {
@@ -68,7 +68,7 @@ async function clipboardUi({ selectPromise } = {}) {
     clipboardCore: require("./clipboard-core.js"),
     __TAURI__: { core: { invoke: async (command, args) => {
       calls.push({ command, args });
-      if (command === "select_clipboard_item" && selectPromise) return selectPromise;
+      if (command === "select_clipboard_item" && selectPromise) return typeof selectPromise === "function" ? selectPromise(args) : selectPromise;
       return command === "clipboard_history" ? snapshot : undefined;
     } } },
     addEventListener() {},
@@ -84,7 +84,7 @@ async function clipboardUi({ selectPromise } = {}) {
       context.snapshotPayload = payload;
       vm.runInContext("applySnapshot(snapshotPayload)", context);
     },
-    selecting() { return vm.runInContext("state.selecting", context); },
+    selecting() { return vm.runInContext("Boolean(state.selecting)", context); },
     async key(key, target = document.body, options = {}) {
       const event = { key, target, defaultPrevented: false, isComposing: false, ...options,
         preventDefault() { this.defaultPrevented = true; } };
@@ -177,7 +177,7 @@ test("storage failure snapshots do not unlock an in-flight paste", async () => {
   assert.equal(ui.selecting(), true);
   ui.snapshot({
     entries: [{ id: 7, text: "alpha", copied_at_unix_ms: 1 }],
-    panel_open: true, last_error: "disk unavailable", storage_error: "disk unavailable", operation_error: null,
+    panel_open: true, last_error: "disk unavailable", storage_error: "disk unavailable", operation_error: "older selection failed",
   });
   assert.equal(ui.selecting(), true);
   await ui.key("Enter");
@@ -185,4 +185,22 @@ test("storage failure snapshots do not unlock an in-flight paste", async () => {
   finish();
   await Promise.resolve();
   await Promise.resolve();
+});
+
+test("an older selection response cannot unlock or close the next panel session", async () => {
+  const requests = [];
+  const ui = await clipboardUi({ selectPromise: () => new Promise((resolve) => requests.push(resolve)) });
+  for (const session of [1, 2]) {
+    ui.snapshot({ entries: [{ id: 7, text: "alpha" }], panel_open: true, panel_session: session, revision: session });
+    await ui.key("ArrowDown");
+    await ui.key("Enter");
+  }
+  requests[0]();
+  await Promise.resolve();
+  await Promise.resolve();
+  ui.snapshot({ entries: [], panel_open: false, panel_session: 1, revision: 1 });
+  assert.equal(ui.selecting(), true);
+  assert.equal(ui.nodes.get("clipboard-list").children.length, 1);
+  assert.deepEqual(ui.calls.filter(({ command }) => command === "select_clipboard_item").map(({ args }) => args.session), [1, 2]);
+  requests[1]();
 });

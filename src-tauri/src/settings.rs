@@ -33,6 +33,7 @@ pub struct SettingsSnapshot {
     pub profiles: Vec<String>,
     pub rules: Vec<RuleView>,
     pub show_desktop_shortcut: String,
+    pub scroll_mode: String,
     pub software_input_passthrough: bool,
     pub runtime: RuntimeView,
     pub config_error: Option<String>,
@@ -93,6 +94,7 @@ pub(super) fn snapshot(state: &AppState) -> Result<SettingsSnapshot, String> {
         profiles: config.profiles.keys().cloned().collect(),
         rules,
         show_desktop_shortcut: config.system_shortcuts.show_desktop.clone(),
+        scroll_mode: config.mouse.scroll_mode.clone(),
         software_input_passthrough: config.software_input_passthrough,
         runtime: runtime_view(state, &runtime),
         config_error: {
@@ -248,24 +250,30 @@ fn read_valid(path: &Path) -> Result<(AppConfig, bool, Vec<String>), String> {
         .and_then(toml::Value::as_integer)
         .unwrap_or(1)
         == 1;
-    let (mut config, disabled_rules) = import_saved_toml(&contents).map_err(|e| e.to_string())?;
+    let (mut config, upgraded_scroll, warnings) =
+        import_saved_toml(&contents).map_err(|e| e.to_string())?;
     let upgraded_save_shortcuts = config.upgrade_default_save_shortcuts();
+    let upgraded_edit_shortcuts = config.upgrade_default_edit_shortcuts();
     config.validate_desktop().map_err(|e| e.to_string())?;
-    Ok((config, legacy || upgraded_save_shortcuts, disabled_rules))
+    Ok((
+        config,
+        legacy || upgraded_save_shortcuts || upgraded_edit_shortcuts || upgraded_scroll,
+        warnings,
+    ))
 }
 
-fn startup_warning(message: Option<String>, disabled_rules: &[String]) -> Option<String> {
-    if disabled_rules.is_empty() {
+fn startup_warning(message: Option<String>, warnings: &[String]) -> Option<String> {
+    if warnings.is_empty() {
         return message;
     }
-    let disabled = format!(
-        "已停用触发键无效的滚轮反转规则（{}）",
-        disabled_rules.join("、")
-    );
-    Some(match message {
-        Some(message) => format!("{message}。{disabled}"),
-        None => disabled,
-    })
+    Some(
+        message
+            .iter()
+            .chain(warnings)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("。"),
+    )
 }
 
 pub(super) struct StartupSettings {
@@ -363,20 +371,20 @@ fn read_if_present(path: &Path) -> Result<Option<(AppConfig, bool, Vec<String>)>
 
 fn read_or_recover(path: &Path) -> (AppConfig, Option<String>, bool) {
     let primary_error = match read_if_present(path) {
-        Ok(Some((config, needs_writeback, disabled_rules))) => {
+        Ok(Some((config, needs_writeback, warnings))) => {
             let error = if needs_writeback {
                 startup_save(path, &config, None, "配置已在内存迁移，但保存失败")
             } else {
                 None
             };
-            return (config, startup_warning(error, &disabled_rules), false);
+            return (config, startup_warning(error, &warnings), false);
         }
         Ok(None) => None,
         Err(error) => Some(error),
     };
     let backup = path.with_extension("toml.bak");
     let backup_error = match read_if_present(&backup) {
-        Ok(Some((config, _, disabled_rules))) => {
+        Ok(Some((config, _, warnings))) => {
             let result = if let Some(error) = primary_error {
                 archive_unreadable(path, &[path])
                     .map(|()| format!("主配置读取失败，已恢复有效备份：{error}"))
@@ -391,7 +399,7 @@ fn read_or_recover(path: &Path) -> (AppConfig, Option<String>, bool) {
                         Some(message),
                         "已在内存恢复配置备份，但写回失败",
                     );
-                    (config, startup_warning(error, &disabled_rules), false)
+                    (config, startup_warning(error, &warnings), false)
                 }
                 Err(error) => (
                     config,
@@ -399,7 +407,7 @@ fn read_or_recover(path: &Path) -> (AppConfig, Option<String>, bool) {
                         Some(format!(
                             "已在内存恢复配置备份，但无法保全主配置，已暂停保存：{error}"
                         )),
-                        &disabled_rules,
+                        &warnings,
                     ),
                     true,
                 ),
@@ -535,9 +543,9 @@ mod tests {
         let mut previous = AppConfig::default();
         previous.software_input_passthrough = false;
         for profile in previous.profiles.values_mut() {
-            profile
-                .keyboard_rules
-                .retain(|rule| !rule.trigger.starts_with("exact_chord:"));
+            profile.keyboard_rules.retain(|rule| {
+                !(rule.trigger.starts_with("exact_chord:") && rule.trigger.ends_with("+key:1"))
+            });
         }
         let mut old_document = toml::Value::try_from(&previous).unwrap();
         old_document
