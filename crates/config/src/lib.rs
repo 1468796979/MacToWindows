@@ -15,6 +15,26 @@ use thiserror::Error;
 
 pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
+const BUILT_IN_PROFILE_IDS: [&str; 3] = ["windows_physical", "shortcut", "custom"];
+const DEFAULT_SAVE_TRIGGERS: [&str; 3] = [
+    "exact_chord:left_control+key:1",
+    "exact_chord:right_control+key:1",
+    "exact_chord:left_control|right_control+key:1",
+];
+const LEGACY_STOCK_MODIFIERS: [(&str, &str); 4] = [
+    ("left_option", "left_windows"),
+    ("right_option", "right_windows"),
+    ("left_command", "left_alt"),
+    ("right_command", "right_alt"),
+];
+const LEGACY_STOCK_EDIT_SHORTCUTS: [(&str, &str); 5] = [
+    ("chord:left_control+key:0", "command:key:0"),
+    ("chord:left_control+key:8", "command:key:8"),
+    ("chord:left_control+key:9", "command:key:9"),
+    ("chord:left_control+key:7", "command:key:7"),
+    ("chord:left_control+key:6", "command:key:6"),
+];
+
 /// A deliberately small, extensible rule representation. Additional fields can be
 /// added without coupling this crate to the rule engine.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -122,6 +142,8 @@ pub struct AppConfig {
     pub enabled: bool,
     #[serde(default = "default_software_input_passthrough")]
     pub software_input_passthrough: bool,
+    #[serde(default)]
+    pub default_save_shortcuts_initialized: bool,
     #[serde(default = "default_panic_hotkey")]
     pub panic_hotkey: Vec<String>,
     #[serde(default)]
@@ -265,13 +287,52 @@ impl AppConfig {
         compile_profile(&self.active_profile, &self.profiles[&self.active_profile])
     }
 
+    /// Mark old saved settings as evaluated and add Save defaults only to
+    /// built-in profiles still recognizably based on the old keyboard preset.
+    pub fn upgrade_default_save_shortcuts(&mut self) -> bool {
+        if self.default_save_shortcuts_initialized {
+            return false;
+        }
+        self.default_save_shortcuts_initialized = true;
+        for id in BUILT_IN_PROFILE_IDS {
+            let Some(profile) = self.profiles.get_mut(id) else {
+                continue;
+            };
+            if !has_legacy_stock_keyboard_rules(profile) {
+                continue;
+            }
+            // Disabled rules can be explicit overrides too. Check normalized
+            // conditions in every category with global desktop scope.
+            let existing: Vec<_> = global_profile_rules(profile)
+                .filter_map(|rule| parse_trigger(&rule.trigger))
+                .collect();
+            for trigger in DEFAULT_SAVE_TRIGGERS {
+                let Some(Trigger::Key {
+                    code,
+                    modifiers,
+                    phase,
+                }) = parse_trigger(trigger)
+                else {
+                    continue;
+                };
+                if !existing
+                    .iter()
+                    .any(|rule| matches_key_input(rule, code, modifiers.required, phase))
+                {
+                    profile.keyboard_rules.push(default_save_rule(trigger));
+                }
+            }
+        }
+        true
+    }
+
     pub fn show_desktop_output(&self) -> Result<Vec<OutputEvent>, ConfigError> {
         let (key, modifiers) = match parse_trigger(&self.system_shortcuts.show_desktop) {
             Some(Trigger::Key {
                 code,
+                modifiers,
                 phase: EventPhase::Down,
-                ..
-            }) => (code, ModifierSet::NONE),
+            }) => (code, modifiers.required),
             Some(Trigger::Chord {
                 key,
                 modifiers,
@@ -329,6 +390,64 @@ impl AppConfig {
             });
         }
         Ok(outputs)
+    }
+}
+
+fn global_profile_rules(profile: &Profile) -> impl Iterator<Item = &Rule> {
+    profile
+        .keyboard_rules
+        .iter()
+        .chain(&profile.mouse_rules)
+        .chain(&profile.global_hotkeys)
+}
+
+fn has_legacy_stock_keyboard_rules(profile: &Profile) -> bool {
+    let contains_rule = |(trigger, action): (&str, &str), enabled_only: bool| {
+        let trigger = parse_trigger(trigger);
+        let action = parse_action(action);
+        global_profile_rules(profile).any(|rule| {
+            (!enabled_only || rule.enabled)
+                && parse_trigger(&rule.trigger) == trigger
+                && parse_action(&rule.action) == action
+        })
+    };
+    LEGACY_STOCK_MODIFIERS
+        .into_iter()
+        .chain(LEGACY_STOCK_EDIT_SHORTCUTS)
+        .all(|rule| contains_rule(rule, false))
+        && LEGACY_STOCK_EDIT_SHORTCUTS
+            .into_iter()
+            .any(|rule| contains_rule(rule, true))
+}
+
+fn matches_key_input(
+    trigger: &Trigger,
+    code: PhysicalCode,
+    modifiers: ModifierSet,
+    phase: EventPhase,
+) -> bool {
+    match trigger {
+        Trigger::Key {
+            code: rule_code,
+            modifiers: matcher,
+            phase: rule_phase,
+        } => *rule_code == code && *rule_phase == phase && matcher.matches(modifiers),
+        Trigger::Chord {
+            key: rule_code,
+            modifiers: required,
+            phase: rule_phase,
+        } => *rule_code == code && *rule_phase == phase && modifiers.contains(*required),
+        _ => false,
+    }
+}
+
+fn default_save_rule(trigger: &str) -> Rule {
+    Rule {
+        name: format!("{trigger} → command:key:1"),
+        trigger: trigger.into(),
+        action: "command:key:1".into(),
+        priority: 200,
+        ..Rule::default()
     }
 }
 
@@ -460,6 +579,17 @@ fn parse_trigger(value: &str) -> Option<Trigger> {
         return Some(Trigger::ModifierChord {
             modifiers: parse_modifiers(modifier_chord)?,
             phase: EventPhase::Up,
+        });
+    }
+    if let Some(chord) = value.strip_prefix("exact_chord:") {
+        let (modifiers, key) = chord.split_once('+')?;
+        return Some(Trigger::Key {
+            code: parse_code(key)?,
+            modifiers: ModifierMatcher {
+                required: parse_modifiers(modifiers)?,
+                exact: true,
+            },
+            phase: EventPhase::Down,
         });
     }
     if let Some(chord) = value.strip_prefix("chord:") {
@@ -715,9 +845,12 @@ pub fn default_config() -> AppConfig {
     for rule in &mut profile.keyboard_rules {
         rule.name = format!("{} → {}", rule.trigger, rule.action);
     }
+    profile
+        .keyboard_rules
+        .extend(DEFAULT_SAVE_TRIGGERS.into_iter().map(default_save_rule));
     let mut profiles = BTreeMap::new();
-    profiles.insert("windows_physical".into(), profile.clone());
-    for id in ["shortcut", "custom"] {
+    profiles.insert(BUILT_IN_PROFILE_IDS[0].into(), profile.clone());
+    for id in BUILT_IN_PROFILE_IDS.into_iter().skip(1) {
         let mut independent = profile.clone();
         for rule in &mut independent.keyboard_rules {
             rule.id = uuid::Uuid::new_v4().to_string();
@@ -729,6 +862,7 @@ pub fn default_config() -> AppConfig {
         active_profile: "windows_physical".into(),
         enabled: false,
         software_input_passthrough: true,
+        default_save_shortcuts_initialized: true,
         panic_hotkey: default_panic_hotkey(),
         mouse: MouseConfig::default(),
         system_shortcuts: SystemShortcutsConfig::default(),
@@ -808,12 +942,7 @@ fn migrate_v1(config: &mut AppConfig) {
         }
         // Materialize the old engine's hidden conversion as editable rules.
         // An explicit rule, including a disabled one, always wins over the baseline.
-        for (trigger, action) in [
-            ("left_option", "left_windows"),
-            ("right_option", "right_windows"),
-            ("left_command", "left_alt"),
-            ("right_command", "right_alt"),
-        ] {
+        for (trigger, action) in LEGACY_STOCK_MODIFIERS {
             let source = parse_code(trigger).unwrap();
             let explicit = [
                 &profile.keyboard_rules,
@@ -1057,7 +1186,228 @@ mod tests {
     fn active_profile_compiles_to_rule_snapshot() {
         let config = default_config();
         let compiled = config.compile_active_profile().unwrap();
-        assert_eq!(compiled.rules().len(), 15);
+        assert_eq!(compiled.rules().len(), 18);
+    }
+
+    #[test]
+    fn default_save_shortcuts_require_control_without_additional_modifiers() {
+        use event_model::{Decision, DeviceSource, EventKind, EventOrigin, NormalizedEvent};
+        use rule_engine::{KeyboardMappingPolicy, RuleEngine};
+
+        let config = default_config();
+        assert!(config.default_save_shortcuts_initialized);
+        for id in BUILT_IN_PROFILE_IDS {
+            let rules = compile_profile(id, &config.profiles[id]).unwrap();
+            let save_rules: Vec<_> = rules
+                .rules()
+                .iter()
+                .filter(|rule| {
+                    matches!(rule.trigger, Trigger::Key { code: PhysicalCode::Key(1), modifiers, .. }
+                        if modifiers.exact)
+                })
+                .collect();
+            assert_eq!(save_rules.len(), 3);
+            assert!(save_rules.iter().all(|rule| rule.priority == 200));
+            for policy in [
+                KeyboardMappingPolicy::Full,
+                KeyboardMappingPolicy::ShortcutsOnly,
+            ] {
+                for (modifiers, saves) in [
+                    (ModifierSet::LEFT_CONTROL, true),
+                    (ModifierSet::RIGHT_CONTROL, true),
+                    (ModifierSet::LEFT_CONTROL | ModifierSet::RIGHT_CONTROL, true),
+                    (ModifierSet::NONE, false),
+                    (ModifierSet::LEFT_CONTROL | ModifierSet::LEFT_SHIFT, false),
+                    (
+                        ModifierSet::RIGHT_CONTROL | ModifierSet::RIGHT_OPTION,
+                        false,
+                    ),
+                    (ModifierSet::LEFT_CONTROL | ModifierSet::LEFT_COMMAND, false),
+                ] {
+                    let mut engine = RuleEngine::new(rules.clone());
+                    let decision = engine.handle_with_policy(
+                        &NormalizedEvent {
+                            source: DeviceSource::Keyboard,
+                            kind: EventKind::Keyboard,
+                            phase: EventPhase::Down,
+                            code: PhysicalCode::key(1),
+                            modifiers,
+                            location: None,
+                            scroll: None,
+                            timestamp_ns: 0,
+                            app_context: None,
+                            origin: EventOrigin::Hardware,
+                        },
+                        policy,
+                    );
+                    let expected = if saves {
+                        Decision::Emit(vec![OutputEvent::Key {
+                            code: PhysicalCode::key(1),
+                            phase: EventPhase::Down,
+                            modifiers: ModifierSet::LEFT_COMMAND,
+                        }])
+                    } else {
+                        Decision::Pass
+                    };
+                    assert_eq!(decision, expected, "{id} {policy:?} {modifiers:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn exact_chord_is_opt_in_and_ordinary_chords_still_allow_additional_modifiers() {
+        let inclusive = parse_trigger("chord:left_control+key:1").unwrap();
+        let exact = parse_trigger("exact_chord:left_control+key:1").unwrap();
+        let key = PhysicalCode::key(1);
+        let control = ModifierSet::LEFT_CONTROL;
+        let control_shift = control | ModifierSet::LEFT_SHIFT;
+        assert!(matches_key_input(
+            &inclusive,
+            key,
+            control,
+            EventPhase::Down
+        ));
+        assert!(matches_key_input(
+            &inclusive,
+            key,
+            control_shift,
+            EventPhase::Down
+        ));
+        assert!(matches_key_input(&exact, key, control, EventPhase::Down));
+        assert!(!matches_key_input(
+            &exact,
+            key,
+            control_shift,
+            EventPhase::Down
+        ));
+        assert!(parse_trigger("exact_chord:+key:1").is_none());
+    }
+
+    fn legacy_save_config() -> AppConfig {
+        let mut config = default_config();
+        config.default_save_shortcuts_initialized = false;
+        for profile in config.profiles.values_mut() {
+            profile
+                .keyboard_rules
+                .retain(|rule| !DEFAULT_SAVE_TRIGGERS.contains(&rule.trigger.as_str()));
+        }
+        config
+    }
+
+    #[test]
+    fn save_upgrade_keeps_global_overrides_and_touches_only_recognized_presets() {
+        let mut config = legacy_save_config();
+        let custom = config.profiles.get_mut("custom").unwrap();
+        custom.keyboard_rules[0].priority = i32::MIN;
+        custom
+            .keyboard_rules
+            .iter_mut()
+            .find(|rule| rule.trigger == "chord:left_control+key:8")
+            .unwrap()
+            .enabled = false;
+        custom.keyboard_rules.push(Rule {
+            trigger: "chord:left_control|left_shift+key:1".into(),
+            action: "suppress".into(),
+            priority: 900,
+            ..Rule::default()
+        });
+        config
+            .profiles
+            .get_mut("windows_physical")
+            .unwrap()
+            .global_hotkeys
+            .push(Rule {
+                trigger: "chord:left_control+key:01".into(),
+                action: "suppress".into(),
+                enabled: false,
+                priority: -10,
+                ..Rule::default()
+            });
+        config
+            .profiles
+            .get_mut("shortcut")
+            .unwrap()
+            .mouse_rules
+            .push(Rule {
+                trigger: "key:01".into(),
+                action: "pass".into(),
+                priority: -20,
+                ..Rule::default()
+            });
+        config.profiles.insert(
+            "imported-profile".into(),
+            legacy_save_config().profiles.remove("custom").unwrap(),
+        );
+        let previous = config.clone();
+        assert!(config.upgrade_default_save_shortcuts());
+        config.validate_desktop().unwrap();
+        assert_eq!(config.schema_version, previous.schema_version);
+        assert_eq!(config.profiles["shortcut"], previous.profiles["shortcut"]);
+        assert_eq!(
+            config.profiles["imported-profile"],
+            previous.profiles["imported-profile"]
+        );
+        for (id, expected_triggers) in [
+            ("windows_physical", &DEFAULT_SAVE_TRIGGERS[1..2]),
+            ("custom", &DEFAULT_SAVE_TRIGGERS[..]),
+        ] {
+            let old = &previous.profiles[id];
+            let updated = &config.profiles[id];
+            let (unchanged, inserted) = updated.keyboard_rules.split_at(old.keyboard_rules.len());
+            assert_eq!(unchanged, old.keyboard_rules);
+            assert_eq!(updated.global_hotkeys, old.global_hotkeys);
+            assert_eq!(
+                inserted
+                    .iter()
+                    .map(|rule| rule.trigger.as_str())
+                    .collect::<Vec<_>>(),
+                expected_triggers
+            );
+        }
+        let saved = export_toml(&config).unwrap();
+        assert!(saved.contains("default_save_shortcuts_initialized = true"));
+        assert!(!config.upgrade_default_save_shortcuts());
+
+        let mut reloaded = import_toml(&saved).unwrap();
+        assert_eq!(reloaded, config);
+        reloaded
+            .profiles
+            .get_mut("custom")
+            .unwrap()
+            .keyboard_rules
+            .pop();
+        assert!(!reloaded.upgrade_default_save_shortcuts());
+        assert_eq!(
+            reloaded.profiles["custom"].keyboard_rules.len(),
+            config.profiles["custom"].keyboard_rules.len() - 1
+        );
+    }
+
+    #[test]
+    fn save_upgrade_preserves_empty_and_custom_profiles_without_stock_bindings() {
+        let mut config = legacy_save_config();
+        config
+            .profiles
+            .insert("windows_physical".into(), Profile::default());
+        config.profiles.insert(
+            "custom".into(),
+            Profile {
+                keyboard_rules: vec![Rule {
+                    trigger: "key:11".into(),
+                    action: "key:45".into(),
+                    ..Rule::default()
+                }],
+                ..Profile::default()
+            },
+        );
+        for rule in &mut config.profiles.get_mut("shortcut").unwrap().keyboard_rules {
+            rule.enabled = false;
+        }
+        let previous = config.profiles.clone();
+        assert!(config.upgrade_default_save_shortcuts());
+        assert_eq!(config.profiles, previous);
+        assert!(!config.upgrade_default_save_shortcuts());
     }
 
     #[test]
@@ -1313,7 +1663,7 @@ mod tests {
                 action: "key:13".into(),
                 ..Rule::default()
             });
-        assert_eq!(config.compile_active_profile().unwrap().rules().len(), 16);
+        assert_eq!(config.compile_active_profile().unwrap().rules().len(), 19);
         assert_eq!(config.profiles["windows_physical"], original_windows);
         let windows_ids: HashSet<_> = original_windows
             .keyboard_rules
@@ -1485,6 +1835,8 @@ mod tests {
                 ..
             })
         ));
+        config.system_shortcuts.show_desktop = "exact_chord:left_control|left_shift+key:103".into();
+        assert_eq!(config.show_desktop_output().unwrap(), outputs);
         config.system_shortcuts.show_desktop = "modifier_chord:left_shift".into();
         assert!(config.validate().is_err());
         config.system_shortcuts.show_desktop = "left_shift".into();

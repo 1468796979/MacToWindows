@@ -1365,8 +1365,8 @@ impl RuntimeController {
                     return self.software_fallback(id, event);
                 }
             }
-            let (decision, native_binding) = session.engine.handle_with_binding(event, policy);
-            owner = OutputOwner::for_binding(stream, event.code, native_binding);
+            let (decision, binding_kind) = session.engine.handle_with_binding_kind(event, policy);
+            owner = OutputOwner::for_binding(stream, event.code, binding_kind);
             if decision == Decision::Pass
                 && unmanaged_flags_change
                 && policy == KeyboardMappingPolicy::Full

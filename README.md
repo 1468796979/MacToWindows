@@ -22,6 +22,8 @@ MacToWindows 是一个面向 Windows 用户的 macOS 全局键鼠语义层。工
 
 触发键示例：`key:11`、`chord:left_control|right_shift+key:11`。多个修饰键之间使用 `|`，修饰键和主键之间使用 `+`。释放时识别的 `modifier_chord:left_control|left_shift` 只支持完整的一次性 `shortcut:` 动作，不接受 `pass`、`suppress` 或没有完整释放生命周期的按键输出。当前桌面应用明确拒绝启用应用限定及设备限定规则。
 
+启用 Windows 模式后，内置预设会把 Ctrl+S 转成 Command+S，适用于 VS Code 等应用。左 Ctrl、右 Ctrl 和两侧同时按住均可触发。保存规则使用 `exact_chord:`（如 `exact_chord:left_control+key:1`），只有修饰键完全匹配才会转换。Ctrl+Shift+S 等其他组合沿用原有行为。升级时会为采用内置快捷键且没有自定义覆盖的旧预设补齐此规则。首次写回时，`config.toml.bak` 保留升级前的配置。后续保存会轮换备份，计划回退到不支持 `exact_chord:` 的版本时请另存一份升级前的配置。
+
 设置页显示规则优先级以及相同触发条件下的覆盖关系。可以在添加规则时指定优先级，也可以从规则列表修改已保存的优先级。
 
 鼠标映射支持按钮、释放和拖动；滚轮反转保留原事件精度及惯性信息。`shortcut:show_desktop` 使用设置页中配置的系统输出快捷键，默认 `key:103`（F11），需与 macOS 的“显示桌面”绑定一致。锁屏和关闭窗口分别使用 Control+Command+Q、Command+W。

@@ -6,6 +6,7 @@
 
 use event_model::{EventKind, EventPhase, ModifierSet, NormalizedEvent, OutputEvent, PhysicalCode};
 use macos_adapter::KeyboardSourceId;
+use rule_engine::BindingKind;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -18,6 +19,7 @@ pub(crate) enum InputStream {
 pub(crate) enum OutputOwner {
     // A stream can map several physical inputs to the same target.
     Mapped(InputStream, PhysicalCode),
+    ExactMapped(InputStream, PhysicalCode),
     // Native input targets its own key or button, even when flags are rewritten.
     Native(InputStream),
     Transient(InputStream, u64),
@@ -25,17 +27,22 @@ pub(crate) enum OutputOwner {
 }
 
 impl OutputOwner {
-    pub(crate) fn for_binding(stream: InputStream, source: PhysicalCode, native: bool) -> Self {
-        if native {
-            Self::Native(stream)
-        } else {
-            Self::Mapped(stream, source)
+    pub(crate) fn for_binding(
+        stream: InputStream,
+        source: PhysicalCode,
+        kind: BindingKind,
+    ) -> Self {
+        match kind {
+            BindingKind::Native => Self::Native(stream),
+            BindingKind::Mapped => Self::Mapped(stream, source),
+            BindingKind::ExactMapped => Self::ExactMapped(stream, source),
         }
     }
 
     fn stream(self) -> InputStream {
         match self {
             Self::Mapped(stream, _)
+            | Self::ExactMapped(stream, _)
             | Self::Native(stream)
             | Self::Transient(stream, _)
             | Self::ApplicationSwitch(stream) => stream,
@@ -83,6 +90,10 @@ impl OutputOwnership {
             {
                 let preserved = if modifier_bits(*code).is_some() {
                     self.preserved_modifiers(owner.stream())
+                } else if matches!(owner, OutputOwner::ExactMapped(_, _)) {
+                    // Keep the key's configured flags while other sources
+                    // continue to own their held modifiers independently.
+                    ModifierSet::NONE
                 } else {
                     // A shortcut's main key deliberately selects its own
                     // stream's flags. A mapped Control may only represent a
@@ -168,7 +179,9 @@ impl OutputOwnership {
     }
 
     pub(crate) fn release_mapped(&mut self, stream: InputStream) -> Vec<OutputEvent> {
-        self.release_matching(|owner| matches!(owner, OutputOwner::Mapped(s, _) if s == stream))
+        self.release_matching(|owner| {
+            matches!(owner, OutputOwner::Mapped(s, _) | OutputOwner::ExactMapped(s, _) if s == stream)
+        })
     }
 
     pub(crate) fn release_stream(&mut self, stream: InputStream) -> Vec<OutputEvent> {

@@ -1092,9 +1092,9 @@ impl RuntimeController {
             .unwrap_or(false);
         self.engine.set_pinyin_active(pinyin_toggle_available);
         let checkpoint = self.engine.checkpoint();
-        let (decision, native_binding) = self
+        let (decision, binding_kind) = self
             .engine
-            .handle_with_binding(event, KeyboardMappingPolicy::Full);
+            .handle_with_binding_kind(event, KeyboardMappingPolicy::Full);
         match decision {
             Decision::Pass => self.pass_local_event(event),
             Decision::Suppress => {
@@ -1106,7 +1106,7 @@ impl RuntimeController {
                 let owner = if event.kind == event_model::EventKind::Scroll {
                     self.next_transient_output(stream)
                 } else {
-                    OutputOwner::for_binding(stream, event.code, native_binding)
+                    OutputOwner::for_binding(stream, event.code, binding_kind)
                 };
                 match self.dispatch_outputs_for(
                     stream,
@@ -2093,8 +2093,10 @@ pub mod commands {
     ) -> Result<settings::SettingsSnapshot, String> {
         tauri::async_runtime::spawn_blocking(move || {
             settings::mutate(&app.state::<AppState>(), expected_revision, |candidate| {
-                *candidate =
+                let mut imported =
                     mac_to_windows_config::import_toml(&contents).map_err(|e| e.to_string())?;
+                imported.upgrade_default_save_shortcuts();
+                *candidate = imported;
                 Ok(())
             })
         })

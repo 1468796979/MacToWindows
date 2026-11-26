@@ -248,9 +248,10 @@ fn read_valid(path: &Path) -> Result<(AppConfig, bool, Vec<String>), String> {
         .and_then(toml::Value::as_integer)
         .unwrap_or(1)
         == 1;
-    let (config, disabled_rules) = import_saved_toml(&contents).map_err(|e| e.to_string())?;
+    let (mut config, disabled_rules) = import_saved_toml(&contents).map_err(|e| e.to_string())?;
+    let upgraded_save_shortcuts = config.upgrade_default_save_shortcuts();
     config.validate_desktop().map_err(|e| e.to_string())?;
-    Ok((config, legacy, disabled_rules))
+    Ok((config, legacy || upgraded_save_shortcuts, disabled_rules))
 }
 
 fn startup_warning(message: Option<String>, disabled_rules: &[String]) -> Option<String> {
@@ -362,8 +363,8 @@ fn read_if_present(path: &Path) -> Result<Option<(AppConfig, bool, Vec<String>)>
 
 fn read_or_recover(path: &Path) -> (AppConfig, Option<String>, bool) {
     let primary_error = match read_if_present(path) {
-        Ok(Some((config, legacy, disabled_rules))) => {
-            let error = if legacy {
+        Ok(Some((config, needs_writeback, disabled_rules))) => {
+            let error = if needs_writeback {
                 startup_save(path, &config, None, "配置已在内存迁移，但保存失败")
             } else {
                 None
@@ -524,6 +525,45 @@ mod tests {
             RuntimeController::from_config(config).unwrap().status,
             RuntimeStatus::Disabled
         );
+    }
+
+    #[test]
+    fn startup_persists_save_shortcuts_once_and_keeps_the_pre_upgrade_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let backup = path.with_extension("toml.bak");
+        let mut previous = AppConfig::default();
+        previous.software_input_passthrough = false;
+        for profile in previous.profiles.values_mut() {
+            profile
+                .keyboard_rules
+                .retain(|rule| !rule.trigger.starts_with("exact_chord:"));
+        }
+        let mut old_document = toml::Value::try_from(&previous).unwrap();
+        old_document
+            .as_table_mut()
+            .unwrap()
+            .remove("default_save_shortcuts_initialized");
+        let original = toml::to_string_pretty(&old_document).unwrap();
+        fs::write(&path, &original).unwrap();
+
+        let upgraded = load_startup(&path);
+        assert!(upgraded.error.is_none(), "{:?}", upgraded.error);
+        assert!(!upgraded.config.software_input_passthrough);
+        for (id, old_profile) in &previous.profiles {
+            let rules = &upgraded.config.profiles[id].keyboard_rules;
+            assert_eq!(
+                &rules[..old_profile.keyboard_rules.len()],
+                old_profile.keyboard_rules
+            );
+            assert_eq!(rules.len(), old_profile.keyboard_rules.len() + 3);
+        }
+        assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("default_save_shortcuts_initialized = true"));
+        assert_eq!(load_startup(&path).config, upgraded.config);
+        assert_eq!(fs::read_to_string(&path).unwrap(), saved);
+        assert_eq!(fs::read_to_string(&backup).unwrap(), original);
     }
 
     #[test]

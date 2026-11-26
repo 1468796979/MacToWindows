@@ -19,6 +19,15 @@ pub enum KeyboardMappingPolicy {
     ShortcutsOnly,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BindingKind {
+    /// The target is still the physical input, with flags rewritten as needed.
+    Native,
+    Mapped,
+    /// Mapped main keys use only the flags selected by their action.
+    ExactMapped,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RuleScope {
     Global,
@@ -381,8 +390,7 @@ pub struct RuntimeState {
 struct SourceBinding {
     outputs: Vec<OutputEvent>,
     passthrough: bool,
-    // The target is still the physical source; only its flags may need rewriting.
-    follow_modifiers: bool,
+    kind: BindingKind,
     // Ordinary software events must stay raw even if the policy changes while
     // the key is held. Rebuilding such Repeat/Up events can discard payloads.
     raw_passthrough: bool,
@@ -409,12 +417,12 @@ impl RuntimeState {
         let native_targets: HashSet<_> = self
             .bindings
             .values()
-            .filter(|binding| binding.follow_modifiers)
+            .filter(|binding| binding.kind == BindingKind::Native)
             .flat_map(|binding| binding.outputs.iter().filter_map(output_code))
             .collect();
         let mut native_modifiers = self.active_modifiers;
         for (source, binding) in &self.bindings {
-            if !binding.follow_modifiers {
+            if binding.kind != BindingKind::Native {
                 if let Some(modifier) = modifier_for_code(*source) {
                     native_modifiers.remove(modifier);
                 }
@@ -428,7 +436,7 @@ impl RuntimeState {
         for binding in self
             .bindings
             .values()
-            .filter(|binding| !binding.follow_modifiers)
+            .filter(|binding| binding.kind != BindingKind::Native)
         {
             for event in &binding.outputs {
                 if held_output_code(event).is_none() {
@@ -554,21 +562,32 @@ impl RuleEngine {
         event: &NormalizedEvent,
         policy: KeyboardMappingPolicy,
     ) -> (event_model::Decision, bool) {
+        let (decision, kind) = self.handle_with_binding_kind(event, policy);
+        (decision, kind == BindingKind::Native)
+    }
+
+    /// Report how to deliver the binding's output. A held source keeps this
+    /// identity, including the exact match, until release.
+    pub fn handle_with_binding_kind(
+        &mut self,
+        event: &NormalizedEvent,
+        policy: KeyboardMappingPolicy,
+    ) -> (event_model::Decision, BindingKind) {
         let previous = self
             .state
             .bindings
             .get(&event.code)
-            .map(|binding| binding.follow_modifiers);
+            .map(|binding| binding.kind);
         let decision = self.handle_with_policy(event, policy);
-        let native = previous
+        let kind = previous
             .or_else(|| {
                 self.state
                     .bindings
                     .get(&event.code)
-                    .map(|binding| binding.follow_modifiers)
+                    .map(|binding| binding.kind)
             })
-            .unwrap_or(true);
-        (decision, native)
+            .unwrap_or(BindingKind::Native);
+        (decision, kind)
     }
 
     pub fn set_keyboard_mapping_policy(&mut self, policy: KeyboardMappingPolicy) {
@@ -787,7 +806,7 @@ impl RuleEngine {
         }
         if phase == EventPhase::Repeat {
             if let Some(binding) = self.state.bindings.get(&event.code) {
-                return if binding.follow_modifiers {
+                return if binding.kind == BindingKind::Native {
                     if binding.raw_passthrough {
                         return event_model::Decision::Pass;
                     }
@@ -821,7 +840,7 @@ impl RuleEngine {
         if event.kind == EventKind::Scroll {
             return self.handle_scroll(event);
         }
-        let action = self
+        let rule = self
             .rules
             .find_with_policy(event, self.state.keyboard_policy)
             .or_else(|| {
@@ -833,8 +852,17 @@ impl RuleEngine {
                     self.rules
                         .find_with_policy(&adjusted, self.state.keyboard_policy)
                 }
-            })
-            .map(|rule| rule.action.clone());
+            });
+        let exact = rule.is_some_and(|rule| {
+            matches!(
+                rule.trigger,
+                Trigger::Key {
+                    modifiers: ModifierMatcher { exact: true, .. },
+                    ..
+                }
+            )
+        });
+        let action = rule.map(|rule| rule.action.clone());
         match action {
             Some(Action::Pass) => self.pass_event(event),
             Some(Action::Suppress) => {
@@ -844,7 +872,7 @@ impl RuleEngine {
                         SourceBinding {
                             outputs: Vec::new(),
                             passthrough: false,
-                            follow_modifiers: false,
+                            kind: BindingKind::Mapped,
                             raw_passthrough: false,
                         },
                     );
@@ -853,7 +881,16 @@ impl RuleEngine {
             }
             Some(Action::Replace(outputs)) => {
                 if is_press_phase(phase) {
-                    return self.acquire_binding(event, outputs, false, false);
+                    return self.acquire_binding(
+                        event,
+                        outputs,
+                        false,
+                        if exact {
+                            BindingKind::ExactMapped
+                        } else {
+                            BindingKind::Mapped
+                        },
+                    );
                 }
                 let outputs = if phase == EventPhase::Repeat {
                     repeat_outputs(&outputs)
@@ -960,7 +997,7 @@ impl RuleEngine {
             modifiers: mapped,
         };
         if is_press_phase(phase) {
-            return self.acquire_binding(event, vec![output], false, true);
+            return self.acquire_binding(event, vec![output], false, BindingKind::Native);
         }
         event_model::Decision::Emit(vec![output])
     }
@@ -987,7 +1024,7 @@ impl RuleEngine {
             }
             _ => return event_model::Decision::Pass,
         };
-        self.acquire_binding(event, vec![output], true, true)
+        self.acquire_binding(event, vec![output], true, BindingKind::Native)
     }
 
     fn acquire_binding(
@@ -995,14 +1032,14 @@ impl RuleEngine {
         event: &NormalizedEvent,
         outputs: Vec<OutputEvent>,
         passthrough: bool,
-        follow_modifiers: bool,
+        kind: BindingKind,
     ) -> event_model::Decision {
         self.state.bindings.insert(
             event.code,
             SourceBinding {
                 outputs: outputs.clone(),
                 passthrough,
-                follow_modifiers,
+                kind,
                 raw_passthrough: passthrough
                     && self.state.keyboard_policy == KeyboardMappingPolicy::ShortcutsOnly,
             },
@@ -1056,7 +1093,9 @@ impl RuleEngine {
                 if last || !self.coalesce_targets {
                     if let Some(mut release) = release_event(&held) {
                         if let OutputEvent::Key { modifiers, .. } = &mut release {
-                            if binding.follow_modifiers || modifier_for_code(code).is_some() {
+                            if binding.kind == BindingKind::Native
+                                || modifier_for_code(code).is_some()
+                            {
                                 *modifiers = self.map_modifier_flags(event.modifiers);
                             }
                         }
@@ -1093,14 +1132,14 @@ impl RuleEngine {
     fn map_modifier_flags(&self, physical: ModifierSet) -> ModifierSet {
         let mut logical = self.physical_modifier_flags(physical);
         for (code, binding) in &self.state.bindings {
-            if !binding.follow_modifiers {
+            if binding.kind != BindingKind::Native {
                 if let Some(source) = modifier_for_code(*code) {
                     logical.remove(source);
                 }
             }
         }
         for binding in self.state.bindings.values() {
-            if !binding.follow_modifiers {
+            if binding.kind != BindingKind::Native {
                 for output in &binding.outputs {
                     if let Some(modifier) = output_modifier(output) {
                         logical.insert(modifier);
@@ -2331,7 +2370,7 @@ mod tests {
             let actual = &actual.bindings[code];
             assert_eq!(actual.outputs, binding.outputs);
             assert_eq!(actual.passthrough, binding.passthrough);
-            assert_eq!(actual.follow_modifiers, binding.follow_modifiers);
+            assert_eq!(actual.kind, binding.kind);
             assert_eq!(actual.raw_passthrough, binding.raw_passthrough);
         }
     }

@@ -242,6 +242,237 @@ fn has_key(outputs: &[OutputEvent], code: u16, phase: EventPhase, modifiers: M) 
 }
 
 #[test]
+fn exact_ctrl_s_keeps_command_down_repeat_and_up_for_each_control_combination() {
+    use EventPhase::{Down, Repeat, Up};
+
+    let left = (59, 0x0004_0001);
+    let right = (62, 0x0004_2000);
+    for (source, pid, passthrough) in [
+        (KeyboardSourceKind::HardwareLike, 0, true),
+        (KeyboardSourceKind::Software, 501, true),
+        (KeyboardSourceKind::Software, 501, false),
+    ] {
+        for controls in [&[left][..], &[right], &[left, right]] {
+            for control_up_first in [false, true] {
+                let mut h = Harness::new(passthrough, false);
+                let mut flags = 0;
+                for &(code, flag) in controls {
+                    flags |= flag;
+                    let input = Keyboard::new(12, code, flags, pid, 0, None);
+                    assert_eq!(h.send(&input, source), EventTapAction::Pass);
+                    assert_eq!(input.metadata().raw_flags, flags);
+                }
+                let down = Keyboard::new(10, 1, flags, pid, 0, None);
+                let repeat = Keyboard::new(10, 1, flags, pid, 0, None);
+                unsafe { CGEventSetIntegerValueField(repeat.raw, 8, 1) };
+                assert_eq!(h.send(&down, source), EventTapAction::Suppress);
+                assert_eq!(h.send(&repeat, source), EventTapAction::Suppress);
+
+                if !control_up_first {
+                    let up = Keyboard::new(11, 1, flags, pid, 0, None);
+                    assert_eq!(h.send(&up, source), EventTapAction::Suppress);
+                }
+                for &(code, flag) in controls.iter().rev() {
+                    flags &= !(flag & 0xffff);
+                    if flags == 0x0004_0000 {
+                        flags = 0;
+                    }
+                    let input = Keyboard::new(12, code, flags, pid, 0, None);
+                    assert_eq!(h.send(&input, source), EventTapAction::Pass);
+                    assert_eq!(input.metadata().raw_flags, flags);
+                }
+                if control_up_first {
+                    let up = Keyboard::new(11, 1, flags, pid, 0, None);
+                    assert_eq!(h.send(&up, source), EventTapAction::Suppress);
+                }
+                assert_eq!(
+                    h.outputs,
+                    [Down, Repeat, Up].map(|phase| OutputEvent::Key {
+                        code: PhysicalCode::key(1),
+                        phase,
+                        modifiers: M::LEFT_COMMAND,
+                    })
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn exact_ctrl_s_does_not_change_plain_s_or_a_chord_with_extra_modifiers() {
+    let left_control = 0x0004_0001;
+    let physical = KeyboardSourceKind::HardwareLike;
+    let mut h = Harness::new(true, false);
+    for phase in [10, 11] {
+        let input = Keyboard::new(phase, 1, 0, 0, 0, None);
+        assert_eq!(h.send(&input, physical), EventTapAction::Pass);
+    }
+    assert!(h.outputs.is_empty());
+    let ctrl = Keyboard::new(12, 59, left_control, 0, 0, None);
+    assert_eq!(h.send(&ctrl, physical), EventTapAction::Pass);
+    h.runtime
+        .lock()
+        .unwrap()
+        .apply(RuntimeCommand::Disable)
+        .unwrap();
+    for phase in [10, 11] {
+        let input = Keyboard::new(phase, 1, left_control, 0, 0, None);
+        assert_eq!(h.send(&input, physical), EventTapAction::Pass);
+        assert_eq!(input.metadata().raw_flags, left_control);
+    }
+    assert!(h.outputs.is_empty(), "paused mode converted Control+S");
+
+    for (code, extra, mapped_flags) in [
+        (56, 0x0002_0002, None),
+        (58, 0x0008_0020, Some(M::LEFT_CONTROL | M::LEFT_WINDOWS)),
+        (55, 0x0010_0008, Some(M::LEFT_CONTROL | M::LEFT_ALT)),
+    ] {
+        let mut h = Harness::new(true, false);
+        assert_eq!(h.send(&ctrl, physical), EventTapAction::Pass);
+        let input = Keyboard::new(12, code, left_control | extra, 0, 0, None);
+        h.send(&input, physical);
+        h.outputs.clear();
+        for phase in [10, 11] {
+            let input = Keyboard::new(phase, 1, left_control | extra, 0, 0, None);
+            let decision = if mapped_flags.is_some() {
+                EventTapAction::Suppress
+            } else {
+                EventTapAction::Pass
+            };
+            assert_eq!(h.send(&input, physical), decision);
+        }
+        let expected: Vec<_> = mapped_flags
+            .into_iter()
+            .flat_map(|modifiers| {
+                [EventPhase::Down, EventPhase::Up].map(|phase| OutputEvent::Key {
+                    code: PhysicalCode::key(1),
+                    phase,
+                    modifiers,
+                })
+            })
+            .collect();
+        assert_eq!(h.outputs, expected);
+    }
+}
+
+#[test]
+fn exact_ctrl_s_keeps_its_flags_without_releasing_other_stream_modifiers() {
+    use EventPhase::{Down, Repeat, Up};
+
+    let software = KeyboardSourceKind::Software;
+    let physical = KeyboardSourceKind::HardwareLike;
+    let ctrl_flags = 0x0004_0001;
+    let shift_flags = 0x0002_0002;
+
+    for (saver, saver_pid, other, pid) in [
+        (software, 501, physical, 0),
+        (software, 501, software, 502),
+        (physical, 0, software, 502),
+    ] {
+        let mut h = Harness::new(true, false);
+        let ctrl_down = Keyboard::new(12, 59, ctrl_flags, saver_pid, 0, None);
+        let save_down = Keyboard::new(10, 1, ctrl_flags, saver_pid, 0, None);
+        let save_repeat = Keyboard::new(10, 1, ctrl_flags, saver_pid, 0, None);
+        unsafe { CGEventSetIntegerValueField(save_repeat.raw, 8, 1) };
+        let save_up = Keyboard::new(11, 1, ctrl_flags, saver_pid, 0, None);
+        let shift_down = Keyboard::new(12, 56, shift_flags, pid, 0, None);
+        assert_eq!(h.send(&shift_down, other), EventTapAction::Pass);
+        assert_eq!(h.send(&ctrl_down, saver), EventTapAction::Pass);
+        assert_eq!(h.send(&save_down, saver), EventTapAction::Suppress);
+
+        // Another modifier arrives after the binding was frozen. Every saved
+        // S event must still use only Command, with the extra holders intact.
+        let option_flags = 0x0008_0020;
+        let option_down = Keyboard::new(12, 58, shift_flags | option_flags, pid, 0, None);
+        h.send(&option_down, other);
+        let before_repeat = h.outputs.len();
+        assert_eq!(h.send(&save_repeat, saver), EventTapAction::Suppress);
+        assert_eq!(h.send(&save_up, saver), EventTapAction::Suppress);
+        assert_eq!(
+            &h.outputs[before_repeat..],
+            &[Repeat, Up].map(|phase| OutputEvent::Key {
+                code: PhysicalCode::key(1),
+                phase,
+                modifiers: M::LEFT_COMMAND,
+            })
+        );
+        assert_eq!(
+            h.outputs.first(),
+            Some(&OutputEvent::Key {
+                code: PhysicalCode::key(1),
+                phase: Down,
+                modifiers: M::LEFT_COMMAND,
+            })
+        );
+        let stream = if pid == 0 {
+            InputStream::Local
+        } else {
+            InputStream::Software(Harness::source(&shift_down, other).id)
+        };
+        assert!(h
+            .runtime
+            .lock()
+            .unwrap()
+            .output_ownership
+            .has_native(stream, PhysicalCode::key(56)));
+        let shift_up = Keyboard::new(12, 56, option_flags, pid, 0, None);
+        h.send(&shift_up, other);
+        let option_up = Keyboard::new(12, 58, 0, pid, 0, None);
+        h.send(&option_up, other);
+        assert!(!h
+            .runtime
+            .lock()
+            .unwrap()
+            .output_ownership
+            .has_native(stream, PhysicalCode::key(56)));
+    }
+}
+
+#[test]
+fn synthetic_control_does_not_make_another_software_streams_s_a_save_shortcut() {
+    let mut h = Harness::new(true, false);
+    let source = KeyboardSourceKind::Software;
+    let ctrl = 0x0004_0001;
+    assert_eq!(
+        h.send(&Keyboard::new(12, 59, ctrl, 501, 0, None), source),
+        EventTapAction::Pass
+    );
+    for phase in [10, 11] {
+        let input = Keyboard::new(phase, 1, ctrl, 502, 0, None);
+        assert_eq!(h.send(&input, source), EventTapAction::Pass);
+    }
+    assert!(h.outputs.is_empty());
+}
+
+#[test]
+fn disabling_mapping_releases_a_held_save_key_without_releasing_native_control() {
+    let mut h = Harness::new(true, false);
+    let source = KeyboardSourceKind::HardwareLike;
+    let ctrl = 0x0004_0001;
+    assert_eq!(
+        h.send(&Keyboard::new(12, 59, ctrl, 0, 0, None), source),
+        EventTapAction::Pass
+    );
+    assert_eq!(
+        h.send(&Keyboard::new(10, 1, ctrl, 0, 0, None), source),
+        EventTapAction::Suppress
+    );
+    let mut runtime = h.runtime.lock().unwrap();
+    assert!(matches!(
+        runtime.apply(RuntimeCommand::Disable).unwrap().as_slice(),
+        [OutputEvent::Key {
+            code: PhysicalCode::Key(1),
+            phase: EventPhase::Up,
+            ..
+        }]
+    ));
+    assert!(runtime
+        .output_ownership
+        .has_native(InputStream::Local, PhysicalCode::left_control()));
+    assert!(runtime.apply(RuntimeCommand::Disable).unwrap().is_empty());
+}
+
+#[test]
 fn caps_lock_keeps_its_native_event_and_mapped_modifier_flags() {
     const COMMAND: u64 = 0x0010_0008;
     const CAPS_LOCK: u64 = 0x0001_0000;
