@@ -115,6 +115,7 @@ struct Harness {
     own: u64,
     routes: KeyboardRoutingState,
     local: EventNormalizer,
+    local_keys: LocalKeyboard,
     outputs: Vec<OutputEvent>,
 }
 
@@ -147,6 +148,7 @@ impl Harness {
             own,
             routes: KeyboardRoutingState::default(),
             local: EventNormalizer::new(own),
+            local_keys: LocalKeyboard::default(),
             outputs: Vec::new(),
         }
     }
@@ -162,7 +164,35 @@ impl Harness {
         }
     }
 
+    fn map_to_n(&mut self, trigger: u16) {
+        let mut runtime = self.runtime.lock().unwrap();
+        let mut config = runtime.config().unwrap().clone();
+        config
+            .profiles
+            .get_mut(&config.active_profile)
+            .unwrap()
+            .keyboard_rules
+            .push(Rule {
+                trigger: format!("key:{trigger}"),
+                action: "key:45".into(),
+                priority: 600,
+                ..Default::default()
+            });
+        runtime
+            .apply(RuntimeCommand::ReplaceConfig(config))
+            .unwrap();
+    }
+
     fn send(&mut self, keyboard: &Keyboard, kind: KeyboardSourceKind) -> EventTapAction {
+        self.send_with_bypass(keyboard, kind, KeyboardBypass::default())
+    }
+
+    fn send_with_bypass(
+        &mut self,
+        keyboard: &Keyboard,
+        kind: KeyboardSourceKind,
+        bypass: KeyboardBypass,
+    ) -> EventTapAction {
         let source = Self::source(keyboard, kind);
         let outputs = &mut self.outputs;
         let routed = route_keyboard_classified(
@@ -174,6 +204,7 @@ impl Harness {
             &self.runtime,
             &self.diagnostics,
             &self.pending,
+            bypass,
             |batch, _| {
                 outputs.extend_from_slice(batch);
                 Ok(())
@@ -185,14 +216,17 @@ impl Harness {
         let Some(event) = self.local.normalize(keyboard.input()) else {
             return EventTapAction::Pass;
         };
-        let decision = self
-            .runtime
-            .lock()
-            .unwrap()
-            .process_event_marked(&event, |batch, _| {
+        let decision = self.runtime.lock().unwrap().process_local_raw(
+            keyboard.input(),
+            &event,
+            &mut self.local_keys,
+            bypass,
+            || false,
+            |batch, _| {
                 outputs.extend_from_slice(batch);
                 Ok(())
-            });
+            },
+        );
         if decision == Decision::Suppress {
             EventTapAction::Suppress
         } else {
@@ -205,6 +239,95 @@ fn has_key(outputs: &[OutputEvent], code: u16, phase: EventPhase, modifiers: M) 
     outputs.iter().any(|output| matches!(output,
         OutputEvent::Key { code:PhysicalCode::Key(actual),phase:actual_phase,modifiers:actual_modifiers }
         if *actual == code && *actual_phase == phase && actual_modifiers.contains(modifiers)))
+}
+
+#[test]
+fn caps_lock_keeps_its_native_event_and_mapped_modifier_flags() {
+    const COMMAND: u64 = 0x0010_0008;
+    const CAPS_LOCK: u64 = 0x0001_0000;
+    for (source, pid) in [
+        (KeyboardSourceKind::HardwareLike, 0),
+        (KeyboardSourceKind::Software, 501),
+    ] {
+        let mut h = Harness::new(false, false);
+        let command = Keyboard::new(12, 55, COMMAND, pid, 0, None);
+        assert_eq!(h.send(&command, source), EventTapAction::Suppress);
+        let caps = Keyboard::new(12, 57, COMMAND | CAPS_LOCK, pid, 0, None);
+        assert_eq!(h.send(&caps, source), EventTapAction::Pass);
+        assert_eq!(unsafe { CGEventGetType(caps.raw) }, 12);
+        assert_eq!(caps.metadata().keycode, 57);
+        assert_eq!(caps.metadata().raw_flags, CAPS_LOCK | 0x0008_0020);
+        assert!(has_key(&h.outputs, 58, EventPhase::Down, M::LEFT_ALT));
+        assert_eq!(h.outputs.len(), 1);
+        assert_eq!(h.runtime.lock().unwrap().status(), &RuntimeStatus::Running);
+        let release = Keyboard::new(12, 55, CAPS_LOCK, pid, 0, None);
+        assert_eq!(h.send(&release, source), EventTapAction::Suppress);
+        assert!(has_key(&h.outputs, 58, EventPhase::Up, M::NONE));
+    }
+}
+
+#[test]
+fn focused_clipboard_forwards_navigation_and_freezes_existing_key_sequences() {
+    let focused = KeyboardBypass {
+        clipboard_focused: true,
+        ..Default::default()
+    };
+    for (source, pid) in [
+        (KeyboardSourceKind::HardwareLike, 0),
+        (KeyboardSourceKind::Software, 501),
+    ] {
+        for key in [36, 48, 53, 76, 125, 126] {
+            let mut h = Harness::new(false, false);
+            h.map_to_n(key);
+            let down = Keyboard::new(10, key, 0, pid, 0, None);
+            let repeat = Keyboard::new(10, key, 0, pid, 0, None);
+            unsafe { CGEventSetIntegerValueField(repeat.raw, 8, 1) };
+            let up = Keyboard::new(11, key, 0, pid, 0, None);
+            assert_eq!(
+                h.send_with_bypass(&down, source, focused),
+                EventTapAction::Pass
+            );
+            assert_eq!(h.send(&repeat, source), EventTapAction::Pass);
+            assert_eq!(h.send(&up, source), EventTapAction::Pass);
+            assert!(h.outputs.is_empty(), "navigation key {key} was mapped");
+
+            assert_eq!(h.send(&down, source), EventTapAction::Suppress);
+            assert_eq!(
+                h.send_with_bypass(&up, source, focused),
+                EventTapAction::Suppress
+            );
+            assert!(has_key(&h.outputs, 45, EventPhase::Down, M::NONE));
+            assert!(has_key(&h.outputs, 45, EventPhase::Up, M::NONE));
+        }
+    }
+}
+
+#[test]
+fn recording_keeps_a_recognized_software_key_raw_until_release() {
+    let mut h = Harness::new(false, false);
+    h.map_to_n(11);
+    let recording = KeyboardBypass {
+        recording: true,
+        ..Default::default()
+    };
+    let source = KeyboardSourceKind::Software;
+    let down = Keyboard::new(10, 11, 0, 501, 0, Some("b"));
+    let up = Keyboard::new(11, 11, 0, 501, 0, None);
+    assert_eq!(
+        h.send_with_bypass(&down, source, recording),
+        EventTapAction::Pass
+    );
+    assert_eq!(down.metadata().keycode, 11);
+    assert_eq!(down.unicode(), vec![u16::from(b'b')]);
+    assert_eq!(h.send(&up, source), EventTapAction::Pass);
+    assert!(h.outputs.is_empty());
+    assert_eq!(h.send(&down, source), EventTapAction::Suppress);
+    assert_eq!(
+        h.send_with_bypass(&up, source, recording),
+        EventTapAction::Suppress
+    );
+    assert!(has_key(&h.outputs, 45, EventPhase::Down, M::NONE));
+    assert!(has_key(&h.outputs, 45, EventPhase::Up, M::NONE));
 }
 
 #[test]
@@ -404,6 +527,7 @@ fn text_does_not_wait_for_a_busy_runtime_mutex() {
             &worker_runtime,
             &diagnostics,
             &pending,
+            KeyboardBypass::default(),
             |_, _| panic!("text cannot inject while runtime is busy"),
         );
         send.send(result).unwrap();

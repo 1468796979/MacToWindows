@@ -16,6 +16,7 @@
     ShiftRight: 60, AltRight: 61, ControlRight: 62, ArrowRight: 124, ArrowLeft: 123,
     ArrowDown: 125, ArrowUp: 126, F1: 122, F2: 120, F3: 99, F4: 118, F5: 96,
     F6: 97, F7: 98, F8: 100, F9: 101, F10: 109, F11: 103, F12: 111,
+    NumpadEnter: 76, Home: 115, PageUp: 116, Delete: 117, End: 119, PageDown: 121,
   };
 
   const MODIFIER_CODES = new Set([
@@ -73,17 +74,21 @@
 
   function createRecorder() {
     const held = new Set();
-    let chord = new Set();
+    let releasedChord = null;
     let recording = false;
-    const cancel = () => { recording = false; chord.clear(); };
+    const cancel = () => { recording = false; releasedChord = null; };
     return {
-      start() { recording = true; chord = new Set(held); },
+      start() { recording = true; releasedChord = null; },
       cancel,
       reset() { cancel(); held.clear(); },
       keyDown(event) {
         if (MODIFIER_CODES.has(event.code)) {
+          const added = !held.has(event.code);
           held.add(event.code);
-          if (recording) held.forEach((code) => chord.add(code));
+          if (recording && releasedChord && added) {
+            cancel();
+            throw new Error("松键后又按下了修饰键。请同时按住需要的修饰键后重新录制。");
+          }
           return null;
         }
         if (!recording) return null;
@@ -92,10 +97,11 @@
         return result;
       },
       keyUp(event) {
-        if (!MODIFIER_CODES.has(event.code)) return null;
+        if (!held.has(event.code)) return null;
+        if (recording && !releasedChord) releasedChord = new Set(held);
         held.delete(event.code);
-        if (!recording || held.size || !chord.size) return null;
-        const names = Array.from(MODIFIER_CODES).filter((code) => chord.has(code)).map(modifierName);
+        if (!recording || held.size) return null;
+        const names = Array.from(MODIFIER_CODES).filter((code) => releasedChord.has(code)).map(modifierName);
         cancel();
         return names.length === 1 ? names[0] : `modifier_chord:${names.join("|")}`;
       },

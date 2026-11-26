@@ -1,6 +1,6 @@
 use event_model::{
-    AppContext, EventKind, EventPhase, ModifierSet, NormalizedEvent, OutputEvent, PhysicalCode,
-    ScrollAxis,
+    AppContext, Decision, EventKind, EventPhase, ModifierSet, NormalizedEvent, OutputEvent,
+    PhysicalCode, ScrollAxis, ScrollAxisTransform,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -819,31 +819,7 @@ impl RuleEngine {
             return event_model::Decision::Pass;
         }
         if event.kind == EventKind::Scroll {
-            let mut invert_x = false;
-            let mut invert_y = false;
-            let mut only_axis_transforms = true;
-            for axis in [ScrollAxis::Horizontal, ScrollAxis::Vertical] {
-                let mut adjusted = event.clone();
-                adjusted.code = PhysicalCode::Scroll(axis);
-                match self.rules.find(&adjusted).map(|rule| &rule.action) {
-                    Some(Action::InvertScroll) => match axis {
-                        ScrollAxis::Horizontal => invert_x = true,
-                        ScrollAxis::Vertical => invert_y = true,
-                    },
-                    Some(Action::Pass) | None => {}
-                    _ => only_axis_transforms = false,
-                }
-            }
-            if only_axis_transforms {
-                return if invert_x || invert_y {
-                    event_model::Decision::Emit(vec![OutputEvent::ScrollTransform {
-                        invert_x,
-                        invert_y,
-                    }])
-                } else {
-                    event_model::Decision::Pass
-                };
-            }
+            return self.handle_scroll(event);
         }
         let action = self
             .rules
@@ -886,23 +862,92 @@ impl RuleEngine {
                 };
                 event_model::Decision::Emit(outputs)
             }
-            Some(Action::InvertScroll) => {
-                event_model::Decision::Emit(vec![OutputEvent::ScrollTransform {
-                    invert_x: matches!(event.code, PhysicalCode::Scroll(ScrollAxis::Horizontal)),
-                    invert_y: matches!(event.code, PhysicalCode::Scroll(ScrollAxis::Vertical)),
-                }])
-            }
             None if self.state.keyboard_policy == KeyboardMappingPolicy::ShortcutsOnly
                 && matches!(event.kind, EventKind::Keyboard | EventKind::FlagsChanged) =>
             {
                 self.pass_event(event)
             }
-            None => self.default_modifier_decision(event),
+            Some(Action::InvertScroll) | None => self.default_modifier_decision(event),
+        }
+    }
+
+    fn handle_scroll(&self, event: &NormalizedEvent) -> Decision {
+        use ScrollAxisTransform::{Invert, Keep, Remove};
+
+        let moved = |axis| match &event.scroll {
+            Some(delta) => match axis {
+                ScrollAxis::Horizontal => delta.x != 0.0,
+                ScrollAxis::Vertical => delta.y != 0.0,
+            },
+            None => event.code == PhysicalCode::Scroll(axis),
+        };
+        let mut outputs = Vec::new();
+        let mut keep_scroll = false;
+        let has_gesture_phase = event.phase == EventPhase::ScrollGesture;
+        let mut has_native_axis = false;
+        let mut transform = |axis| {
+            let moving = moved(axis);
+            if !moving && !has_gesture_phase {
+                return Keep;
+            }
+            let mut adjusted = event.clone();
+            adjusted.code = PhysicalCode::Scroll(axis);
+            let transform = match self.rules.find(&adjusted).map(|rule| &rule.action) {
+                Some(Action::Suppress) => Remove,
+                Some(Action::Replace(action)) => {
+                    if moving {
+                        outputs.extend(action.iter().cloned());
+                    }
+                    Remove
+                }
+                Some(Action::InvertScroll) => Invert,
+                Some(Action::Pass) | None => Keep,
+            };
+            has_native_axis |= transform != Remove;
+            if moving {
+                keep_scroll |= transform != Remove;
+                transform
+            } else {
+                Keep
+            }
+        };
+        let x = transform(ScrollAxis::Horizontal);
+        let y = transform(ScrollAxis::Vertical);
+        if x == Keep && y == Keep {
+            // Also pass zero-delta packets carrying native gesture phases.
+            return Decision::Pass;
+        }
+        if keep_scroll {
+            outputs.push(if x == Remove || y == Remove {
+                OutputEvent::ScrollTransformAxes { x, y }
+            } else {
+                OutputEvent::ScrollTransform {
+                    invert_x: x == Invert,
+                    invert_y: y == Invert,
+                }
+            });
+        } else if has_gesture_phase && has_native_axis {
+            // Another axis may scroll later in this gesture, or may have
+            // scrolled earlier. Preserve the phase without the consumed delta.
+            outputs.push(OutputEvent::ScrollTransformAxes {
+                x: Remove,
+                y: Remove,
+            });
+        }
+        if outputs.is_empty() {
+            Decision::Suppress
+        } else {
+            Decision::Emit(outputs)
         }
     }
 
     fn default_modifier_decision(&mut self, event: &NormalizedEvent) -> event_model::Decision {
-        if !matches!(event.kind, EventKind::Keyboard | EventKind::FlagsChanged) {
+        let phase = effective_phase(event);
+        // Unmanaged flagsChanged events (including Caps Lock and Fn) cannot
+        // be rebuilt as key presses. Let the adapter rewrite their flags in place.
+        if !matches!(event.kind, EventKind::Keyboard | EventKind::FlagsChanged)
+            || phase == EventPhase::Changed
+        {
             return self.pass_event(event);
         }
         let mapped = self.map_modifier_flags(event.modifiers);
@@ -911,10 +956,10 @@ impl RuleEngine {
         }
         let output = OutputEvent::Key {
             code: event.code,
-            phase: effective_phase(event),
+            phase,
             modifiers: mapped,
         };
-        if is_press_phase(effective_phase(event)) {
+        if is_press_phase(phase) {
             return self.acquire_binding(event, vec![output], false, true);
         }
         event_model::Decision::Emit(vec![output])
@@ -1928,6 +1973,131 @@ mod tests {
                 invert_y: false
             }])
         );
+    }
+
+    #[test]
+    fn scroll_actions_apply_per_moving_axis_without_losing_the_other_axis() {
+        use event_model::ScrollDelta;
+        use ScrollAxisTransform::{Invert, Keep, Remove};
+
+        let output = |phase| OutputEvent::Key {
+            code: PhysicalCode::key(3),
+            phase,
+            modifiers: ModifierSet::NONE,
+        };
+        let scroll_rule = |axis, action| Rule {
+            id: format!("{axis:?}"),
+            enabled: true,
+            priority: 0,
+            scope: RuleScope::Global,
+            trigger: Trigger::Scroll { axis },
+            action,
+        };
+        let rules = |vertical| {
+            CompiledRules::compile(vec![
+                scroll_rule(
+                    ScrollAxis::Horizontal,
+                    Action::Replace(vec![output(EventPhase::Down)]),
+                ),
+                scroll_rule(ScrollAxis::Vertical, vertical),
+            ])
+            .unwrap()
+        };
+        let mut engine = RuleEngine::new(rules(Action::InvertScroll));
+        let scroll = |x, y, axis| NormalizedEvent {
+            source: DeviceSource::Mouse,
+            kind: EventKind::Scroll,
+            code: PhysicalCode::Scroll(axis),
+            phase: EventPhase::Motion,
+            scroll: Some(ScrollDelta { x, y }),
+            ..key(0, EventPhase::Motion)
+        };
+        let horizontal = scroll(1.0, 0.0, ScrollAxis::Horizontal);
+        let horizontal_gesture = NormalizedEvent {
+            phase: EventPhase::ScrollGesture,
+            ..horizontal.clone()
+        };
+        let diagonal = scroll(1.0, 0.125, ScrollAxis::Vertical);
+        let vertical = scroll(0.0, 0.125, ScrollAxis::Vertical);
+        let phase_only = scroll(0.0, 0.0, ScrollAxis::Vertical);
+        let press = output(EventPhase::Down);
+        let release = output(EventPhase::Up);
+        assert_eq!(
+            engine.handle(&horizontal),
+            Decision::Emit(vec![press.clone(), release.clone()])
+        );
+        assert_eq!(
+            engine.handle(&horizontal_gesture),
+            Decision::Emit(vec![
+                press.clone(),
+                release.clone(),
+                OutputEvent::ScrollTransformAxes {
+                    x: Remove,
+                    y: Remove,
+                },
+            ])
+        );
+        assert_eq!(
+            engine.handle(&diagonal),
+            Decision::Emit(vec![
+                press.clone(),
+                release.clone(),
+                OutputEvent::ScrollTransformAxes {
+                    x: Remove,
+                    y: Invert,
+                },
+            ])
+        );
+        assert_eq!(
+            engine.handle(&vertical),
+            Decision::Emit(vec![OutputEvent::ScrollTransform {
+                invert_x: false,
+                invert_y: true,
+            }])
+        );
+        assert_eq!(engine.handle(&phase_only), Decision::Pass);
+
+        engine.replace_rules(rules(Action::Pass));
+        assert_eq!(
+            engine.handle(&diagonal),
+            Decision::Emit(vec![
+                press.clone(),
+                release.clone(),
+                OutputEvent::ScrollTransformAxes { x: Remove, y: Keep },
+            ])
+        );
+        engine.replace_rules(rules(Action::Suppress));
+        assert_eq!(
+            engine.handle(&horizontal_gesture),
+            Decision::Emit(vec![press.clone(), release.clone()])
+        );
+        assert_eq!(
+            engine.handle(&diagonal),
+            Decision::Emit(vec![press, release])
+        );
+        assert_eq!(engine.handle(&vertical), Decision::Suppress);
+        assert_eq!(engine.handle(&phase_only), Decision::Pass);
+    }
+
+    #[test]
+    fn unmanaged_flags_changes_pass_with_a_mapped_modifier_held() {
+        let mut command = replacement("left_command_to_option", 55, 58, 1);
+        command.action = Action::Replace(vec![OutputEvent::Key {
+            code: PhysicalCode::left_option(),
+            phase: EventPhase::Down,
+            modifiers: ModifierSet::LEFT_OPTION,
+        }]);
+        let mut engine = RuleEngine::new(CompiledRules::compile(vec![command]).unwrap());
+        assert!(matches!(
+            engine.handle(&modifier(55, ModifierSet::LEFT_COMMAND, 1)),
+            Decision::Emit(_)
+        ));
+        for code in [57, 63] {
+            let event = modifier(code, ModifierSet::LEFT_COMMAND, 2);
+            assert_eq!(engine.handle(&event), Decision::Pass);
+            assert_eq!(engine.modifiers_for_event(&event), ModifierSet::LEFT_OPTION);
+            assert!(!engine.state().physical_down(event.code));
+        }
     }
 
     #[test]

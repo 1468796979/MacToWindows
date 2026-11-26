@@ -7,7 +7,7 @@ use rule_engine::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashSet},
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{self, Write},
     path::Path,
 };
@@ -187,6 +187,12 @@ pub enum ConfigError {
     UnsupportedScope(String),
     #[error("rule compilation failed: {0}")]
     RuleCompile(#[from] EngineError),
+}
+
+#[derive(Debug)]
+pub enum SaveOutcome {
+    Saved,
+    DirectorySyncFailed(io::Error),
 }
 
 impl AppConfig {
@@ -395,6 +401,10 @@ where
     F: Fn(&Rule) -> Result<RuleScope, ConfigError>,
 {
     for (index, input) in inputs.iter().enumerate() {
+        let rule_scope = scope(input)?;
+        if matches!(rule_scope, RuleScope::Global) {
+            validate_global_scope_fields(profile_id, category, index, input)?;
+        }
         let trigger = parse_trigger(&input.trigger).ok_or_else(|| {
             ConfigError::InvalidRule(format!("profiles.{profile_id}.{category}[{index}].trigger"))
         })?;
@@ -418,10 +428,29 @@ where
             id: input.id.clone(),
             enabled: input.enabled,
             priority: input.priority,
-            scope: scope(input)?,
+            scope: rule_scope,
             trigger,
             action,
         });
+    }
+    Ok(())
+}
+
+fn validate_global_scope_fields(
+    profile_id: &str,
+    category: &str,
+    index: usize,
+    rule: &Rule,
+) -> Result<(), ConfigError> {
+    for (field, present) in [
+        ("app_bundle_id", rule.app_bundle_id.is_some()),
+        ("device_identifier", rule.device_identifier.is_some()),
+    ] {
+        if rule.enabled && present {
+            return Err(ConfigError::InvalidRule(format!(
+                "profiles.{profile_id}.{category}[{index}].{field}: an enabled global rule cannot be restricted to an application or device"
+            )));
+        }
     }
     Ok(())
 }
@@ -732,6 +761,12 @@ pub fn import_saved_toml(input: &str) -> Result<(AppConfig, Vec<String>), Config
             ("device_rules", &mut profile.device_rules),
         ] {
             for (index, rule) in rules.iter_mut().enumerate() {
+                if matches!(
+                    category,
+                    "keyboard_rules" | "mouse_rules" | "global_hotkeys"
+                ) {
+                    validate_global_scope_fields(profile_id, category, index, rule)?;
+                }
                 if rule.enabled
                     && rule.action == "invert_scroll"
                     && parse_trigger(&rule.trigger)
@@ -835,34 +870,49 @@ pub fn load(path: impl AsRef<Path>) -> Result<AppConfig, ConfigError> {
     import_toml(&fs::read_to_string(path)?)
 }
 
-pub fn save_atomic(path: impl AsRef<Path>, config: &AppConfig) -> Result<(), ConfigError> {
-    let path = path.as_ref();
+pub fn save_atomic(path: impl AsRef<Path>, config: &AppConfig) -> Result<SaveOutcome, ConfigError> {
+    save_with_directory_sync(path.as_ref(), config, File::sync_all)
+}
+
+fn save_with_directory_sync(
+    path: &Path,
+    config: &AppConfig,
+    sync_directory: impl FnOnce(&File) -> io::Result<()>,
+) -> Result<SaveOutcome, ConfigError> {
     let data = export_toml(config)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let directory = File::open(parent)?;
     let tmp = path.with_extension(format!("tmp.{}.{}", std::process::id(), unique_suffix()));
+    let backup_tmp = path.with_extension(format!(
+        "bak.tmp.{}.{}",
+        std::process::id(),
+        unique_suffix()
+    ));
     let result = (|| {
-        let mut file = File::create(&tmp)?;
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
         file.write_all(data.as_bytes())?;
         file.sync_all()?;
         let backup = path.with_extension("toml.bak");
-        if path.exists() {
-            let backup_tmp = path.with_extension(format!("bak.tmp.{}", unique_suffix()));
+        if path.try_exists()? {
             fs::copy(path, &backup_tmp)?;
             File::open(&backup_tmp)?.sync_all()?;
             fs::rename(&backup_tmp, &backup)?;
         }
-        fs::rename(&tmp, path)?;
-        if let Some(parent) = path.parent() {
-            File::open(parent)?.sync_all()?;
-        }
-        Ok::<(), io::Error>(())
+        fs::rename(&tmp, path)
     })();
-    if result.is_err() {
+    if let Err(error) = result {
         let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_file(&backup_tmp);
+        return Err(error.into());
     }
-    result.map_err(ConfigError::Io)
+    Ok(match sync_directory(&directory) {
+        Ok(()) => SaveOutcome::Saved,
+        Err(error) => SaveOutcome::DirectorySyncFailed(error),
+    })
 }
 
 fn unique_suffix() -> u128 {
@@ -891,6 +941,54 @@ mod tests {
         let text = export_toml(&config).unwrap();
         let decoded = import_toml(&text).unwrap();
         assert_eq!(decoded, config);
+    }
+
+    #[test]
+    fn imports_reject_enabled_global_rules_with_scope_fields() {
+        for (category, field) in [
+            ("keyboard_rules", "app_bundle_id"),
+            ("mouse_rules", "device_identifier"),
+            ("global_hotkeys", "app_bundle_id"),
+        ] {
+            let input = format!(
+                "schema_version = 2\nactive_profile = 'custom'\n\
+                 [[profiles.custom.{category}]]\n\
+                 id = '00000000-0000-4000-8000-000000000001'\nname = 'scoped'\n\
+                 trigger = 'key:11'\naction = 'key:45'\n{field} = 'example'\n"
+            );
+            let location = format!("profiles.custom.{category}[0].{field}");
+            assert!(import_toml(&input)
+                .unwrap_err()
+                .to_string()
+                .contains(&location));
+            assert!(import_saved_toml(&input)
+                .unwrap_err()
+                .to_string()
+                .contains(&location));
+            let disabled = format!("{input}enabled = false\n");
+            assert!(import_toml(&disabled).is_ok());
+            assert!(import_saved_toml(&disabled).is_ok());
+        }
+    }
+
+    #[test]
+    fn directory_sync_failure_identifies_already_replaced_primary() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let baseline = AppConfig::default();
+        let mut updated = baseline.clone();
+        updated.active_profile = "custom".into();
+        save_atomic(&path, &baseline).unwrap();
+        let outcome = save_with_directory_sync(&path, &updated, |_| {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "synthetic directory sync failure",
+            ))
+        })
+        .unwrap();
+        assert!(matches!(outcome, SaveOutcome::DirectorySyncFailed(_)));
+        assert_eq!(load(&path).unwrap(), updated);
+        assert_eq!(load(path.with_extension("toml.bak")).unwrap(), baseline);
     }
 
     #[test]

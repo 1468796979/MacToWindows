@@ -171,6 +171,10 @@ impl OutputOwnership {
         self.release_matching(|owner| matches!(owner, OutputOwner::Mapped(s, _) if s == stream))
     }
 
+    pub(crate) fn release_stream(&mut self, stream: InputStream) -> Vec<OutputEvent> {
+        self.release_matching(|owner| owner.stream() == stream)
+    }
+
     fn release_matching(
         &mut self,
         matches_owner: impl Fn(OutputOwner) -> bool,

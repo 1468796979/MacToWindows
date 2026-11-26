@@ -1,6 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const {
+  createRecorder,
   normalizeRule,
   recordedTrigger,
 } = require("./rule-editor-core.js");
@@ -49,7 +50,7 @@ test("recordedTrigger joins multiple modifiers with the backend delimiter", () =
 });
 
 test("recorder preserves right and simultaneous left/right modifiers", () => {
-  const recorder = require("./rule-editor-core.js").createRecorder();
+  const recorder = createRecorder();
   recorder.keyDown({ code: "ControlRight", ctrlKey: true });
   recorder.start();
   recorder.keyDown({ code: "ShiftRight", ctrlKey: true, shiftKey: true });
@@ -63,7 +64,7 @@ test("recorder preserves right and simultaneous left/right modifiers", () => {
 });
 
 test("pure modifier combinations commit after all modifiers are released", () => {
-  const recorder = require("./rule-editor-core.js").createRecorder();
+  const recorder = createRecorder();
   recorder.start();
   assert.equal(recorder.keyDown({ code: "ControlRight", ctrlKey: true }), null);
   assert.equal(recorder.keyDown({ code: "ShiftLeft", ctrlKey: true, shiftKey: true }), null);
@@ -74,8 +75,35 @@ test("pure modifier combinations commit after all modifiers are released", () =>
   assert.equal(recorder.keyUp({ code: "MetaRight", metaKey: false }), "right_command");
 });
 
+test("a newly pressed modifier after the first release cancels the recording", () => {
+  const recorder = createRecorder();
+  recorder.start();
+  recorder.keyDown({ code: "ControlLeft" });
+  recorder.keyDown({ code: "ShiftLeft" });
+  assert.equal(recorder.keyUp({ code: "ControlLeft" }), null);
+  assert.throws(() => recorder.keyDown({ code: "AltLeft" }), /重新录制/);
+  assert.equal(recorder.keyUp({ code: "ShiftLeft" }), null);
+  assert.equal(recorder.keyUp({ code: "AltLeft" }), null);
+  recorder.start();
+  for (const code of ["ControlRight", "ControlLeft", "ShiftRight"]) recorder.keyDown({ code });
+  assert.equal(recorder.keyUp({ code: "ControlLeft" }), null);
+  assert.equal(recorder.keyUp({ code: "ShiftRight" }), null);
+  assert.equal(recorder.keyUp({ code: "ControlRight" }), "modifier_chord:left_control|right_control|right_shift");
+});
+
+test("macOS navigation keys and keypad Enter use their physical key codes", () => {
+  const keyCodes = { Delete: 117, Home: 115, End: 119, PageUp: 116, PageDown: 121, NumpadEnter: 76 };
+  const recorder = createRecorder();
+  for (const [code, keyCode] of Object.entries(keyCodes)) {
+    recorder.start();
+    assert.equal(recorder.keyDown({ code }), `key:${keyCode}`);
+  }
+  assert.notEqual(recordedTrigger({ code: "Backspace" }), recordedTrigger({ code: "Delete" }));
+  assert.notEqual(recordedTrigger({ code: "Enter" }), recordedTrigger({ code: "NumpadEnter" }));
+});
+
 test("blur reset and modifier releases prevent stale recorded sides", () => {
-  const recorder = require("./rule-editor-core.js").createRecorder();
+  const recorder = createRecorder();
   recorder.keyDown({ code: "ControlRight", ctrlKey: true });
   recorder.reset();
   recorder.start();

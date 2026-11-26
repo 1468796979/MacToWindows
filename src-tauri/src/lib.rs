@@ -15,6 +15,7 @@ use std::thread::JoinHandle;
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 mod clipboard;
+mod instance_lock;
 mod output_ownership;
 #[cfg(test)]
 mod output_ownership_tests;
@@ -164,33 +165,60 @@ enum ClipboardHotkeyDelivery {
     Suppress,
 }
 
-#[cfg(any(target_os = "macos", test))]
 #[derive(Default)]
-struct RuleRecordingKeys(std::collections::HashSet<event_model::PhysicalCode>);
+struct NativeKeyboardKeys(std::collections::HashSet<event_model::PhysicalCode>);
 
-#[cfg(any(target_os = "macos", test))]
-impl RuleRecordingKeys {
-    fn forward(&mut self, event: &NormalizedEvent, recording: bool, already_bound: bool) -> bool {
+impl NativeKeyboardKeys {
+    fn forward(&mut self, event: &NormalizedEvent, bypass: bool, already_bound: bool) -> bool {
         use event_model::{EventKind, EventPhase, ModifierSet, PhysicalCode};
 
         let phase = match (event.kind, event.phase) {
             (EventKind::FlagsChanged, EventPhase::Changed) => match event.code {
-                PhysicalCode::Key(57) => return recording && !already_bound,
-                _ if event.modifiers == ModifierSet::NONE => EventPhase::Up,
-                _ => EventPhase::Down,
+                PhysicalCode::Key(54..=56 | 58..=62) => {
+                    if event.modifiers == ModifierSet::NONE {
+                        EventPhase::Up
+                    } else {
+                        EventPhase::Down
+                    }
+                }
+                _ => return bypass && !already_bound,
             },
             (EventKind::Keyboard | EventKind::FlagsChanged, phase) => phase,
             _ => return false,
         };
         match phase {
             EventPhase::Up => self.0.remove(&event.code),
-            EventPhase::Down if recording && !already_bound => {
+            EventPhase::Down if bypass && !already_bound => {
                 self.0.insert(event.code);
                 true
             }
             _ => self.0.contains(&event.code),
         }
     }
+}
+
+#[derive(Clone, Copy, Default)]
+struct KeyboardBypass {
+    recording: bool,
+    clipboard_focused: bool,
+}
+
+impl KeyboardBypass {
+    fn applies(self, event: &NormalizedEvent) -> bool {
+        use event_model::{EventKind, PhysicalCode};
+
+        self.recording
+            || (self.clipboard_focused
+                && event.kind == EventKind::Keyboard
+                && matches!(event.code, PhysicalCode::Key(36 | 48 | 53 | 76 | 125 | 126)))
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct LocalKeyboard {
+    clipboard_hotkey: ClipboardHotkeyLatch,
+    native_keys: NativeKeyboardKeys,
 }
 
 pub struct RuntimeController {
@@ -202,12 +230,14 @@ pub struct RuntimeController {
     adapter: SafeAdapter,
     input_source: Option<InputSourceService>,
     input_source_request_error: Option<String>,
+    software_cleanup_error: Option<String>,
     clipboard: Option<Arc<clipboard::ClipboardManager>>,
     diagnostics: Arc<Diagnostics>,
     external_keyboard_pending: Arc<AtomicBool>,
     profile: String,
     config: Option<AppConfig>,
     status: RuntimeStatus,
+    disable_generation: u64,
     config_revision: u64,
     pending_releases: Vec<OutputEvent>,
     last_error: Option<String>,
@@ -218,6 +248,7 @@ pub struct AppState {
     pub event_runtime: EventRuntime,
     clipboard: Arc<Mutex<Option<Arc<clipboard::ClipboardManager>>>>,
     settings: settings::SettingsStore,
+    mode_gate: Mutex<()>,
     shutdown_started: AtomicBool,
     shutdown_complete: AtomicBool,
 }
@@ -229,6 +260,7 @@ impl AppState {
             event_runtime: EventRuntime::default(),
             clipboard: Arc::new(Mutex::new(None)),
             settings: settings::SettingsStore::default(),
+            mode_gate: Mutex::new(()),
             shutdown_started: AtomicBool::new(false),
             shutdown_complete: AtomicBool::new(false),
         }
@@ -240,6 +272,7 @@ impl AppState {
             event_runtime: EventRuntime::default(),
             clipboard: Arc::new(Mutex::new(None)),
             settings: settings::SettingsStore::default(),
+            mode_gate: Mutex::new(()),
             shutdown_started: AtomicBool::new(false),
             shutdown_complete: AtomicBool::new(false),
         })
@@ -268,16 +301,25 @@ impl AppState {
 
 #[derive(Default)]
 pub struct EventRuntime {
-    started: Arc<AtomicBool>,
-    stop: Arc<AtomicBool>,
+    started: AtomicBool,
+    closing: AtomicBool,
     rule_recording: Arc<AtomicBool>,
-    thread: Mutex<Option<JoinHandle<()>>>,
+    clipboard_focused: Arc<AtomicBool>,
+    start_gate: Mutex<()>,
+    worker: Mutex<Option<TapWorker>>,
     start_error: Mutex<Option<String>>,
 }
 
+struct TapWorker {
+    stopped: Arc<AtomicBool>,
+    thread: JoinHandle<()>,
+}
+
+type TapReady = std::sync::mpsc::SyncSender<Result<(), String>>;
+
 impl EventRuntime {
     pub fn is_started(&self) -> bool {
-        self.started.load(Ordering::Acquire)
+        self.started.load(Ordering::Acquire) && !self.closing.load(Ordering::Acquire)
     }
 
     pub fn start(
@@ -285,15 +327,76 @@ impl EventRuntime {
         runtime: Arc<Mutex<RuntimeController>>,
         clipboard: Option<Arc<clipboard::ClipboardManager>>,
     ) -> Result<(), String> {
-        if self.started.swap(true, Ordering::AcqRel) {
-            return Ok(());
-        }
-        self.stop.store(false, Ordering::Release);
-        let result = self.start_thread(runtime, clipboard);
+        self.start_with(std::time::Duration::from_secs(3), |stopped, ready_tx| {
+            self.start_thread(runtime, clipboard, stopped, ready_tx)
+        })
+    }
+
+    fn start_with(
+        &self,
+        timeout: std::time::Duration,
+        spawn: impl FnOnce(Arc<AtomicBool>, TapReady) -> Result<JoinHandle<()>, String>,
+    ) -> Result<(), String> {
+        let _start = self
+            .start_gate
+            .lock()
+            .map_err(|_| "event runtime lock poisoned")?;
+        let result = self.start_worker(timeout, spawn);
         if let Ok(mut error) = self.start_error.lock() {
             *error = result.as_ref().err().cloned();
         }
         result
+    }
+
+    fn start_worker(
+        &self,
+        timeout: std::time::Duration,
+        spawn: impl FnOnce(Arc<AtomicBool>, TapReady) -> Result<JoinHandle<()>, String>,
+    ) -> Result<(), String> {
+        let mut worker = self
+            .worker
+            .lock()
+            .map_err(|_| "event runtime lock poisoned")?;
+        if self.closing.load(Ordering::Acquire) {
+            return Err("应用正在退出".into());
+        }
+        if worker
+            .as_ref()
+            .is_some_and(|worker| !worker.thread.is_finished())
+        {
+            return if self.is_started() {
+                Ok(())
+            } else {
+                Err("上一次 Event Tap 启动仍在取消，请稍后重试".into())
+            };
+        }
+        if let Some(previous) = worker.take() {
+            let _ = previous.thread.join();
+        }
+        self.started.store(false, Ordering::Release);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let thread = spawn(Arc::clone(&stopped), ready_tx)?;
+        *worker = Some(TapWorker {
+            stopped: Arc::clone(&stopped),
+            thread,
+        });
+        drop(worker);
+
+        match ready_rx.recv_timeout(timeout) {
+            Ok(Ok(())) if !self.closing.load(Ordering::Acquire) => {
+                self.started.store(true, Ordering::Release);
+                Ok(())
+            }
+            Ok(result) => {
+                stopped.store(true, Ordering::Release);
+                result.and(Err("应用正在退出".into()))
+            }
+            Err(error) => {
+                stopped.store(true, Ordering::Release);
+                Err(format!("Event Tap 启动超时：{error}"))
+            }
+        }
     }
 
     fn last_start_error(&self) -> Option<String> {
@@ -304,14 +407,14 @@ impl EventRuntime {
         &self,
         runtime: Arc<Mutex<RuntimeController>>,
         clipboard: Option<Arc<clipboard::ClipboardManager>>,
-    ) -> Result<(), String> {
+        stopped: Arc<AtomicBool>,
+        ready_tx: TapReady,
+    ) -> Result<JoinHandle<()>, String> {
         #[cfg(target_os = "macos")]
         {
-            let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-            let stopped = Arc::clone(&self.stop);
-            let started = Arc::clone(&self.started);
             let rule_recording = Arc::clone(&self.rule_recording);
-            let thread = std::thread::Builder::new()
+            let clipboard_focused = Arc::clone(&self.clipboard_focused);
+            std::thread::Builder::new()
                 .name("mac-to-windows-event-tap".into())
                 .spawn(move || {
                     let callback_runtime = Arc::clone(&runtime);
@@ -332,16 +435,20 @@ impl EventRuntime {
                             )
                         });
                     let mut normalizer = macos_adapter::EventNormalizer::new(marker);
-                    let mut clipboard_hotkey = ClipboardHotkeyLatch::default();
-                    let mut recording_keys = RuleRecordingKeys::default();
-                    let keyboard_sources = macos_adapter::KeyboardSourceCache::start();
-                    let mut keyboard_routes = macos_adapter::KeyboardRoutingState::default();
+                    let mut local_keys = LocalKeyboard::default();
+                    let keyboard_sources = Arc::new(macos_adapter::KeyboardSourceCache::start());
+                    let keyboard_routes =
+                        Arc::new(Mutex::new(macos_adapter::KeyboardRoutingState::default()));
+                    let callback_sources = Arc::clone(&keyboard_sources);
+                    let callback_routes = Arc::clone(&keyboard_routes);
                     let tap = macos_adapter::EventTap::create(event_mask(), move |raw| {
+                        let Ok(mut routes) = callback_routes.lock() else {
+                            return macos_adapter::EventTapAction::Pass;
+                        };
                         if raw.is_tap_disabled() {
                             normalizer.reset();
-                            clipboard_hotkey.reset();
-                            recording_keys.0.clear();
-                            keyboard_routes.reset();
+                            local_keys = LocalKeyboard::default();
+                            routes.reset();
                             if let Ok(mut controller) = callback_runtime.lock() {
                                 controller.reset_keyboard_continuity();
                                 if controller.status == RuntimeStatus::Running {
@@ -353,14 +460,19 @@ impl EventRuntime {
                             }
                             return macos_adapter::EventTapAction::Pass;
                         }
+                        let bypass = KeyboardBypass {
+                            recording: rule_recording.load(Ordering::Acquire),
+                            clipboard_focused: clipboard_focused.load(Ordering::Acquire),
+                        };
                         if let Some(action) = route_keyboard_source(
                             raw,
                             marker,
-                            &keyboard_sources,
-                            &mut keyboard_routes,
+                            &callback_sources,
+                            &mut routes,
                             &callback_runtime,
                             &diagnostics,
                             &external_keyboard_pending,
+                            bypass,
                             |outputs, own| unsafe {
                                 macos_adapter::inject_outputs_with_context(
                                     outputs,
@@ -375,79 +487,24 @@ impl EventRuntime {
                         let Some(event) = normalizer.normalize(raw) else {
                             return macos_adapter::EventTapAction::Pass;
                         };
-                        let mut inject = |outputs: &[OutputEvent], marker| unsafe {
-                            macos_adapter::inject_outputs_with_context(
-                                outputs,
-                                marker,
-                                raw.proxy(),
-                                raw.raw_event(),
-                            )
-                        };
-                        let recording = rule_recording.load(Ordering::Acquire);
-                        if (recording || !recording_keys.0.is_empty())
-                            && !is_emergency_hotkey(&event)
-                        {
-                            if let Ok(mut controller) = callback_runtime.lock() {
-                                let already_bound =
-                                    controller.engine.state().physical_down(event.code)
-                                        || controller
-                                            .output_ownership
-                                            .has_native(InputStream::Local, event.code)
-                                        || (is_clipboard_key(&event)
-                                            && (clipboard_hotkey.active
-                                                || clipboard_hotkey.forwarding_v));
-                                if recording_keys.forward(&event, recording, already_bound) {
-                                    if event.kind == event_model::EventKind::FlagsChanged {
-                                        clipboard_hotkey.handle(&event);
-                                    }
-                                    return if controller
-                                        .pass_unmapped_local_keyboard(&event, &mut inject)
-                                        == Decision::Pass
-                                    {
-                                        macos_adapter::EventTapAction::Pass
-                                    } else {
-                                        macos_adapter::EventTapAction::Suppress
-                                    };
-                                }
-                            }
-                        }
-                        let hotkey = clipboard_hotkey.delivery(&event, || {
-                            clipboard.as_ref().is_some_and(|manager| manager.try_show())
-                        });
-                        if hotkey == Some(ClipboardHotkeyDelivery::Suppress) {
-                            return macos_adapter::EventTapAction::Suppress;
-                        }
-                        let forward_hotkey = hotkey == Some(ClipboardHotkeyDelivery::Forward);
                         let decision = callback_runtime
                             .lock()
                             .map(|mut controller| {
-                                let decision = if forward_hotkey {
-                                    controller.pass_unmapped_local_keyboard(&event, &mut inject)
-                                } else {
-                                    controller.process_event_marked(&event, &mut inject)
-                                };
-                                if decision == Decision::Pass {
-                                    if let Some(metadata) = raw.keyboard_metadata() {
-                                        let modifiers = if forward_hotkey
-                                            && controller.status == RuntimeStatus::Running
-                                        {
-                                            controller.engine.modifiers_for_event(&event)
-                                        } else {
-                                            metadata.modifiers
-                                        };
-                                        let flags =
-                                            controller.output_ownership.modifiers_with_preserved(
-                                                InputStream::Local,
-                                                modifiers,
-                                            );
-                                        if flags != metadata.modifiers {
-                                            let _ = unsafe {
-                                                macos_adapter::set_keyboard_modifiers(raw, flags)
-                                            };
-                                        }
-                                    }
-                                }
-                                decision
+                                controller.process_local_raw(
+                                    raw,
+                                    &event,
+                                    &mut local_keys,
+                                    bypass,
+                                    || clipboard.as_ref().is_some_and(|manager| manager.try_show()),
+                                    |outputs, marker| unsafe {
+                                        macos_adapter::inject_outputs_with_context(
+                                            outputs,
+                                            marker,
+                                            raw.proxy(),
+                                            raw.raw_event(),
+                                        )
+                                    },
+                                )
                             })
                             .unwrap_or(Decision::Pass);
                         if decision == Decision::Suppress {
@@ -459,16 +516,34 @@ impl EventRuntime {
                     match tap {
                         Ok(mut tap) => match tap.start() {
                             Ok(()) => {
-                                let _ = ready_tx.send(Ok(()));
-                                tap.run_loop_until(&stopped);
-                                // Do not queue global cleanup behind a tap whose run loop has stopped.
-                                tap.stop();
-                                if let Ok(mut controller) = runtime.lock() {
-                                    if let Ok(outputs) = controller.apply(RuntimeCommand::Shutdown)
-                                    {
-                                        let _ = flush_outputs(&mut controller, &outputs);
-                                    }
+                                if !stopped.load(Ordering::Acquire) && ready_tx.send(Ok(())).is_ok()
+                                {
+                                    let mut last_check = std::time::Instant::now();
+                                    tap.run_loop_until_with(&stopped, || {
+                                        if last_check.elapsed()
+                                            < std::time::Duration::from_millis(250)
+                                        {
+                                            return;
+                                        }
+                                        let Ok(mut routes) = keyboard_routes.lock() else {
+                                            return;
+                                        };
+                                        let Ok(mut controller) = runtime.try_lock() else {
+                                            return;
+                                        };
+                                        last_check = std::time::Instant::now();
+                                        let disconnected = controller.retire_disconnected_software(
+                                            |id, last_input| {
+                                                keyboard_sources.process_has_ended(id, last_input)
+                                            },
+                                            macos_adapter::inject_outputs,
+                                        );
+                                        for pid in disconnected {
+                                            routes.forget_process(pid);
+                                        }
+                                    });
                                 }
+                                tap.stop();
                             }
                             Err(error) => {
                                 let _ =
@@ -479,59 +554,47 @@ impl EventRuntime {
                             let _ = ready_tx.send(Err(format!("Event Tap 创建失败：{error:?}")));
                         }
                     }
-                    started.store(false, Ordering::Release);
                 })
-                .map_err(|error| {
-                    self.started.store(false, Ordering::Release);
-                    error.to_string()
-                })?;
-            *self
-                .thread
-                .lock()
-                .map_err(|_| "event runtime lock poisoned")? = Some(thread);
-            match ready_rx.recv_timeout(std::time::Duration::from_secs(3)) {
-                Ok(result) => result,
-                Err(error) => {
-                    self.stop.store(true, Ordering::Release);
-                    Err(format!("Event Tap 启动超时：{error}"))
-                }
-            }
+                .map_err(|error| error.to_string())
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (runtime, clipboard);
-            self.started.store(false, Ordering::Release);
+            let _ = (runtime, clipboard, stopped, ready_tx);
             Err("Event Tap 仅支持 macOS".into())
         }
     }
 
     pub fn shutdown(&self, runtime: &Mutex<RuntimeController>) -> Result<(), String> {
+        self.closing.store(true, Ordering::Release);
         self.rule_recording.store(false, Ordering::Release);
-        self.stop.store(true, Ordering::Release);
-        let thread = self
-            .thread
+        self.clipboard_focused.store(false, Ordering::Release);
+        self.started.store(false, Ordering::Release);
+        let mut worker = self
+            .worker
             .lock()
-            .map_err(|_| "event runtime lock poisoned")?
-            .take();
-        if let Some(thread) = thread {
+            .map_err(|_| "event runtime lock poisoned")?;
+        if let Some(active) = worker.as_ref() {
+            active.stopped.store(true, Ordering::Release);
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-            while !thread.is_finished() {
+            while !active.thread.is_finished() {
                 if std::time::Instant::now() >= deadline {
-                    *self
-                        .thread
-                        .lock()
-                        .map_err(|_| "event runtime lock poisoned")? = Some(thread);
                     return Err("等待事件线程退出超时".into());
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
-            thread.join().map_err(|_| "事件线程异常退出".to_owned())?;
         }
-        let mut controller = runtime.lock().map_err(|_| "runtime lock poisoned")?;
-        let outputs = controller
-            .apply(RuntimeCommand::Shutdown)
-            .map_err(|e| format!("{e:?}"))?;
-        flush_outputs(&mut controller, &outputs).map_err(|e| format!("{e:?}"))
+        let join = worker.take().map(|worker| worker.thread.join());
+        drop(worker);
+        {
+            let mut controller = runtime.lock().map_err(|_| "runtime lock poisoned")?;
+            let outputs = controller
+                .apply(RuntimeCommand::Shutdown)
+                .map_err(|e| format!("{e:?}"))?;
+            flush_outputs(&mut controller, &outputs).map_err(|e| format!("{e:?}"))?;
+        }
+        join.transpose()
+            .map(|_| ())
+            .map_err(|_| "事件线程异常退出".to_owned())
     }
 }
 
@@ -544,6 +607,7 @@ fn route_keyboard_source<F>(
     runtime: &Mutex<RuntimeController>,
     diagnostics: &Diagnostics,
     pending: &AtomicBool,
+    bypass: KeyboardBypass,
     inject: F,
 ) -> Option<macos_adapter::EventTapAction>
 where
@@ -564,6 +628,7 @@ where
         runtime,
         diagnostics,
         pending,
+        bypass,
         inject,
     )
 }
@@ -578,6 +643,7 @@ fn route_keyboard_classified<F>(
     runtime: &Mutex<RuntimeController>,
     diagnostics: &Diagnostics,
     pending: &AtomicBool,
+    bypass: KeyboardBypass,
     mut inject: F,
 ) -> Option<macos_adapter::EventTapAction>
 where
@@ -617,8 +683,8 @@ where
                         identity.process_start = observed_identity.process_start;
                     }
                     let mut result =
-                        controller.process_software_raw(identity, raw, false, &mut inject);
-                    if result.decision == Decision::Pass {
+                        controller.process_software_raw(identity, raw, bypass, &mut inject);
+                    if result.decision == Decision::Pass && !result.preserve_original {
                         let base = result.original_modifiers.unwrap_or(metadata.modifiers);
                         let flags = base | controller.software_preserved_modifiers(identity);
                         if flags != metadata.modifiers {
@@ -630,6 +696,7 @@ where
                 .unwrap_or(SoftwareResult {
                     decision: Decision::Pass,
                     original_modifiers: None,
+                    preserve_original: false,
                 });
             if let Some(modifiers) = result.original_modifiers {
                 // The original event keeps its keycode, phase and text payload.
@@ -730,12 +797,14 @@ impl RuntimeController {
             adapter,
             input_source,
             input_source_request_error: None,
+            software_cleanup_error: None,
             clipboard: None,
             diagnostics,
             external_keyboard_pending: Arc::new(AtomicBool::new(false)),
             profile: "windows_physical".into(),
             config: None,
             status: RuntimeStatus::Disabled,
+            disable_generation: 0,
             config_revision: 0,
             pending_releases: Vec::new(),
             last_error: None,
@@ -788,6 +857,9 @@ impl RuntimeController {
     }
 
     fn transition(&mut self, status: RuntimeStatus) -> Vec<OutputEvent> {
+        if status == RuntimeStatus::Disabled {
+            self.disable_generation = self.disable_generation.wrapping_add(1);
+        }
         if matches!(
             status,
             RuntimeStatus::PermissionRequired | RuntimeStatus::Stopped
@@ -876,13 +948,31 @@ impl RuntimeController {
     fn permissions_refreshed(&mut self, permission: PermissionState) -> Vec<OutputEvent> {
         self.adapter.set_permission(permission);
         if permission != PermissionState::Granted {
-            self.last_error = Some("输入权限未就绪，映射已暂停".into());
             return self.transition(RuntimeStatus::PermissionRequired);
         }
         if self.status == RuntimeStatus::PermissionRequired {
             self.status = RuntimeStatus::Disabled;
         }
         std::mem::take(&mut self.pending_releases)
+    }
+
+    fn last_error_message(&self) -> Option<String> {
+        self.last_error
+            .clone()
+            .or_else(|| {
+                (self.status == RuntimeStatus::PermissionRequired)
+                    .then(|| "输入权限未就绪，映射已暂停".into())
+            })
+            .or_else(|| self.software_cleanup_error.clone())
+    }
+
+    fn enable_after_tap_ready(&mut self, disable_generation: u64) -> Result<(), String> {
+        if self.disable_generation != disable_generation {
+            return Err("本次 Windows 模式启用已取消".into());
+        }
+        self.apply(RuntimeCommand::Enable)
+            .map(|_| ())
+            .map_err(|error| format!("{error:?}"))
     }
 
     pub fn apply(&mut self, command: RuntimeCommand) -> Result<Vec<OutputEvent>, RuntimeError> {
@@ -1048,6 +1138,62 @@ impl RuntimeController {
             self.diagnostics.record_suppressed();
             Decision::Suppress
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn process_local_raw(
+        &mut self,
+        raw: macos_adapter::EventTapEvent,
+        event: &NormalizedEvent,
+        keys: &mut LocalKeyboard,
+        bypass: KeyboardBypass,
+        show_clipboard: impl FnOnce() -> bool,
+        mut inject: impl FnMut(&[OutputEvent], u64) -> Result<(), InjectionError>,
+    ) -> Decision {
+        let bypass = bypass.applies(event);
+        if (bypass || !keys.native_keys.0.is_empty()) && !is_emergency_hotkey(event) {
+            let already_bound = self.engine.state().physical_down(event.code)
+                || self
+                    .output_ownership
+                    .has_native(InputStream::Local, event.code)
+                || (is_clipboard_key(event)
+                    && (keys.clipboard_hotkey.active || keys.clipboard_hotkey.forwarding_v));
+            if keys.native_keys.forward(event, bypass, already_bound) {
+                if event.kind == event_model::EventKind::FlagsChanged {
+                    keys.clipboard_hotkey.handle(event);
+                }
+                return self.pass_unmapped_local_keyboard(event, &mut inject);
+            }
+        }
+        let hotkey = keys.clipboard_hotkey.delivery(event, show_clipboard);
+        if hotkey == Some(ClipboardHotkeyDelivery::Suppress) {
+            return Decision::Suppress;
+        }
+        let forward_hotkey = hotkey == Some(ClipboardHotkeyDelivery::Forward);
+        let decision = if forward_hotkey {
+            self.pass_unmapped_local_keyboard(event, &mut inject)
+        } else {
+            self.process_event_marked(event, &mut inject)
+        };
+        if decision == Decision::Pass {
+            if let Some(metadata) = raw.keyboard_metadata() {
+                let modifiers = if self.status == RuntimeStatus::Running
+                    && (forward_hotkey || raw.is_unmanaged_flags_change())
+                {
+                    self.engine.modifiers_for_event(event)
+                } else {
+                    metadata.modifiers
+                };
+                let flags = self
+                    .output_ownership
+                    .modifiers_with_preserved(InputStream::Local, modifiers);
+                if flags != metadata.modifiers {
+                    // The raw event is borrowed from the active tap callback.
+                    let _ = unsafe { macos_adapter::set_keyboard_modifiers(raw, flags) };
+                }
+            }
+        }
+        decision
     }
 
     #[cfg(target_os = "macos")]
@@ -1293,7 +1439,7 @@ fn start_status_notifications(app: tauri::AppHandle, toggle: tauri::menu::MenuIt
                 (
                     r.status.clone(),
                     r.config_revision,
-                    r.last_error.clone(),
+                    r.last_error_message(),
                     r.input_source_error(),
                     r.pending_releases.len(),
                     state.event_runtime.last_start_error(),
@@ -1349,10 +1495,19 @@ fn begin_shutdown(app: &tauri::AppHandle, code: i32) {
 
 pub fn run() {
     let config_path = clipboard_history_path().with_file_name("config.toml");
-    let (config, error) = settings::load_startup(&config_path);
-    let mut app_state = AppState::from_config(config).expect("validated startup configuration");
-    app_state.settings.path = Some(config_path);
-    *app_state.settings.error.lock().expect("new settings lock") = error;
+    let data_directory = config_path.parent().expect("configuration directory");
+    let _directory_lock = match instance_lock::acquire(data_directory) {
+        Ok(Some(lock)) => lock,
+        Ok(None) => {
+            eprintln!("另一个 MacToWindows 实例正在使用此用户数据目录。");
+            return;
+        }
+        Err(error) => {
+            eprintln!("无法锁定 MacToWindows 用户数据目录：{error}");
+            return;
+        }
+    };
+    let app_state = settings::load_startup(&config_path).into_state(config_path);
     tauri::Builder::default()
         .manage(app_state)
         .invoke_handler(tauri::generate_handler![
@@ -1360,6 +1515,7 @@ pub fn run() {
             commands::runtime_status,
             commands::settings_snapshot,
             commands::set_rule_enabled,
+            commands::set_rule_priority,
             commands::set_show_desktop_shortcut,
             commands::set_software_input_passthrough,
             commands::set_profile,
@@ -1393,18 +1549,32 @@ pub fn run() {
                     _ => {}
                 });
             }
-            WebviewWindowBuilder::new(app, "clipboard", WebviewUrl::App("clipboard.html".into()))
-                .title("剪贴板历史")
-                .inner_size(360.0, 460.0)
-                .min_inner_size(320.0, 360.0)
-                .visible(false)
-                .decorations(false)
-                .resizable(true)
-                .always_on_top(true)
-                .skip_taskbar(true)
-                .center()
-                .build()?;
+            let clipboard_window = WebviewWindowBuilder::new(
+                app,
+                "clipboard",
+                WebviewUrl::App("clipboard.html".into()),
+            )
+            .title("剪贴板历史")
+            .inner_size(360.0, 460.0)
+            .min_inner_size(320.0, 360.0)
+            .visible(false)
+            .decorations(false)
+            .resizable(true)
+            .always_on_top(true)
+            .skip_taskbar(true)
+            .center()
+            .build()?;
             let state = app.state::<AppState>();
+            let clipboard_focused = Arc::clone(&state.event_runtime.clipboard_focused);
+            clipboard_window.on_window_event(move |event| match event {
+                tauri::WindowEvent::Focused(focused) => {
+                    clipboard_focused.store(*focused, Ordering::Release);
+                }
+                tauri::WindowEvent::CloseRequested { .. } | tauri::WindowEvent::Destroyed => {
+                    clipboard_focused.store(false, Ordering::Release);
+                }
+                _ => {}
+            });
             let manager = clipboard::ClipboardManager::start_with_marker(
                 app.handle().clone(),
                 clipboard_history_path(),
@@ -1528,7 +1698,7 @@ fn runtime_view(state: &AppState, runtime: &RuntimeController) -> RuntimeView {
         input_source,
         input_source_error: runtime.input_source_error(),
         clipboard_status,
-        last_error: runtime.last_error.clone(),
+        last_error: runtime.last_error_message(),
         pending_releases: runtime.pending_releases.len(),
     }
 }
@@ -1563,6 +1733,7 @@ pub mod commands {
     }
 
     pub(super) fn toggle_mode_impl(state: &AppState) -> Result<bool, String> {
+        let _mode = state.mode_gate.lock().map_err(|_| "mode lock poisoned")?;
         if state.shutdown_started.load(Ordering::Acquire) {
             return Err("应用正在退出".into());
         }
@@ -1581,23 +1752,21 @@ pub mod commands {
             RuntimeStatus::Disabled
             | RuntimeStatus::Degraded
             | RuntimeStatus::PermissionRequired => {
-                runtime
-                    .apply(RuntimeCommand::Enable)
-                    .map_err(|error| format!("{error:?}"))?;
+                let disable_generation = runtime.disable_generation;
                 drop(runtime);
-                if let Err(error) = state
+                state
                     .event_runtime
-                    .start(Arc::clone(&state.runtime), state.clipboard())
+                    .start(Arc::clone(&state.runtime), state.clipboard())?;
+                let mut runtime = state
+                    .runtime
+                    .lock()
+                    .map_err(|_| "runtime lock poisoned".to_owned())?;
+                if state.shutdown_started.load(Ordering::Acquire)
+                    || runtime.status() == &RuntimeStatus::Stopped
                 {
-                    let mut runtime = state
-                        .runtime
-                        .lock()
-                        .map_err(|_| "runtime lock poisoned".to_owned())?;
-                    if let Ok(outputs) = runtime.apply(RuntimeCommand::Disable) {
-                        let _ = flush_outputs(&mut runtime, &outputs);
-                    }
-                    return Err(error);
+                    return Err("应用正在退出".into());
                 }
+                runtime.enable_after_tap_ready(disable_generation)?;
                 Ok(true)
             }
             RuntimeStatus::Stopped => Err("runtime has stopped".into()),
@@ -1644,6 +1813,23 @@ pub mod commands {
         tauri::async_runtime::spawn_blocking(move || {
             settings::mutate(&app.state::<AppState>(), expected_revision, |config| {
                 settings::set_enabled(config, &profile_id, &rule_id, enabled)
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+
+    #[tauri::command]
+    pub async fn set_rule_priority(
+        app: tauri::AppHandle,
+        profile_id: String,
+        rule_id: String,
+        priority: i32,
+        expected_revision: u64,
+    ) -> Result<settings::SettingsSnapshot, String> {
+        tauri::async_runtime::spawn_blocking(move || {
+            settings::mutate(&app.state::<AppState>(), expected_revision, |config| {
+                settings::set_priority(config, &profile_id, &rule_id, priority)
             })
         })
         .await
@@ -1748,6 +1934,11 @@ pub mod commands {
     #[tauri::command]
     pub async fn reload_permissions(app: tauri::AppHandle) -> Result<RuntimeStatus, String> {
         tauri::async_runtime::spawn_blocking(move || {
+            let state = app.state::<AppState>();
+            let _mode = state.mode_gate.lock().map_err(|_| "mode lock poisoned")?;
+            if state.shutdown_started.load(Ordering::Acquire) {
+                return Err("应用正在退出".into());
+            }
             #[cfg(target_os = "macos")]
             let permission = {
                 let (listen, post) = macos_adapter::platform::request_permissions();
@@ -1759,9 +1950,13 @@ pub mod commands {
             };
             #[cfg(not(target_os = "macos"))]
             let permission = PermissionState::Denied;
-            let state = app.state::<AppState>();
             let status = {
                 let mut runtime = state.runtime.lock().map_err(|_| "runtime lock poisoned")?;
+                if state.shutdown_started.load(Ordering::Acquire)
+                    || runtime.status() == &RuntimeStatus::Stopped
+                {
+                    return Err("应用正在退出".into());
+                }
                 let outputs = runtime.permissions_refreshed(permission);
                 flush_outputs(&mut runtime, &outputs).map_err(|e| format!("{e:?}"))?;
                 runtime.status().clone()
@@ -2784,6 +2979,117 @@ mod tests {
     }
 
     #[test]
+    fn timed_out_event_tap_cannot_publish_late_readiness_or_stop_the_controller() {
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let state = AppState::from_config(AppConfig::default()).unwrap();
+        let (finish, wait_to_finish) = mpsc::channel();
+        let (late, observe_late) = mpsc::channel();
+        let runtime = &state.event_runtime;
+        let error = runtime
+            .start_with(Duration::ZERO, |stopped, ready| {
+                Ok(std::thread::spawn(move || {
+                    wait_to_finish.recv().unwrap();
+                    assert!(stopped.load(Ordering::Acquire));
+                    late.send(ready.send(Ok(())).is_err()).unwrap();
+                }))
+            })
+            .unwrap_err();
+        assert!(error.contains("启动超时"));
+        assert!(!runtime.is_started());
+        assert!(runtime
+            .start_with(Duration::ZERO, |_, _| panic!("worker still cancelling"))
+            .is_err());
+        finish.send(()).unwrap();
+        assert!(observe_late.recv_timeout(Duration::from_secs(1)).unwrap());
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !runtime
+            .worker
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .thread
+            .is_finished()
+        {
+            assert!(Instant::now() < deadline, "cancelled worker did not exit");
+            std::thread::yield_now();
+        }
+        assert_eq!(
+            state.runtime.lock().unwrap().status(),
+            &RuntimeStatus::Disabled
+        );
+        runtime
+            .start_with(Duration::from_secs(1), |stopped, ready| {
+                Ok(std::thread::spawn(move || {
+                    ready.send(Ok(())).unwrap();
+                    while !stopped.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }))
+            })
+            .unwrap();
+        assert!(runtime.is_started());
+        assert!(runtime.last_start_error().is_none());
+        assert!(runtime
+            .start_with(Duration::ZERO, |_, _| panic!("tap already started"))
+            .is_ok());
+        runtime.shutdown(&state.runtime).unwrap();
+        assert_eq!(
+            state.runtime.lock().unwrap().status(),
+            &RuntimeStatus::Stopped
+        );
+        assert!(runtime
+            .start_with(Duration::ZERO, |_, _| panic!("app has closed"))
+            .is_err());
+    }
+
+    #[test]
+    fn granting_permissions_clears_only_the_permission_notice() {
+        let mut controller = controller_with_rule();
+        assert!(controller
+            .permissions_refreshed(PermissionState::Denied)
+            .is_empty());
+        assert_eq!(
+            controller.last_error_message().as_deref(),
+            Some("输入权限未就绪，映射已暂停")
+        );
+        assert!(controller
+            .permissions_refreshed(PermissionState::Granted)
+            .is_empty());
+        assert_eq!(controller.status(), &RuntimeStatus::Disabled);
+        assert!(controller.last_error_message().is_none());
+
+        controller.last_error = Some("事件注入失败".into());
+        controller.permissions_refreshed(PermissionState::Denied);
+        controller.permissions_refreshed(PermissionState::Granted);
+        assert_eq!(
+            controller.last_error_message().as_deref(),
+            Some("事件注入失败")
+        );
+    }
+
+    #[test]
+    fn emergency_disable_cancels_an_enable_waiting_for_the_tap() {
+        let mut controller = controller_with_rule();
+        let pending_enable = controller.disable_generation;
+        let emergency = keyboard_event(
+            53,
+            EventPhase::Down,
+            ModifierSet::LEFT_CONTROL | ModifierSet::LEFT_OPTION | ModifierSet::LEFT_COMMAND,
+            EventKind::Keyboard,
+        );
+        assert_eq!(
+            controller.process_event(&emergency, |_| Ok(())),
+            Decision::Pass
+        );
+        assert!(controller.enable_after_tap_ready(pending_enable).is_err());
+        assert_eq!(controller.status(), &RuntimeStatus::Disabled);
+    }
+
+    #[test]
     fn input_source_unavailable_is_reported_without_disabling_mappings() {
         let mut controller = controller_with_rule();
         controller.status = RuntimeStatus::Running;
@@ -2807,7 +3113,7 @@ mod tests {
 
     #[test]
     fn recording_keeps_raw_key_tails_and_leaves_existing_bindings_to_the_runtime() {
-        let mut recording = RuleRecordingKeys::default();
+        let mut recording = NativeKeyboardKeys::default();
         let down = key();
         let repeat = NormalizedEvent {
             phase: EventPhase::Repeat,

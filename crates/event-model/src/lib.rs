@@ -138,6 +138,8 @@ pub enum EventPhase {
     Repeat,
     Changed,
     Motion,
+    /// A scroll event carrying a native gesture or momentum phase.
+    ScrollGesture,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -217,7 +219,19 @@ pub enum OutputEvent {
         invert_x: bool,
         invert_y: bool,
     },
+    /// Keep, invert, or remove each axis of the original scroll event.
+    ScrollTransformAxes {
+        x: ScrollAxisTransform,
+        y: ScrollAxisTransform,
+    },
     SystemShortcut(SystemShortcut),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ScrollAxisTransform {
+    Keep,
+    Invert,
+    Remove,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

@@ -12,12 +12,12 @@ fi
 
 identity="${CODESIGN_IDENTITY:-}"
 if [[ -z "$identity" ]]; then
-  identity="$(security find-identity -v -p codesigning \
-    | sed -n 's/^[[:space:]]*[0-9][0-9]*)[[:space:]]*\(.*\)$/\1/p' \
-    | head -n 1)"
+  identity_candidates="$(security find-identity -v -p codesigning \
+    | sed -En 's/^[[:space:]]*[0-9]+\)[[:space:]]+([[:xdigit:]]{40})[[:space:]]+".*/\1/p')"
+  identity="${identity_candidates%%$'\n'*}"
 fi
 
-if [[ -z "$identity" ]]; then
+if [[ -z "$identity" || "$identity" == "-" ]]; then
   print -u2 "没有可用的稳定代码签名身份。"
   print -u2 "请先在钥匙串中创建或安装 Apple Development、Developer ID，或固定的本地代码签名证书。"
   print -u2 "禁止使用 codesign --sign -，否则每次构建都会生成新的 CDHash 并重新触发 TCC 授权。"

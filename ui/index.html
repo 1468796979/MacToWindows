@@ -80,11 +80,16 @@
           <button id="rule-dialog-close" class="text-button" type="button" aria-label="关闭">关闭</button>
         </div>
         <form id="rule-form">
-          <label class="form-field">规则名称<input id="rule-name" name="name" placeholder="例如：Ctrl + B" /></label>
-          <label class="form-field">触发键<input id="rule-trigger" name="trigger" required placeholder="例如：chord:left_control+key:11" /></label>
-          <div class="form-actions"><button id="record-trigger" class="secondary" type="button">录制按键</button><span id="recording-state" class="muted" aria-live="polite"></span></div>
-          <label class="form-field">动作<input id="rule-action" name="action" required placeholder="例如：command:key:11 或 shortcut:hard_refresh" /></label>
-          <p class="muted form-hint">可用格式：key:keycode、chord:left_control|right_shift+key:keycode、modifier_chord:left_control|right_shift、command:key:11、shortcut:动作名、pass、suppress。多个修饰键用 | 分隔。</p>
+          <fieldset id="rule-definition" class="rule-definition">
+            <label class="form-field">规则名称<input id="rule-name" name="name" placeholder="例如：Ctrl + B" /></label>
+            <label class="form-field">触发键<input id="rule-trigger" name="trigger" required placeholder="例如：chord:left_control+key:11" /></label>
+            <div class="form-actions"><button id="record-trigger" class="secondary" type="button">录制按键</button><span id="recording-state" class="muted" aria-live="polite"></span></div>
+            <label class="form-field">动作<input id="rule-action" name="action" required placeholder="例如：command:key:11 或 shortcut:hard_refresh" /></label>
+            <p class="muted form-hint">可用格式：key:keycode、chord:left_control|right_shift+key:keycode、modifier_chord:left_control|right_shift、command:key:11、shortcut:动作名、pass、suppress。多个修饰键用 | 分隔。</p>
+          </fieldset>
+          <p id="rule-priority-target" class="muted" hidden></p>
+          <label class="form-field">优先级<input id="rule-priority" name="priority" type="number" min="-2147483648" max="2147483647" step="1" required aria-describedby="rule-priority-help" /></label>
+          <p id="rule-priority-help" class="muted form-hint">同一触发条件下，优先级数值较大的规则先处理。</p>
           <p id="rule-feedback" class="form-feedback" aria-live="polite"></p>
           <div class="modal-actions"><button id="rule-cancel" class="secondary" type="button">取消</button><button id="rule-submit" class="primary" type="submit">添加规则</button></div>
         </form>

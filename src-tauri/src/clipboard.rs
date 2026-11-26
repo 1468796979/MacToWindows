@@ -95,8 +95,8 @@ impl ClipboardManagerCore {
         })
     }
 
-    fn write_text(&mut self, text: &str) -> Result<(), PasteboardError> {
-        self.pasteboard.write_text(text).map(|_| ())
+    fn write_text(&mut self, text: &str) -> Result<i64, PasteboardError> {
+        self.pasteboard.write_text(text)
     }
 
     fn history_clone(&self) -> ClipboardHistory {
@@ -807,13 +807,15 @@ fn select_and_paste(
     let result = core
         .write_text(&selection.text)
         .map_err(|error| format!("写入系统剪贴板失败：{error}"))
-        .and_then(|_| {
+        .and_then(|expected_change_count| {
             let select_generation = Arc::clone(select_generation);
             run_on_main_thread_result(app, move |timed_out| {
-                selection.target.paste_if_frontmost(marker, || {
-                    !timed_out.load(Ordering::Acquire)
-                        && select_generation.load(Ordering::Acquire) == generation
-                })
+                selection
+                    .target
+                    .paste_if_frontmost(marker, expected_change_count, || {
+                        !timed_out.load(Ordering::Acquire)
+                            && select_generation.load(Ordering::Acquire) == generation
+                    })
             })?
         });
     if let Err(message) = result {

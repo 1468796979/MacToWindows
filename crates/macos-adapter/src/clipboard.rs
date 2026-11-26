@@ -56,13 +56,15 @@ impl ForegroundApplication {
         platform::activate_instance(self)
     }
 
-    /// Posts the clipboard shortcut to this instance only while it is frontmost.
+    /// Posts the shortcut only while this instance is frontmost and the
+    /// pasteboard still has the ownership count from the selected write.
     pub fn paste_if_frontmost(
         &self,
         marker: u64,
+        expected_change_count: i64,
         selection_is_current: impl FnOnce() -> bool,
     ) -> Result<(), String> {
-        platform::paste_if_frontmost(self, marker, selection_is_current)
+        platform::paste_if_frontmost(self, marker, expected_change_count, selection_is_current)
     }
 }
 
@@ -215,15 +217,16 @@ mod platform {
         }
 
         fn write_text(&mut self, text: &str) -> Result<i64, PasteboardError> {
-            self.pasteboard.clearContents();
             let value = NSString::from_str(text);
+            let owned_change_count = self.pasteboard.clearContents() as i64;
             if !self
                 .pasteboard
                 .setString_forType(&value, Self::pasteboard_type())
             {
                 return Err(PasteboardError::WriteFailed);
             }
-            Ok(self.pasteboard.changeCount() as i64)
+            // A later read could return the count of another writer.
+            Ok(owned_change_count)
         }
 
         fn frontmost_bundle_id(&mut self) -> Result<Option<String>, PasteboardError> {
@@ -301,9 +304,10 @@ mod platform {
     pub fn paste_if_frontmost(
         target: &ForegroundApplication,
         marker: u64,
+        expected_change_count: i64,
         selection_is_current: impl FnOnce() -> bool,
     ) -> Result<(), String> {
-        let foreground_changed = || "目标应用已离开前台，已取消自动粘贴".to_owned();
+        let foreground_changed = || FOREGROUND_CHANGED.to_owned();
         if MainThreadMarker::new().is_none() {
             return Err(foreground_changed());
         }
@@ -313,19 +317,99 @@ mod platform {
             phase,
             modifiers: ModifierSet::LEFT_COMMAND,
         });
+        let mut refusal = None;
         crate::platform::inject_outputs_to_application(&outputs, marker, || {
-            let frontmost = NSWorkspace::sharedWorkspace().frontmostApplication()?;
-            (target.pid > 0
-                && target.pid == application.processIdentifier()
-                && application.isEqual(Some(&frontmost))
-                && !application.isTerminated()
-                && selection_is_current())
-            .then_some(target.pid)
+            let frontmost_pid = NSWorkspace::sharedWorkspace()
+                .frontmostApplication()
+                .filter(|frontmost| {
+                    target.pid > 0
+                        && target.pid == application.processIdentifier()
+                        && application.isEqual(Some(frontmost))
+                        && !application.isTerminated()
+                })
+                .map(|_| target.pid);
+            match confirm_paste_target(
+                frontmost_pid,
+                selection_is_current,
+                expected_change_count,
+                || NSPasteboard::generalPasteboard().changeCount() as i64,
+            ) {
+                Ok(pid) => Some(pid),
+                Err(error) => {
+                    refusal = Some(error);
+                    None
+                }
+            }
         })
-        .map_err(|error| match error {
-            crate::InjectionError::InvalidEvent => foreground_changed(),
-            _ => format!("自动粘贴失败：{error}"),
+        .map_err(|error| match (error, refusal) {
+            (crate::InjectionError::InvalidEvent, Some(reason)) => reason.to_owned(),
+            (error, _) => format!("自动粘贴失败：{error}"),
         })
+    }
+
+    const FOREGROUND_CHANGED: &str = "目标应用已离开前台，已取消自动粘贴";
+    const PASTEBOARD_CHANGED: &str = "系统剪贴板内容已变化，已取消自动粘贴";
+
+    fn confirm_paste_target(
+        frontmost_pid: Option<i32>,
+        selection_is_current: impl FnOnce() -> bool,
+        expected_change_count: i64,
+        current_change_count: impl FnOnce() -> i64,
+    ) -> Result<i32, &'static str> {
+        let pid = frontmost_pid.ok_or(FOREGROUND_CHANGED)?;
+        let pasteboard_unchanged = current_change_count() == expected_change_count;
+        if !selection_is_current() {
+            return Err("操作已取消");
+        }
+        if !pasteboard_unchanged {
+            return Err(PASTEBOARD_CHANGED);
+        }
+        Ok(pid)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn paste_uses_only_the_selected_pasteboard_ownership() {
+            let mut private_board = PlatformPasteboard {
+                pasteboard: NSPasteboard::pasteboardWithUniqueName(),
+            };
+            let expected = private_board.write_text("selected").unwrap();
+            assert_eq!(
+                private_board.read_text().unwrap().as_deref(),
+                Some("selected")
+            );
+            assert_eq!(
+                confirm_paste_target(
+                    Some(42),
+                    || true,
+                    expected,
+                    || private_board.change_count().unwrap()
+                ),
+                Ok(42)
+            );
+            assert_eq!(
+                confirm_paste_target(None, || true, expected, || panic!("wrong target")),
+                Err(FOREGROUND_CHANGED)
+            );
+            assert_eq!(
+                confirm_paste_target(Some(42), || false, expected, || expected),
+                Err("操作已取消")
+            );
+            let newer = private_board.write_text("replacement").unwrap();
+            assert_ne!(expected, newer);
+            assert_eq!(
+                confirm_paste_target(
+                    Some(42),
+                    || true,
+                    expected,
+                    || private_board.change_count().unwrap()
+                ),
+                Err(PASTEBOARD_CHANGED)
+            );
+        }
     }
 }
 
@@ -375,6 +459,7 @@ mod platform {
     pub fn paste_if_frontmost(
         _target: &ForegroundApplication,
         _marker: u64,
+        _expected_change_count: i64,
         _selection_is_current: impl FnOnce() -> bool,
     ) -> Result<(), String> {
         Err(PasteboardError::Unsupported.to_string())

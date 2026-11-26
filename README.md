@@ -14,11 +14,15 @@ MacToWindows 是一个面向 Windows 用户的 macOS 全局键鼠语义层。工
 
 ## 配置与规则
 
-配置位于 `~/Library/Application Support/MacToWindows/config.toml`，上一次有效内容备份为 `config.toml.bak`。规则、名称、开关和预设修改成功后自动保存；保存失败时原配置继续生效。每次启动保持暂停，需要手动启用 Windows 模式。
+配置位于 `~/Library/Application Support/MacToWindows/config.toml`，上一份内容备份为 `config.toml.bak`。设置修改后自动保存。替换主文件前发生错误时，原配置继续生效。主文件已替换但目录同步失败时，新配置生效，设置页显示同步警告。每次启动保持暂停，需要手动启用 Windows 模式。
+
+应用会锁定用户数据目录，防止并行实例互相覆盖配置和剪贴板历史。升级前请退出旧版应用。启动时无法恢复的配置会尽量保存在同目录下的 `config.manual-recovery`，恢复提示会显示保存位置。无法保全原文件时，应用会暂停配置写入。
 
 当前配置格式为 schema v2，规则使用稳定 UUID；v1 文件在加载或导入时迁移，启动迁移会保留原文件备份。各预设保存完整、独立的规则集合，自定义预设初始复制默认规则，之后新增或关闭规则不会改变其他预设。旧版本不能直接读取 v2；回退前应保留迁移前的备份。
 
 触发键示例：`key:11`、`chord:left_control|right_shift+key:11`。多个修饰键之间使用 `|`，修饰键和主键之间使用 `+`。释放时识别的 `modifier_chord:left_control|left_shift` 只支持完整的一次性 `shortcut:` 动作，不接受 `pass`、`suppress` 或没有完整释放生命周期的按键输出。当前桌面应用明确拒绝启用应用限定及设备限定规则。
+
+设置页显示规则优先级以及相同触发条件下的覆盖关系。可以在添加规则时指定优先级，也可以从规则列表修改已保存的优先级。
 
 鼠标映射支持按钮、释放和拖动；滚轮反转保留原事件精度及惯性信息。`shortcut:show_desktop` 使用设置页中配置的系统输出快捷键，默认 `key:103`（F11），需与 macOS 的“显示桌面”绑定一致。锁屏和关闭窗口分别使用 Control+Command+Q、Command+W。
 

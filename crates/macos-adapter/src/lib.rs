@@ -339,6 +339,24 @@ impl EventTapEvent {
         self.event_type == TAP_DISABLED_BY_TIMEOUT || self.event_type == TAP_DISABLED_BY_USER_INPUT
     }
 
+    /// A native flagsChanged event whose key is outside the eight managed modifiers.
+    pub fn is_unmanaged_flags_change(self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            if self.event_type != 12 || self.raw_event.is_null() {
+                return false;
+            }
+            let code = unsafe { platform::CGEventGetIntegerValueField(self.raw_event, 9) };
+            !platform::MODIFIER_KEYS
+                .iter()
+                .any(|(_, _, key, _)| i64::from(*key) == code)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            false
+        }
+    }
+
     /// Read keyboard metadata without changing or retaining the native event.
     pub fn keyboard_metadata(self) -> Option<KeyboardMetadata> {
         if !matches!(self.event_type, 10..=12) || self.raw_event.is_null() {
@@ -637,7 +655,7 @@ pub mod platform {
         EventTapAction, EventTapEvent, InjectionError, OutputEvent, PhysicalCode, RawEventRef,
         TAP_DISABLED_BY_TIMEOUT, TAP_DISABLED_BY_USER_INPUT,
     };
-    use event_model::EventPhase;
+    use event_model::{EventPhase, ScrollAxisTransform};
     use std::ffi::c_void;
     use std::panic::{catch_unwind, AssertUnwindSafe};
     use std::ptr;
@@ -900,9 +918,17 @@ pub mod platform {
         /// every 50ms when no callback is running. No run-loop pointer crosses
         /// threads, and a stop requested before startup cannot be lost.
         pub fn run_loop_until(&self, stop: &AtomicBool) {
+            self.run_loop_until_with(stop, || {});
+        }
+
+        /// Runs short maintenance on the same thread between event callbacks.
+        pub fn run_loop_until_with(&self, stop: &AtomicBool, mut maintain: impl FnMut()) {
             while self.running && !stop.load(Ordering::Acquire) {
                 unsafe {
                     CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false);
+                }
+                if !stop.load(Ordering::Acquire) {
+                    maintain();
                 }
             }
         }
@@ -1148,10 +1174,18 @@ pub mod platform {
                 } else {
                     ScrollAxis::Vertical
                 };
+                let has_gesture_phase = unsafe {
+                    CGEventGetIntegerValueField(raw, 99) != 0
+                        || CGEventGetIntegerValueField(raw, 123) != 0
+                };
                 (
                     DeviceSource::Mouse,
                     EventKind::Scroll,
-                    EventPhase::Motion,
+                    if has_gesture_phase {
+                        EventPhase::ScrollGesture
+                    } else {
+                        EventPhase::Motion
+                    },
                     PhysicalCode::Scroll(axis),
                     Some(ScrollDelta {
                         x: horizontal,
@@ -1185,7 +1219,7 @@ pub mod platform {
 
     // Aggregate flags cannot distinguish the side that was released while its
     // counterpart remains held. These are the public SDK's device-side bits.
-    const MODIFIER_KEYS: [(u64, u64, u16, event_model::ModifierSet); 8] = [
+    pub(super) const MODIFIER_KEYS: [(u64, u64, u16, event_model::ModifierSet); 8] = [
         (0x0002_0000, 0x02, 56, event_model::ModifierSet::LEFT_SHIFT),
         (0x0002_0000, 0x04, 60, event_model::ModifierSet::RIGHT_SHIFT),
         (
@@ -1508,35 +1542,22 @@ pub mod platform {
                     batch.push(event);
                 }
                 OutputEvent::ScrollTransform { invert_x, invert_y } => {
-                    if source_raw.is_null() || unsafe { CGEventGetType(source_raw) } != 22 {
-                        return Err(InjectionError::InvalidEvent);
-                    }
-                    let event = OwnedEvent::new(unsafe { CGEventCreateCopy(source_raw) })?;
-                    for (invert, line, fixed, pixel, accelerated, raw) in [
-                        (*invert_y, 11, 93, 96, 176, 178),
-                        (*invert_x, 12, 94, 97, 175, 177),
-                    ] {
+                    let axis = |invert| {
                         if invert {
-                            for field in [line, pixel] {
-                                let value =
-                                    unsafe { CGEventGetIntegerValueField(source_raw, field) }
-                                        .checked_neg()
-                                        .ok_or(InjectionError::InvalidEvent)?;
-                                unsafe {
-                                    CGEventSetIntegerValueField(event.0, field, value);
-                                }
-                            }
-                            for field in [fixed, accelerated, raw] {
-                                let value =
-                                    unsafe { CGEventGetDoubleValueField(source_raw, field) };
-                                unsafe {
-                                    CGEventSetDoubleValueField(event.0, field, -value);
-                                }
-                            }
+                            ScrollAxisTransform::Invert
+                        } else {
+                            ScrollAxisTransform::Keep
                         }
-                    }
-                    event.mark_checked(marker)?;
-                    batch.push(event);
+                    };
+                    batch.push(copy_scroll_with_axes(
+                        source_raw,
+                        axis(*invert_x),
+                        axis(*invert_y),
+                        marker,
+                    )?);
+                }
+                OutputEvent::ScrollTransformAxes { x, y } => {
+                    batch.push(copy_scroll_with_axes(source_raw, *x, *y, marker)?);
                 }
                 OutputEvent::SystemShortcut(shortcut) => {
                     for (code, phase, modifiers) in shortcut_sequence(*shortcut)? {
@@ -1547,6 +1568,49 @@ pub mod platform {
             }
         }
         Ok(batch)
+    }
+
+    fn copy_scroll_with_axes(
+        source: EventRef,
+        x: ScrollAxisTransform,
+        y: ScrollAxisTransform,
+        marker: u64,
+    ) -> Result<OwnedEvent, InjectionError> {
+        use ScrollAxisTransform::{Invert, Keep, Remove};
+
+        if source.is_null() || unsafe { CGEventGetType(source) } != 22 {
+            return Err(InjectionError::InvalidEvent);
+        }
+        let event = OwnedEvent::new(unsafe { CGEventCreateCopy(source) })?;
+        for (transform, integer_fields, precise_fields) in
+            [(y, [11, 96], [93, 176, 178]), (x, [12, 97], [94, 175, 177])]
+        {
+            match transform {
+                Keep => {}
+                Remove => unsafe {
+                    for field in integer_fields {
+                        CGEventSetIntegerValueField(event.0, field, 0);
+                    }
+                    for field in precise_fields {
+                        CGEventSetDoubleValueField(event.0, field, 0.0);
+                    }
+                },
+                Invert => unsafe {
+                    for field in integer_fields {
+                        let value = CGEventGetIntegerValueField(source, field)
+                            .checked_neg()
+                            .ok_or(InjectionError::InvalidEvent)?;
+                        CGEventSetIntegerValueField(event.0, field, value);
+                    }
+                    for field in precise_fields {
+                        let value = CGEventGetDoubleValueField(source, field);
+                        CGEventSetDoubleValueField(event.0, field, -value);
+                    }
+                },
+            }
+        }
+        event.mark_checked(marker)?;
+        Ok(event)
     }
 
     fn create_keyboard_event(
@@ -1975,6 +2039,33 @@ pub mod platform {
                 unsafe { CGEventGetFlags(raw.0) },
                 flags_for_modifiers(M::LEFT_SHIFT) | extra
             );
+        }
+
+        #[test]
+        fn unmanaged_caps_and_fn_flags_stay_native_when_managed_flags_change() {
+            for (code, native_flag) in [(57, 0x0001_0000), (63, 0x0080_0000)] {
+                let raw =
+                    software_keyboard_raw(code, flags_for_modifiers(M::LEFT_COMMAND) | native_flag);
+                unsafe { CGEventSetType(raw.0, 12) };
+                raw.mark_checked(42).unwrap();
+                let input = EventTapEvent::new(12, raw.0);
+                assert!(input.is_unmanaged_flags_change());
+                unsafe { super::super::set_keyboard_modifiers(input, M::LEFT_OPTION) }.unwrap();
+                unsafe {
+                    assert_eq!(CGEventGetType(raw.0), 12);
+                    assert_eq!(CGEventGetIntegerValueField(raw.0, 9), i64::from(code));
+                    assert_eq!(
+                        CGEventGetIntegerValueField(raw.0, EVENT_SOURCE_USER_DATA_FIELD),
+                        42
+                    );
+                    assert_eq!(
+                        CGEventGetFlags(raw.0),
+                        flags_for_modifiers(M::LEFT_OPTION) | native_flag
+                    );
+                }
+            }
+            let command = keyboard_raw(55, flags_for_modifiers(M::LEFT_COMMAND));
+            assert!(!EventTapEvent::new(12, command.0).is_unmanaged_flags_change());
         }
 
         #[test]
@@ -2497,6 +2588,72 @@ pub mod platform {
                 }
             }
             assert_eq!(unsafe { CGEventGetIntegerValueField(source.0, 11) }, -2);
+        }
+
+        #[test]
+        fn scroll_copy_removes_one_axis_and_inverts_the_other_without_losing_phases() {
+            let source = OwnedEvent::new(unsafe {
+                CGEventCreateScrollWheelEvent2(ptr::null_mut(), 0, 2, -2, 3, 0)
+            })
+            .unwrap();
+            let precise = [(93, -0.625), (176, -0.375), (178, -0.25)];
+            let removed = [(94, 0.125), (175, 0.375), (177, 0.75)];
+            unsafe {
+                for (field, value) in [
+                    (11, -2),
+                    (12, 3),
+                    (96, -15),
+                    (97, 11),
+                    (88, 1),
+                    (99, 2),
+                    (123, 4),
+                ] {
+                    CGEventSetIntegerValueField(source.0, field, value);
+                }
+                for (field, value) in precise.into_iter().chain(removed) {
+                    CGEventSetDoubleValueField(source.0, field, value);
+                }
+            }
+            let batch = unsafe {
+                build_output_batch(
+                    &[OutputEvent::ScrollTransformAxes {
+                        x: ScrollAxisTransform::Remove,
+                        y: ScrollAxisTransform::Invert,
+                    }],
+                    42,
+                    source.0,
+                )
+            }
+            .unwrap();
+            let event = batch[0].0;
+            assert_eq!(
+                normalize_event(EventTapEvent::new(22, source.0))
+                    .unwrap()
+                    .phase,
+                EventPhase::ScrollGesture
+            );
+            unsafe {
+                for (field, value) in [
+                    (11, 2),
+                    (12, 0),
+                    (96, 15),
+                    (97, 0),
+                    (88, 1),
+                    (99, 2),
+                    (123, 4),
+                ] {
+                    assert_eq!(CGEventGetIntegerValueField(event, field), value);
+                }
+                for (field, value) in precise {
+                    assert_eq!(CGEventGetDoubleValueField(source.0, field), value);
+                    assert_eq!(CGEventGetDoubleValueField(event, field), -value);
+                }
+                for (field, value) in removed {
+                    assert_eq!(CGEventGetDoubleValueField(source.0, field), value);
+                    assert_eq!(CGEventGetDoubleValueField(event, field), 0.0);
+                }
+                assert_eq!(CGEventGetTimestamp(event), CGEventGetTimestamp(source.0));
+            }
         }
 
         #[test]

@@ -18,7 +18,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       RELEASE_SOURCE_SHA: ${{ github.sha }}
       RELEASE_TAG: ${{ inputs.tag }}

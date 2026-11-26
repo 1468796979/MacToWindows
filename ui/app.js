@@ -5,6 +5,7 @@ const state = {
 const $ = (id) => document.getElementById(id);
 const ruleEditor = window.ruleEditorCore;
 const recorder = ruleEditor.createRecorder();
+const defaultRulePriority = 100;
 const permissionSettingsPath = "请前往：系统设置 → 隐私与安全性 → 辅助功能和输入监控。";
 const backendInvoke = (command, args) => {
   const invoke = window.__TAURI__?.core?.invoke || window.__TAURI_INTERNALS__?.invoke;
@@ -24,16 +25,34 @@ function renderRules() {
   const query = $("search").value.trim().toLowerCase();
   const list = $("rules");
   list.replaceChildren();
-  const rules = (state.snapshot?.rules || []).filter((rule) =>
+  const allRules = state.snapshot?.rules || [];
+  const rulesById = new Map(allRules.map((rule) => [rule.id, rule]));
+  const rules = allRules.filter((rule) =>
     [rule.name, rule.trigger, rule.action, rule.category, rule.app_bundle_id].join(" ").toLowerCase().includes(query));
   for (const rule of rules) {
     const profileId = state.snapshot.active_profile;
     const row = textElement("div", "rule", "");
     const description = document.createElement("div");
+    const name = rule.name || `${rule.trigger} → ${rule.action}`;
     description.append(
-      textElement("div", "rule-name", rule.name || `${rule.trigger} → ${rule.action}`),
+      textElement("div", "rule-name", name),
       textElement("div", "rule-detail", `${rule.trigger} → ${rule.action}${rule.app_bundle_id ? ` · ${rule.app_bundle_id}` : ""}`),
     );
+    const priority = textElement(rule.editable ? "button" : "span",
+      rule.editable ? "text-button rule-priority" : "rule-priority muted", `优先级 ${rule.priority}`);
+    if (rule.editable) {
+      priority.type = "button";
+      priority.disabled = state.writesPending > 0;
+      priority.setAttribute("aria-label", `调整 ${name} 的优先级，当前为 ${rule.priority}`);
+      priority.addEventListener("click", () => openRuleDialog(rule, profileId));
+    }
+    description.append(priority);
+    const coveringRule = rulesById.get(rule.covered_by);
+    if (coveringRule) {
+      const coveringName = coveringRule.name || `${coveringRule.trigger} → ${coveringRule.action}`;
+      description.append(textElement("div", "rule-detail",
+        `完整映射时由「${coveringName}」（优先级 ${coveringRule.priority}）优先处理`));
+    }
     const categoryLabel = { keyboard_rules: "键盘", mouse_rules: "鼠标", global_hotkeys: "快捷键", app_rules: "按应用", device_rules: "按设备" }[rule.category] || "规则";
     row.append(description, textElement("span", "keycap", categoryLabel));
     if (rule.editable) {
@@ -234,6 +253,7 @@ let recordingStatus = "idle";
 let recordingIntent = 0;
 let recordingQueue = Promise.resolve();
 let nativeRecordingMayBeActive = false;
+let priorityTarget = null;
 
 // A cancellation must reach the backend after any start already in flight.
 function enqueueRecording(operation) {
@@ -266,14 +286,21 @@ function closeRuleDialog() {
   stopRecording();
   $("rule-dialog").hidden = true;
 }
-function openRuleDialog() {
+function openRuleDialog(rule = null, profileId = null) {
+  priorityTarget = rule && { profileId, ruleId: rule.id };
   $("rule-form").reset();
   $("rule-feedback").textContent = "";
   stopRecording();
+  $("rule-dialog-title").textContent = rule ? "调整规则优先级" : "新增规则";
+  $("rule-definition").hidden = $("rule-definition").disabled = Boolean(rule);
+  $("rule-priority-target").hidden = !rule;
+  $("rule-priority-target").textContent = rule ? (rule.name || `${rule.trigger} → ${rule.action}`) : "";
+  $("rule-priority").value = String(rule?.priority ?? defaultRulePriority);
+  $("rule-submit").textContent = rule ? "保存优先级" : "添加规则";
   $("rule-dialog").hidden = false;
-  $("rule-name").focus();
+  $(rule ? "rule-priority" : "rule-name").focus();
 }
-$("add-rule").addEventListener("click", openRuleDialog);
+$("add-rule").addEventListener("click", () => openRuleDialog());
 $("rule-dialog-close").addEventListener("click", closeRuleDialog);
 $("rule-cancel").addEventListener("click", closeRuleDialog);
 document.querySelector("[data-close-rule-dialog]").addEventListener("click", closeRuleDialog);
@@ -314,7 +341,7 @@ window.addEventListener("keydown", (event) => {
     stopRecording("已取消录制");
     return;
   }
-  if (recordingStatus === "starting") return;
+  if (recordingStatus === "starting" || event.repeat) return;
   try { acceptRecordedTrigger(recorder.keyDown(event)); }
   catch (error) { stopRecording(message(error)); }
 });
@@ -338,8 +365,18 @@ $("rule-form").addEventListener("submit", async (event) => {
   if (recordingStatus !== "idle") stopRecording("已取消录制");
   $("rule-feedback").textContent = "";
   try {
-    const rule = ruleEditor.normalizeRule({ name: $("rule-name").value, trigger: $("rule-trigger").value, action: $("rule-action").value, enabled: true });
-    await mutateSettings("add_rule", () => ({ ...rule, priority: 100 }));
+    const rawPriority = $("rule-priority").value.trim();
+    const priority = Number(rawPriority);
+    if (!rawPriority || !Number.isInteger(priority) || priority < -2147483648 || priority > 2147483647) {
+      throw new Error("优先级必须是介于 -2147483648 和 2147483647 的整数。");
+    }
+    const target = priorityTarget;
+    if (target) {
+      await mutateSettings("set_rule_priority", () => ({ ...target, priority }));
+    } else {
+      const rule = ruleEditor.normalizeRule({ name: $("rule-name").value, trigger: $("rule-trigger").value, action: $("rule-action").value, enabled: true });
+      await mutateSettings("add_rule", () => ({ ...rule, priority }));
+    }
     closeRuleDialog();
   } catch (error) { $("rule-feedback").textContent = message(error); }
 });

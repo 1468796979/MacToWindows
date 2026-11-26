@@ -188,6 +188,44 @@ test("rule toggle updates the backend using its stable ID and revision", async (
   assert.equal(toggleFor(ui).attributes["aria-pressed"], "false");
 });
 
+test("a covered rule shows its winner even when the list is filtered, and its priority can be adjusted", async () => {
+  const fallback = { ...snapshot().rules[0], name: "自定义屏蔽复制", trigger: "chord:left_control+key:8", action: "suppress", covered_by: "default-copy" };
+  const initial = snapshot(4, { rules: [
+    { ...fallback, id: "default-copy", name: "默认复制", action: "command:key:8", priority: 200, covered_by: null },
+    fallback,
+  ] });
+  const confirmed = snapshot(5, { rules: [
+    { ...initial.rules[0], covered_by: fallback.id },
+    { ...fallback, priority: 201, covered_by: null },
+  ] });
+  const ui = await appUi({ invoke(command, args) {
+    if (command === "settings_snapshot") return initial;
+    assert.equal(command, "set_rule_priority");
+    assert.deepEqual(JSON.parse(JSON.stringify(args)), {
+      profileId: "custom", ruleId: fallback.id, priority: 201, expectedRevision: 4,
+    });
+    return confirmed;
+  } });
+  const search = ui.get("search");
+  search.value = fallback.name;
+  await search.fire("input");
+  const description = () => ui.get("rules").children[0].children[0];
+  assert.equal(description().children[2].textContent, "优先级 100");
+  assert.match(description().children[3].textContent, /默认复制.*优先级 200/);
+  await description().children[2].click();
+  assert.equal(ui.get("rule-definition").disabled, true);
+  assert.equal(ui.get("rule-priority-target").textContent, fallback.name);
+  assert.equal(ui.get("rule-priority").value, "100");
+  ui.get("rule-priority").value = "201";
+  await ui.get("rule-form").fire("submit");
+  assert.equal(ui.get("rule-dialog").hidden, true);
+  assert.equal(description().children[2].textContent, "优先级 201");
+  assert.equal(description().children[3], undefined);
+  search.value = "";
+  await search.fire("input");
+  assert.match(description().children[3].textContent, /自定义屏蔽复制.*优先级 201/);
+});
+
 test("failed rule writes keep the confirmed state and show their error", async () => {
   const ui = await appUi({ invoke(command) {
     if (command === "settings_snapshot") return snapshot();
@@ -279,6 +317,7 @@ test("profile changes, imported rules and new rule names come from mutation snap
     else if (command === "add_rule") {
       assert.equal(args.name, "My named rule");
       assert.equal(args.expectedRevision, 2);
+      assert.equal(args.priority, 100);
       current = snapshot(3, { active_profile: "FromFile", profiles: ["FromFile"], rules: [{ ...snapshot().rules[0], name: args.name }] });
     } else throw new Error(command);
     return current;
@@ -289,6 +328,7 @@ test("profile changes, imported rules and new rule names come from mutation snap
   ui.get("config-file").files = [{ text: async () => "valid toml" }];
   await ui.get("config-file").fire("change"); await ui.idle();
   assert.equal(ui.get("profile-select").value, "FromFile");
+  await ui.get("add-rule").click();
   ui.get("rule-name").value = "My named rule";
   ui.get("rule-trigger").value = "key:11";
   ui.get("rule-action").value = "key:12";
@@ -363,6 +403,21 @@ test("recording through actual key handlers preserves sides and resets on blur",
   assert.equal(ui.get("rule-trigger").value, "modifier_chord:right_control|left_shift");
 });
 
+test("an overlapping modifier sequence prompts a retry and stops native recording", async () => {
+  const ui = await appUi();
+  await ui.get("add-rule").click();
+  await ui.get("record-trigger").click();
+  await ui.event("keydown", { key: "Control", code: "ControlLeft" });
+  await ui.event("keydown", { key: "Shift", code: "ShiftLeft" });
+  await ui.event("keyup", { key: "Control", code: "ControlLeft" });
+  await ui.event("keydown", { key: "Alt", code: "AltLeft" });
+  await ui.event("keyup", { key: "Shift", code: "ShiftLeft" });
+  await ui.event("keyup", { key: "Alt", code: "AltLeft" });
+  assert.equal(ui.get("rule-trigger").value, "");
+  assert.match(ui.get("recording-state").textContent, /重新录制/);
+  assert.deepEqual(ui.calls.filter(({ command }) => command === "set_rule_recording").map(({ args }) => args.active), [true, false]);
+});
+
 test("recording waits for the native bypass and stops it on completion", async () => {
   const pending = deferred();
   const ui = await appUi({ invoke(command, args) {
@@ -376,6 +431,8 @@ test("recording waits for the native bypass and stops it on completion", async (
   assert.equal(ui.get("rule-trigger").value, "");
   pending.resolve();
   await request;
+  await ui.event("keydown", { key: "n", code: "KeyN", repeat: true });
+  assert.equal(ui.get("rule-trigger").value, "");
   await ui.event("keydown", { key: "b", code: "KeyB" });
   assert.equal(ui.get("rule-trigger").value, "key:11");
   assert.deepEqual(ui.calls.filter(({ command }) => command === "set_rule_recording").map(({ args }) => args.active), [true, false]);

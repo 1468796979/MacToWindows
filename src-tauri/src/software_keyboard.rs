@@ -1,8 +1,8 @@
 //! Per-source keyboard state. Submitted text never enters this state machine.
 use super::output_ownership::{InputStream, OutputOwner};
 use super::{
-    ClipboardHotkeyAction, ClipboardHotkeyLatch, NormalizedEvent, OutputEvent, RuntimeController,
-    RuntimeStatus, SystemShortcut,
+    ClipboardHotkeyAction, ClipboardHotkeyLatch, KeyboardBypass, NativeKeyboardKeys,
+    NormalizedEvent, OutputEvent, RuntimeController, RuntimeStatus, SystemShortcut,
 };
 use event_model::{Decision, EventKind, EventPhase, ModifierSet as M, PhysicalCode};
 use macos_adapter::{
@@ -20,6 +20,7 @@ pub(crate) struct SoftwareSession {
     pub force_full: bool,
     observed_generation: u64,
     raw_keys: HashMap<PhysicalCode, bool>,
+    native_keys: NativeKeyboardKeys,
 }
 
 #[cfg(test)]
@@ -94,6 +95,113 @@ mod tests {
         assert!(protects_text(&metadata));
         metadata.keycode = 8;
         assert!(!protects_text(&metadata));
+    }
+
+    #[test]
+    fn confirmed_process_exit_clears_native_modifiers_even_while_paused() {
+        let mut controller = controller();
+        let mut outputs = Vec::new();
+        let control = event(59, EventPhase::Down, M::LEFT_CONTROL);
+        assert_eq!(
+            send(
+                &mut controller,
+                59,
+                EventPhase::Down,
+                M::LEFT_CONTROL,
+                &mut outputs
+            )
+            .decision,
+            Decision::Pass
+        );
+        let survivor = KeyboardSourceId {
+            process_id: source().process_id + 1,
+            ..source()
+        };
+        controller.process_software_event_marked(survivor, &control, false, |_, _| Ok(()));
+        controller
+            .apply(super::super::RuntimeCommand::Disable)
+            .unwrap();
+        assert!(controller
+            .retire_disconnected_software(|_, _| false, |_, _| panic!("unknown is live"))
+            .is_empty());
+        assert_eq!(
+            controller
+                .output_ownership
+                .modifiers_with_preserved(InputStream::Local, M::NONE),
+            M::LEFT_CONTROL
+        );
+
+        assert_eq!(
+            controller.retire_disconnected_software(
+                |id, _| id == source(),
+                |_, _| panic!("other source holds Control")
+            ),
+            vec![source().process_id]
+        );
+        assert!(!controller
+            .output_ownership
+            .has_native(InputStream::Software(source()), control.code));
+        assert!(controller
+            .output_ownership
+            .has_native(InputStream::Software(survivor), control.code));
+        assert_eq!(
+            controller
+                .output_ownership
+                .modifiers_with_preserved(InputStream::Local, M::NONE),
+            M::LEFT_CONTROL
+        );
+
+        assert_eq!(
+            controller.retire_disconnected_software(
+                |id, _| id == survivor,
+                |batch, _| {
+                    outputs.extend_from_slice(batch);
+                    Ok(())
+                }
+            ),
+            vec![survivor.process_id]
+        );
+        assert_eq!(outputs, vec![key(59, EventPhase::Up, M::NONE)]);
+        assert_eq!(
+            controller
+                .output_ownership
+                .modifiers_with_preserved(InputStream::Local, M::NONE),
+            M::NONE
+        );
+        assert_eq!(controller.status(), &RuntimeStatus::Disabled);
+    }
+
+    #[test]
+    fn process_exit_retries_failed_release_without_dropping_session() {
+        let mut controller = controller();
+        send(
+            &mut controller,
+            59,
+            EventPhase::Down,
+            M::LEFT_CONTROL,
+            &mut Vec::new(),
+        );
+        assert!(controller
+            .retire_disconnected_software(
+                |id, _| id == source(),
+                |_, _| Err(InjectionError::Unavailable)
+            )
+            .is_empty());
+        assert!(controller.software.contains_key(&source()));
+        assert!(controller.last_error_message().is_some());
+        assert_eq!(controller.status(), &RuntimeStatus::Running);
+        assert_eq!(
+            controller.retire_disconnected_software(
+                |id, _| id == source(),
+                |batch, _| {
+                    assert_eq!(batch, &[key(59, EventPhase::Up, M::NONE)]);
+                    Ok(())
+                }
+            ),
+            vec![source().process_id]
+        );
+        assert!(!controller.software.contains_key(&source()));
+        assert!(controller.last_error_message().is_none());
     }
 
     #[test]
@@ -571,6 +679,7 @@ impl SoftwareSession {
             force_full,
             observed_generation: 0,
             raw_keys: HashMap::new(),
+            native_keys: NativeKeyboardKeys::default(),
         }
     }
 
@@ -586,6 +695,7 @@ impl SoftwareSession {
         !self.switcher.active()
             && !self.clipboard.active
             && self.raw_keys.is_empty()
+            && self.native_keys.0.is_empty()
             && (0..128).all(|code| !self.engine.state().physical_down(PhysicalCode::key(code)))
     }
 }
@@ -773,6 +883,7 @@ fn without_alt(modifiers: M) -> M {
 pub(crate) struct SoftwareResult {
     pub decision: Decision,
     pub original_modifiers: Option<M>,
+    pub preserve_original: bool,
 }
 
 impl RuntimeController {
@@ -784,6 +895,7 @@ impl RuntimeController {
             session.normalizer.reset();
             session.clipboard.reset();
             session.raw_keys.clear();
+            session.native_keys.0.clear();
             session.switcher.consumed_tabs.clear();
             // During the gap raw input continues outside our tap. Its Up may
             // already have reached the target, so forget stale native holders
@@ -867,6 +979,7 @@ impl RuntimeController {
                 Decision::Suppress
             },
             original_modifiers: None,
+            preserve_original: false,
         }
     }
     pub(crate) fn software_preserved_modifiers(&self, id: KeyboardSourceId) -> M {
@@ -921,42 +1034,7 @@ impl RuntimeController {
             .filter(|old| *old != id && same_process_stream(*old, id))
             .collect();
         for old in retired {
-            if let Some(mut session) = self.software.remove(&old) {
-                let stream = InputStream::Software(old);
-                let mut ownership = self.output_ownership.clone();
-                let releases = ownership.release_mapped(stream);
-                if !releases.is_empty() {
-                    if let Err(error) = inject(&releases, self.own_marker()) {
-                        self.software.insert(old, session);
-                        return Err(error);
-                    }
-                }
-                self.output_ownership = ownership;
-                session.engine.clear_bindings();
-                let checkpoint = session.switcher.clone();
-                let releases = session.switcher.release(M::NONE);
-                if let Err(error) = self.dispatch_outputs_for(
-                    stream,
-                    OutputOwner::ApplicationSwitch(stream),
-                    &releases,
-                    M::NONE,
-                    &mut *inject,
-                ) {
-                    session.switcher = checkpoint;
-                    self.software.insert(old, session);
-                    return Err(error);
-                }
-                let releases = self
-                    .output_ownership
-                    .release_owner(OutputOwner::Native(stream));
-                if !releases.is_empty() {
-                    if let Err(error) = inject(&releases, self.own_marker()) {
-                        self.pending_releases.extend(releases);
-                        self.software.insert(old, session);
-                        return Err(error);
-                    }
-                }
-            }
+            self.retire_software_source(old, inject)?;
         }
         if !self.software.contains_key(&id) {
             // Do not evict a source which may still own an outstanding Up.
@@ -995,18 +1073,70 @@ impl RuntimeController {
         Ok(id)
     }
 
+    fn retire_software_source<F>(
+        &mut self,
+        id: KeyboardSourceId,
+        inject: &mut F,
+    ) -> Result<(), InjectionError>
+    where
+        F: FnMut(&[OutputEvent], u64) -> Result<(), InjectionError>,
+    {
+        let mut ownership = self.output_ownership.clone();
+        let releases = ownership.release_stream(InputStream::Software(id));
+        if !releases.is_empty() {
+            inject(&releases, self.own_marker())?;
+        }
+        self.output_ownership = ownership;
+        self.software.remove(&id);
+        Ok(())
+    }
+
+    pub(crate) fn retire_disconnected_software<F>(
+        &mut self,
+        mut ended: impl FnMut(KeyboardSourceId, std::time::Instant) -> bool,
+        mut inject: F,
+    ) -> Vec<i32>
+    where
+        F: FnMut(&[OutputEvent], u64) -> Result<(), InjectionError>,
+    {
+        let retired: Vec<_> = self
+            .software
+            .iter()
+            .filter_map(|(&id, session)| {
+                let observed = KeyboardSourceId {
+                    process_start: session.observed_generation,
+                    ..id
+                };
+                ended(observed, session.last_used).then_some(id)
+            })
+            .collect();
+        let mut disconnected = Vec::with_capacity(retired.len());
+        let mut error = None;
+        for id in retired {
+            match self.retire_software_source(id, &mut inject) {
+                Ok(()) => disconnected.push(id.process_id),
+                Err(failure) => {
+                    self.diagnostics.record_injection_failure();
+                    error = Some(format!("软件输入已退出，按键释放尚未完成：{failure}"));
+                }
+            }
+        }
+        self.software_cleanup_error = error;
+        disconnected
+    }
+
     #[cfg(target_os = "macos")]
     pub(crate) fn process_software_raw<F>(
         &mut self,
         id: KeyboardSourceId,
         raw: macos_adapter::EventTapEvent,
-        force_full: bool,
+        bypass: KeyboardBypass,
         mut inject: F,
     ) -> SoftwareResult
     where
         F: FnMut(&[OutputEvent], u64) -> Result<(), InjectionError>,
     {
-        let id = match self.prepare_software_source(id, force_full, &mut inject) {
+        let id = match self.prepare_software_source(id, false, &mut inject) {
             Ok(id) => id,
             Err(error) => {
                 self.degrade_with(format!("软件来源更新失败：{error}"), &mut inject);
@@ -1020,6 +1150,7 @@ impl RuntimeController {
                 return SoftwareResult {
                     decision: Decision::Pass,
                     original_modifiers: None,
+                    preserve_original: false,
                 };
             }
         };
@@ -1030,19 +1161,50 @@ impl RuntimeController {
             .normalizer
             .normalize_software(raw);
         match event {
-            Some(event) => self.process_software_event_marked(id, &event, force_full, inject),
+            Some(event) => self.process_software_event_with_bypass(
+                id,
+                &event,
+                false,
+                bypass,
+                raw.is_unmanaged_flags_change(),
+                inject,
+            ),
             None => SoftwareResult {
                 decision: Decision::Pass,
                 original_modifiers: None,
+                preserve_original: false,
             },
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn process_software_event_marked<F>(
         &mut self,
         id: KeyboardSourceId,
         event: &NormalizedEvent,
         force_full: bool,
+        inject: F,
+    ) -> SoftwareResult
+    where
+        F: FnMut(&[OutputEvent], u64) -> Result<(), InjectionError>,
+    {
+        self.process_software_event_with_bypass(
+            id,
+            event,
+            force_full,
+            KeyboardBypass::default(),
+            false,
+            inject,
+        )
+    }
+
+    fn process_software_event_with_bypass<F>(
+        &mut self,
+        id: KeyboardSourceId,
+        event: &NormalizedEvent,
+        force_full: bool,
+        bypass: KeyboardBypass,
+        unmanaged_flags_change: bool,
         mut inject: F,
     ) -> SoftwareResult
     where
@@ -1051,6 +1213,7 @@ impl RuntimeController {
         let pass = || SoftwareResult {
             decision: Decision::Pass,
             original_modifiers: None,
+            preserve_original: false,
         };
         self.diagnostics.record_seen();
         if event
@@ -1115,11 +1278,41 @@ impl RuntimeController {
         let mut original_modifiers = None;
         let mut owner = OutputOwner::Native(stream);
         let mut pass_after_effects = false;
+        let mut preserve_original = false;
+        let already_bound = session.engine.state().physical_down(event.code)
+            || self.output_ownership.has_native(stream, event.code)
+            || (super::is_clipboard_key(event) && session.clipboard.active)
+            || session.switcher.consumed_tabs.contains(&event.code);
         let mut decision = if let Some(rewrite_flags) = session.raw_keys.get(&event.code).copied() {
             original_modifiers = rewrite_flags.then(|| session.engine.modifiers_for_event(event));
             if event.phase == EventPhase::Up {
                 session.raw_keys.remove(&event.code);
             }
+            Decision::Pass
+        } else if session
+            .native_keys
+            .forward(event, bypass.applies(event), already_bound)
+        {
+            session.engine.interrupt_gestures();
+            if event.kind == EventKind::FlagsChanged {
+                session.clipboard.handle(event);
+            }
+            if session.switcher.active() {
+                let releases = session.switcher.release(event.modifiers);
+                if let Err(error) = self.dispatch_outputs_for(
+                    stream,
+                    OutputOwner::ApplicationSwitch(stream),
+                    &releases,
+                    event.modifiers,
+                    &mut inject,
+                ) {
+                    self.software.insert(id, session);
+                    self.degrade_with(format!("切换应用释放失败：{error}"), &mut inject);
+                    self.diagnostics.record_passed();
+                    return self.software_fallback(id, event);
+                }
+            }
+            preserve_original = true;
             Decision::Pass
         } else if let Some(action) = session.clipboard.handle(event) {
             session.engine.interrupt_gestures();
@@ -1174,6 +1367,12 @@ impl RuntimeController {
             }
             let (decision, native_binding) = session.engine.handle_with_binding(event, policy);
             owner = OutputOwner::for_binding(stream, event.code, native_binding);
+            if decision == Decision::Pass
+                && unmanaged_flags_change
+                && policy == KeyboardMappingPolicy::Full
+            {
+                original_modifiers = Some(session.engine.modifiers_for_event(event));
+            }
             decision
         };
         if let Decision::Emit(outputs) = &decision {
@@ -1230,6 +1429,7 @@ impl RuntimeController {
         SoftwareResult {
             decision,
             original_modifiers,
+            preserve_original,
         }
     }
 }

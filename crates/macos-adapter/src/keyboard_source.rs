@@ -4,7 +4,7 @@
 //! In particular, a virtual HID can be indistinguishable from a physical device.
 
 use super::{is_own_marker, KeyboardMetadata};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread::JoinHandle;
@@ -48,6 +48,11 @@ impl KeyboardRoutingState {
     pub fn reset(&mut self) {
         self.bindings.clear();
         self.generations.clear();
+    }
+
+    pub fn forget_process(&mut self, process_id: i32) {
+        self.bindings.retain(|(pid, _), _| *pid != process_id);
+        self.generations.remove(&process_id);
     }
 
     /// Inspect the current producer epoch without registering a key. Callers
@@ -145,6 +150,7 @@ struct ProcessIdentity {
 struct SourceSnapshot {
     refreshed: Instant,
     processes: HashMap<i32, ProcessIdentity>,
+    listed_pids: Option<HashSet<i32>>,
 }
 
 impl Default for SourceSnapshot {
@@ -152,6 +158,7 @@ impl Default for SourceSnapshot {
         Self {
             refreshed: Instant::now(),
             processes: HashMap::new(),
+            listed_pids: None,
         }
     }
 }
@@ -168,10 +175,7 @@ pub struct KeyboardSourceCache {
 
 impl KeyboardSourceCache {
     pub fn start() -> Self {
-        let snapshot = Arc::new(RwLock::new(SourceSnapshot {
-            refreshed: Instant::now(),
-            processes: process_snapshot(),
-        }));
+        let snapshot = Arc::new(RwLock::new(process_snapshot()));
         let stopped = Arc::new(AtomicBool::new(false));
         let worker_snapshot = Arc::clone(&snapshot);
         let worker_stopped = Arc::clone(&stopped);
@@ -183,10 +187,7 @@ impl KeyboardSourceCache {
                     if worker_stopped.load(Ordering::Acquire) {
                         break;
                     }
-                    let next = SourceSnapshot {
-                        refreshed: Instant::now(),
-                        processes: process_snapshot(),
-                    };
+                    let next = process_snapshot();
                     if let Ok(mut current) = worker_snapshot.write() {
                         *current = next;
                     }
@@ -210,6 +211,27 @@ impl KeyboardSourceCache {
                 .flatten()
         });
         classify(metadata, own_marker, identity)
+    }
+
+    /// A missing classification is inconclusive. Confirm disappearance from a
+    /// complete process listing, or a different generation of a known PID.
+    pub fn process_has_ended(&self, id: KeyboardSourceId, last_input: Instant) -> bool {
+        if id.process_id <= 0 {
+            return false;
+        }
+        self.snapshot.try_read().is_ok_and(|snapshot| {
+            snapshot.refreshed > last_input
+                && snapshot.refreshed.elapsed() <= Duration::from_secs(3)
+                && (snapshot
+                    .listed_pids
+                    .as_ref()
+                    .is_some_and(|pids| !pids.contains(&id.process_id))
+                    || (id.process_start != 0
+                        && snapshot
+                            .processes
+                            .get(&id.process_id)
+                            .is_some_and(|entry| entry.started != id.process_start)))
+        })
     }
 }
 
@@ -261,7 +283,7 @@ fn is_deskflow_executable(path: &str) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn process_snapshot() -> HashMap<i32, ProcessIdentity> {
+fn process_snapshot() -> SourceSnapshot {
     use std::ffi::c_void;
     use std::mem::size_of;
 
@@ -281,9 +303,10 @@ fn process_snapshot() -> HashMap<i32, ProcessIdentity> {
         fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut c_void, size: i32) -> i32;
     }
 
+    let mut snapshot = SourceSnapshot::default();
     let needed = unsafe { proc_listpids(1, 0, std::ptr::null_mut(), 0) };
     if needed <= 0 {
-        return HashMap::new();
+        return snapshot;
     }
     let mut pids = vec![0_i32; needed as usize / size_of::<i32>() + 256];
     let bytes = unsafe {
@@ -295,7 +318,15 @@ fn process_snapshot() -> HashMap<i32, ProcessIdentity> {
         )
     };
     let count = (bytes.max(0) as usize / size_of::<i32>()).min(pids.len());
-    let mut processes = HashMap::new();
+    if bytes > 0 && (bytes as usize) < pids.len() * size_of::<i32>() {
+        snapshot.listed_pids = Some(
+            pids[..count]
+                .iter()
+                .copied()
+                .filter(|&pid| pid > 0)
+                .collect(),
+        );
+    }
     for &pid in &pids[..count] {
         if pid <= 0 {
             continue;
@@ -344,7 +375,7 @@ fn process_snapshot() -> HashMap<i32, ProcessIdentity> {
             continue;
         }
         let deskflow = is_deskflow_executable(path);
-        processes.insert(
+        snapshot.processes.insert(
             pid,
             ProcessIdentity {
                 started: info
@@ -355,12 +386,12 @@ fn process_snapshot() -> HashMap<i32, ProcessIdentity> {
             },
         );
     }
-    processes
+    snapshot
 }
 
 #[cfg(not(target_os = "macos"))]
-fn process_snapshot() -> HashMap<i32, ProcessIdentity> {
-    HashMap::new()
+fn process_snapshot() -> SourceSnapshot {
+    SourceSnapshot::default()
 }
 
 #[cfg(test)]
@@ -379,6 +410,54 @@ mod tests {
             unicode_len: 0,
             unicode_is_ascii_a: false,
         }
+    }
+
+    #[test]
+    fn process_termination_requires_a_fresh_complete_list_or_verified_generation() {
+        let now = Instant::now();
+        let prior_input = now - Duration::from_millis(1);
+        let cache = KeyboardSourceCache {
+            snapshot: Arc::new(RwLock::new(SourceSnapshot {
+                refreshed: now,
+                ..SourceSnapshot::default()
+            })),
+            stopped: Arc::new(AtomicBool::new(false)),
+            worker: None,
+        };
+        let id = KeyboardSourceId {
+            process_id: 501,
+            process_start: 12,
+            marker: 0,
+        };
+        assert!(!cache.process_has_ended(id, prior_input));
+        cache.snapshot.write().unwrap().listed_pids = Some(HashSet::from([501]));
+        assert!(!cache.process_has_ended(id, prior_input));
+
+        cache.snapshot.write().unwrap().processes.insert(
+            501,
+            ProcessIdentity {
+                started: 13,
+                deskflow: false,
+            },
+        );
+        assert!(cache.process_has_ended(id, prior_input));
+        assert!(!cache.process_has_ended(id, now));
+        let unidentified = KeyboardSourceId {
+            process_start: 0,
+            ..id
+        };
+        assert!(!cache.process_has_ended(unidentified, prior_input));
+        cache.snapshot.write().unwrap().listed_pids = Some(HashSet::from([502]));
+        assert!(cache.process_has_ended(unidentified, prior_input));
+        assert!(!cache.process_has_ended(
+            KeyboardSourceId {
+                process_id: 0,
+                ..id
+            },
+            prior_input
+        ));
+        cache.snapshot.write().unwrap().refreshed = now - Duration::from_secs(4);
+        assert!(!cache.process_has_ended(id, now - Duration::from_secs(5)));
     }
 
     #[test]
@@ -665,7 +744,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn native_process_snapshot_reads_current_process_generation() {
-        let snapshot = process_snapshot();
+        let snapshot = process_snapshot().processes;
         let current = snapshot.get(&(std::process::id() as i32)).unwrap();
         assert!(current.started > 0);
         assert!(!current.deskflow);
