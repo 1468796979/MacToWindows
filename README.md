@@ -26,6 +26,8 @@ MacToWindows 是一个面向 Windows 用户的 macOS 全局键鼠语义层。工
 
 内置预设中的左 Ctrl+Shift+Z 和左 Ctrl+Shift+V 分别输出 Command+Shift+Z 和 Command+Shift+V。可用 `modified:left_command|left_shift+key:6` 配置带修饰键的输出。
 
+启用 Windows 模式后，内置预设会把 Ctrl+Y 转成 Command+Shift+Z，在 VS Code 中重做上一步撤销的编辑。左 Ctrl、右 Ctrl 和两侧同时按住均可触发，额外按下 Shift、Alt 等修饰键时不会触发。旧版配置升级时，仍使用内置撤销规则的预设会自动补齐缺少的重做规则，原有的 Ctrl+Y 自定义规则会保留。
+
 设置页显示规则优先级以及相同触发条件下的覆盖关系。可以在添加规则时指定优先级，也可以从规则列表修改已保存的优先级。
 
 鼠标映射支持按钮、释放和拖动；滚轮反转保留原事件精度及惯性信息。`shortcut:show_desktop` 使用设置页中配置的系统输出快捷键，默认 `key:103`（F11），需与 macOS 的“显示桌面”绑定一致。锁屏和关闭窗口分别使用 Control+Command+Q、Command+W。

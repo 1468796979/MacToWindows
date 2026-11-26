@@ -2158,6 +2158,7 @@ pub mod commands {
                     mac_to_windows_config::import_toml(&contents).map_err(|e| e.to_string())?;
                 imported.upgrade_default_save_shortcuts();
                 imported.upgrade_default_edit_shortcuts();
+                imported.upgrade_default_redo_shortcuts();
                 *candidate = imported;
                 Ok(())
             })

@@ -254,10 +254,15 @@ fn read_valid(path: &Path) -> Result<(AppConfig, bool, Vec<String>), String> {
         import_saved_toml(&contents).map_err(|e| e.to_string())?;
     let upgraded_save_shortcuts = config.upgrade_default_save_shortcuts();
     let upgraded_edit_shortcuts = config.upgrade_default_edit_shortcuts();
+    let upgraded_redo_shortcuts = config.upgrade_default_redo_shortcuts();
     config.validate_desktop().map_err(|e| e.to_string())?;
     Ok((
         config,
-        legacy || upgraded_save_shortcuts || upgraded_edit_shortcuts || upgraded_scroll,
+        legacy
+            || upgraded_save_shortcuts
+            || upgraded_edit_shortcuts
+            || upgraded_redo_shortcuts
+            || upgraded_scroll,
         warnings,
     ))
 }
@@ -569,6 +574,84 @@ mod tests {
         assert_eq!(fs::read_to_string(&backup).unwrap(), original);
         let saved = fs::read_to_string(&path).unwrap();
         assert!(saved.contains("default_save_shortcuts_initialized = true"));
+        assert_eq!(load_startup(&path).config, upgraded.config);
+        assert_eq!(fs::read_to_string(&path).unwrap(), saved);
+        assert_eq!(fs::read_to_string(&backup).unwrap(), original);
+    }
+
+    #[test]
+    fn startup_adds_redo_to_existing_undo_presets_and_preserves_overrides() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        let backup = path.with_extension("toml.bak");
+        let mut previous = AppConfig::default();
+        for profile in previous.profiles.values_mut() {
+            profile
+                .keyboard_rules
+                .retain(|rule| !rule.trigger.ends_with("+key:16"));
+        }
+        let windows = previous.profiles.get_mut("windows_physical").unwrap();
+        windows
+            .keyboard_rules
+            .retain(|rule| rule.trigger != "chord:left_control+key:8");
+        windows.global_hotkeys.push(mac_to_windows_config::Rule {
+            trigger: "exact_chord:left_control+key:016".into(),
+            action: "pass".into(),
+            enabled: false,
+            ..mac_to_windows_config::Rule::default()
+        });
+        let shortcut = previous.profiles.get_mut("shortcut").unwrap();
+        shortcut
+            .keyboard_rules
+            .iter_mut()
+            .find(|rule| rule.trigger == "exact_chord:left_control+key:6")
+            .unwrap()
+            .enabled = false;
+        previous.profiles.insert("empty".into(), Profile::default());
+        let mut old_document = toml::Value::try_from(&previous).unwrap();
+        old_document
+            .as_table_mut()
+            .unwrap()
+            .remove("default_redo_shortcuts_initialized");
+        let original = toml::to_string_pretty(&old_document).unwrap();
+        fs::write(&path, &original).unwrap();
+
+        let upgraded = load_startup(&path);
+        assert!(upgraded.error.is_none(), "{:?}", upgraded.error);
+        let old_windows = &previous.profiles["windows_physical"];
+        let windows = &upgraded.config.profiles["windows_physical"];
+        let (existing, added) = windows
+            .keyboard_rules
+            .split_at(old_windows.keyboard_rules.len());
+        assert_eq!(existing, old_windows.keyboard_rules);
+        assert_eq!(windows.global_hotkeys, old_windows.global_hotkeys);
+        assert_eq!(
+            added
+                .iter()
+                .map(|rule| rule.trigger.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "exact_chord:right_control+key:16",
+                "exact_chord:left_control|right_control+key:16"
+            ]
+        );
+        assert!(added
+            .iter()
+            .all(|rule| rule.action == "modified:left_command|left_shift+key:6"));
+        assert_eq!(
+            upgraded.config.profiles["shortcut"],
+            previous.profiles["shortcut"]
+        );
+        assert_eq!(
+            upgraded.config.profiles["empty"],
+            previous.profiles["empty"]
+        );
+        assert_eq!(
+            upgraded.config.profiles["custom"].keyboard_rules.len(),
+            previous.profiles["custom"].keyboard_rules.len() + 3
+        );
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("default_redo_shortcuts_initialized = true"));
         assert_eq!(load_startup(&path).config, upgraded.config);
         assert_eq!(fs::read_to_string(&path).unwrap(), saved);
         assert_eq!(fs::read_to_string(&backup).unwrap(), original);

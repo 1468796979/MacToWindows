@@ -21,18 +21,26 @@ const DEFAULT_SAVE_TRIGGERS: [&str; 3] = [
     "exact_chord:right_control+key:1",
     "exact_chord:left_control|right_control+key:1",
 ];
+const DEFAULT_REDO_TRIGGERS: [&str; 3] = [
+    "exact_chord:left_control+key:16",
+    "exact_chord:right_control+key:16",
+    "exact_chord:left_control|right_control+key:16",
+];
+const DEFAULT_SAVE_ACTION: &str = "command:key:1";
+const DEFAULT_REDO_ACTION: &str = "modified:left_command|left_shift+key:6";
 const LEGACY_STOCK_MODIFIERS: [(&str, &str); 4] = [
     ("left_option", "left_windows"),
     ("right_option", "right_windows"),
     ("left_command", "left_alt"),
     ("right_command", "right_alt"),
 ];
+const LEGACY_STOCK_UNDO: (&str, &str) = ("chord:left_control+key:6", "command:key:6");
 const LEGACY_STOCK_EDIT_SHORTCUTS: [(&str, &str); 5] = [
     ("chord:left_control+key:0", "command:key:0"),
     ("chord:left_control+key:8", "command:key:8"),
     ("chord:left_control+key:9", "command:key:9"),
     ("chord:left_control+key:7", "command:key:7"),
-    ("chord:left_control+key:6", "command:key:6"),
+    LEGACY_STOCK_UNDO,
 ];
 
 /// A deliberately small, extensible rule representation. Additional fields can be
@@ -173,6 +181,8 @@ pub struct AppConfig {
     pub software_input_passthrough: bool,
     #[serde(default)]
     pub default_save_shortcuts_initialized: bool,
+    #[serde(default)]
+    pub default_redo_shortcuts_initialized: bool,
     #[serde(default = "default_panic_hotkey")]
     pub panic_hotkey: Vec<String>,
     #[serde(default)]
@@ -329,32 +339,30 @@ impl AppConfig {
         }
         self.default_save_shortcuts_initialized = true;
         for id in BUILT_IN_PROFILE_IDS {
-            let Some(profile) = self.profiles.get_mut(id) else {
-                continue;
-            };
-            if !has_legacy_stock_keyboard_rules(profile) {
-                continue;
+            if let Some(profile) = self
+                .profiles
+                .get_mut(id)
+                .filter(|profile| has_legacy_stock_keyboard_rules(profile))
+            {
+                add_missing_default_chords(profile, DEFAULT_SAVE_TRIGGERS, DEFAULT_SAVE_ACTION);
             }
-            // Disabled rules can be explicit overrides too. Check normalized
-            // conditions in every category with global desktop scope.
-            let existing: Vec<_> = global_profile_rules(profile)
-                .filter_map(|rule| parse_trigger(&rule.trigger))
-                .collect();
-            for trigger in DEFAULT_SAVE_TRIGGERS {
-                let Some(Trigger::Key {
-                    code,
-                    modifiers,
-                    phase,
-                }) = parse_trigger(trigger)
-                else {
-                    continue;
-                };
-                if !existing
-                    .iter()
-                    .any(|rule| matches_key_input(rule, code, modifiers.required, phase))
-                {
-                    profile.keyboard_rules.push(default_save_rule(trigger));
-                }
+        }
+        true
+    }
+
+    /// Add Redo to older built-in profiles that still use the default Undo.
+    pub fn upgrade_default_redo_shortcuts(&mut self) -> bool {
+        if self.default_redo_shortcuts_initialized {
+            return false;
+        }
+        self.default_redo_shortcuts_initialized = true;
+        for id in BUILT_IN_PROFILE_IDS {
+            if let Some(profile) = self
+                .profiles
+                .get_mut(id)
+                .filter(|profile| has_stock_keyboard_rule(profile, LEGACY_STOCK_UNDO, true))
+            {
+                add_missing_default_chords(profile, DEFAULT_REDO_TRIGGERS, DEFAULT_REDO_ACTION);
             }
         }
         true
@@ -507,27 +515,57 @@ fn global_profile_rules(profile: &Profile) -> impl Iterator<Item = &Rule> {
 }
 
 fn has_legacy_stock_keyboard_rules(profile: &Profile) -> bool {
-    let contains_rule = |(trigger, action): (&str, &str), enabled_only: bool| {
-        let exact = trigger
-            .strip_prefix("chord:")
-            .map(|chord| format!("exact_chord:{chord}"));
-        let trigger = parse_trigger(trigger);
-        let exact = exact.as_deref().and_then(parse_trigger);
-        let action = parse_action(action);
-        global_profile_rules(profile).any(|rule| {
-            (!enabled_only || rule.enabled)
-                && (parse_trigger(&rule.trigger) == trigger
-                    || exact.is_some() && parse_trigger(&rule.trigger) == exact)
-                && parse_action(&rule.action) == action
-        })
-    };
     LEGACY_STOCK_MODIFIERS
         .into_iter()
         .chain(LEGACY_STOCK_EDIT_SHORTCUTS)
-        .all(|rule| contains_rule(rule, false))
+        .all(|rule| has_stock_keyboard_rule(profile, rule, false))
         && LEGACY_STOCK_EDIT_SHORTCUTS
             .into_iter()
-            .any(|rule| contains_rule(rule, true))
+            .any(|rule| has_stock_keyboard_rule(profile, rule, true))
+}
+
+fn has_stock_keyboard_rule(
+    profile: &Profile,
+    (trigger, action): (&str, &str),
+    enabled_only: bool,
+) -> bool {
+    let exact = trigger
+        .strip_prefix("chord:")
+        .and_then(|chord| parse_trigger(&format!("exact_chord:{chord}")));
+    let trigger = parse_trigger(trigger);
+    let action = parse_action(action);
+    global_profile_rules(profile).any(|rule| {
+        let existing = parse_trigger(&rule.trigger);
+        (!enabled_only || rule.enabled)
+            && (existing == trigger || exact.is_some() && existing == exact)
+            && parse_action(&rule.action) == action
+    })
+}
+
+fn add_missing_default_chords(profile: &mut Profile, triggers: [&str; 3], action: &str) {
+    // Disabled rules can be explicit overrides too. Check normalized
+    // conditions in every category with global desktop scope.
+    let existing: Vec<_> = global_profile_rules(profile)
+        .filter_map(|rule| parse_trigger(&rule.trigger))
+        .collect();
+    for trigger in triggers {
+        let Some(Trigger::Key {
+            code,
+            modifiers,
+            phase,
+        }) = parse_trigger(trigger)
+        else {
+            continue;
+        };
+        if !existing
+            .iter()
+            .any(|rule| matches_key_input(rule, code, modifiers.required, phase))
+        {
+            profile
+                .keyboard_rules
+                .push(default_chord_rule(trigger, action));
+        }
+    }
 }
 
 fn matches_key_input(
@@ -551,11 +589,11 @@ fn matches_key_input(
     }
 }
 
-fn default_save_rule(trigger: &str) -> Rule {
+fn default_chord_rule(trigger: &str, action: &str) -> Rule {
     Rule {
-        name: format!("{trigger} → command:key:1"),
+        name: format!("{trigger} → {action}"),
         trigger: trigger.into(),
-        action: "command:key:1".into(),
+        action: action.into(),
         priority: 200,
         ..Rule::default()
     }
@@ -963,9 +1001,16 @@ pub fn default_config() -> AppConfig {
     for rule in &mut profile.keyboard_rules {
         rule.name = format!("{} → {}", rule.trigger, rule.action);
     }
-    profile
-        .keyboard_rules
-        .extend(DEFAULT_SAVE_TRIGGERS.into_iter().map(default_save_rule));
+    for (triggers, action) in [
+        (DEFAULT_SAVE_TRIGGERS, DEFAULT_SAVE_ACTION),
+        (DEFAULT_REDO_TRIGGERS, DEFAULT_REDO_ACTION),
+    ] {
+        profile.keyboard_rules.extend(
+            triggers
+                .into_iter()
+                .map(|trigger| default_chord_rule(trigger, action)),
+        );
+    }
     let mut profiles = BTreeMap::new();
     profiles.insert(BUILT_IN_PROFILE_IDS[0].into(), profile.clone());
     for id in BUILT_IN_PROFILE_IDS.into_iter().skip(1) {
@@ -981,6 +1026,7 @@ pub fn default_config() -> AppConfig {
         enabled: false,
         software_input_passthrough: true,
         default_save_shortcuts_initialized: true,
+        default_redo_shortcuts_initialized: true,
         panic_hotkey: default_panic_hotkey(),
         mouse: MouseConfig::default(),
         system_shortcuts: SystemShortcutsConfig::default(),
@@ -1319,7 +1365,7 @@ mod tests {
     fn active_profile_compiles_to_rule_snapshot() {
         let config = default_config();
         let compiled = config.compile_active_profile().unwrap();
-        assert_eq!(compiled.rules().len(), 24);
+        assert_eq!(compiled.rules().len(), 27);
     }
 
     #[test]
@@ -1860,6 +1906,7 @@ mod tests {
     fn custom_profile_starts_as_an_independent_copy_and_keeps_defaults_on_add() {
         let mut config = default_config();
         config.active_profile = "custom".into();
+        let default_rule_count = config.compile_active_profile().unwrap().rules().len();
         let original_windows = config.profiles["windows_physical"].clone();
         config
             .profiles
@@ -1871,7 +1918,10 @@ mod tests {
                 action: "key:13".into(),
                 ..Rule::default()
             });
-        assert_eq!(config.compile_active_profile().unwrap().rules().len(), 25);
+        assert_eq!(
+            config.compile_active_profile().unwrap().rules().len(),
+            default_rule_count + 1
+        );
         assert_eq!(config.profiles["windows_physical"], original_windows);
         let windows_ids: HashSet<_> = original_windows
             .keyboard_rules

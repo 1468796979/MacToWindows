@@ -299,6 +299,77 @@ fn exact_ctrl_s_keeps_command_down_repeat_and_up_for_each_control_combination() 
 }
 
 #[test]
+fn exact_ctrl_y_emits_shift_command_z_throughout_the_key_lifecycle() {
+    use EventPhase::{Down, Repeat, Up};
+
+    let left = (59, 0x0004_0001);
+    let right = (62, 0x0004_2000);
+    let shift = (56, 0x0002_0002);
+    for (source, pid, passthrough) in [
+        (KeyboardSourceKind::HardwareLike, 0, true),
+        (KeyboardSourceKind::Software, 501, true),
+        (KeyboardSourceKind::Software, 501, false),
+    ] {
+        for (keys, redo) in [
+            (&[][..], false),
+            (&[left][..], true),
+            (&[right][..], true),
+            (&[left, right][..], true),
+            (&[left, shift][..], false),
+        ] {
+            let mut h = Harness::new(passthrough, false);
+            let mut flags = 0;
+            for &(code, flag) in keys {
+                flags |= flag;
+                assert_eq!(
+                    h.send(&Keyboard::new(12, code, flags, pid, 0, None), source),
+                    EventTapAction::Pass
+                );
+            }
+            let repeat = Keyboard::new(10, 16, flags, pid, 0, None);
+            unsafe { CGEventSetIntegerValueField(repeat.raw, 8, 1) };
+            let expected = if redo {
+                EventTapAction::Suppress
+            } else {
+                EventTapAction::Pass
+            };
+            for input in [Keyboard::new(10, 16, flags, pid, 0, None), repeat] {
+                assert_eq!(h.send(&input, source), expected);
+            }
+            for &(code, flag) in keys.iter().rev() {
+                flags &= !(flag & 0xffff);
+                if flags & 0x2001 == 0 {
+                    flags &= !0x0004_0000;
+                }
+                if code == shift.0 {
+                    flags &= !0x0002_0000;
+                }
+                assert_eq!(
+                    h.send(&Keyboard::new(12, code, flags, pid, 0, None), source),
+                    EventTapAction::Pass
+                );
+            }
+            assert_eq!(
+                h.send(&Keyboard::new(11, 16, flags, pid, 0, None), source),
+                expected
+            );
+            if redo {
+                assert_eq!(
+                    h.outputs,
+                    [Down, Repeat, Up].map(|phase| OutputEvent::Key {
+                        code: PhysicalCode::key(6),
+                        phase,
+                        modifiers: M::LEFT_COMMAND | M::LEFT_SHIFT,
+                    })
+                );
+            } else {
+                assert!(h.outputs.is_empty());
+            }
+        }
+    }
+}
+
+#[test]
 fn exact_ctrl_s_does_not_change_plain_s_or_a_chord_with_extra_modifiers() {
     let left_control = 0x0004_0001;
     let physical = KeyboardSourceKind::HardwareLike;
