@@ -625,11 +625,19 @@ impl RuleEngine {
     /// A caller can use this to resolve an explicit Alt+Tab session while
     /// still honoring the active preset's shortcut rules.
     pub fn shortcut_action(&self, event: &NormalizedEvent) -> Option<Action> {
+        self.action_for_event(event, KeyboardMappingPolicy::ShortcutsOnly)
+    }
+
+    pub fn action_for_event(
+        &self,
+        event: &NormalizedEvent,
+        policy: KeyboardMappingPolicy,
+    ) -> Option<Action> {
         if matches!(event.origin, event_model::EventOrigin::TextInjection { .. }) {
             return None;
         }
         self.rules
-            .find_with_policy(event, KeyboardMappingPolicy::ShortcutsOnly)
+            .find_with_policy(event, policy)
             .map(|rule| rule.action.clone())
     }
 

@@ -7,7 +7,7 @@
 use event_model::{EventKind, EventPhase, ModifierSet, NormalizedEvent, OutputEvent, PhysicalCode};
 use macos_adapter::KeyboardSourceId;
 use rule_engine::BindingKind;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum InputStream {
@@ -52,14 +52,14 @@ impl OutputOwner {
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct OutputOwnership {
-    held: HashMap<PhysicalCode, HashSet<OutputOwner>>,
+    held: HashMap<PhysicalCode, HashMap<OutputOwner, ModifierSet>>,
 }
 
 impl OutputOwnership {
     pub(crate) fn has_native(&self, stream: InputStream, code: PhysicalCode) -> bool {
         self.held
             .get(&code)
-            .is_some_and(|owners| owners.contains(&OutputOwner::Native(stream)))
+            .is_some_and(|owners| owners.contains_key(&OutputOwner::Native(stream)))
     }
 
     /// Filter primitive outputs in order. Expand system key sequences before
@@ -72,14 +72,20 @@ impl OutputOwnership {
         let mut filtered = Vec::with_capacity(outputs.len());
         for output in outputs {
             let target = match output {
-                OutputEvent::Key { code, phase, .. } => Some((*code, *phase)),
-                OutputEvent::MouseButton { button, phase } => {
-                    Some((PhysicalCode::MouseButton(*button), *phase))
-                }
+                OutputEvent::Key {
+                    code,
+                    phase,
+                    modifiers,
+                } => Some((*code, *phase, *modifiers)),
+                OutputEvent::MouseButton { button, phase } => Some((
+                    PhysicalCode::MouseButton(*button),
+                    *phase,
+                    ModifierSet::NONE,
+                )),
                 _ => None,
             };
-            if let Some((code, phase)) = target {
-                if !self.transition(owner, code, phase, false) {
+            if let Some((code, phase, modifiers)) = target {
+                if !self.transition(owner, code, phase, modifiers, false) {
                     continue;
                 }
             }
@@ -129,7 +135,13 @@ impl OutputOwnership {
         } else {
             event.phase
         };
-        self.transition(OutputOwner::Native(stream), event.code, phase, true)
+        self.transition(
+            OutputOwner::Native(stream),
+            event.code,
+            phase,
+            event.modifiers,
+            true,
+        )
     }
 
     /// Modifier state that this stream must not accidentally release. Its own
@@ -141,7 +153,7 @@ impl OutputOwnership {
             .filter_map(|(code, owners)| {
                 let (physical, _) = modifier_bits(*code)?;
                 owners
-                    .iter()
+                    .keys()
                     .any(|owner| *owner != OutputOwner::Native(stream))
                     .then_some(physical)
             })
@@ -164,7 +176,7 @@ impl OutputOwnership {
             .filter_map(|(code, owners)| {
                 let (physical, _) = modifier_bits(*code)?;
                 owners
-                    .iter()
+                    .keys()
                     .any(|owner| owner.stream() != stream)
                     .then_some(physical)
             })
@@ -195,7 +207,7 @@ impl OutputOwnership {
         let mut targets: Vec<_> = self
             .held
             .iter()
-            .flat_map(|(&code, owners)| owners.iter().copied().map(move |owner| (code, owner)))
+            .flat_map(|(&code, owners)| owners.keys().copied().map(move |owner| (code, owner)))
             .filter(|&(_, owner)| matches_owner(owner))
             .collect();
         // Finish main keys before their modifiers. Stable order makes cleanup
@@ -243,17 +255,29 @@ impl OutputOwnership {
         owner: OutputOwner,
         code: PhysicalCode,
         phase: EventPhase,
+        modifiers: ModifierSet,
         raw: bool,
     ) -> bool {
         match phase {
             EventPhase::Down => {
                 let owners = self.held.entry(code).or_default();
                 let first = owners.is_empty();
-                let already_held = owners.contains(&owner);
-                owners.insert(owner);
+                let already_held = owners.contains_key(&owner);
+                // Two different shortcuts can intentionally share a main
+                // key. Deliver both presses while retaining one final Up.
+                let distinct_shortcut = !already_held
+                    && matches!(
+                        owner,
+                        OutputOwner::Mapped(..) | OutputOwner::ExactMapped(..)
+                    )
+                    && matches!(code, PhysicalCode::Key(_))
+                    && modifier_bits(code).is_none()
+                    && modifiers != ModifierSet::NONE
+                    && owners.values().all(|held| *held != modifiers);
+                owners.entry(owner).or_insert(modifiers);
                 // A repeated raw Down can be a new software submission. Keep
                 // it usable when it does not interfere with another holder.
-                first || (raw && already_held && owners.len() == 1)
+                first || distinct_shortcut || (raw && already_held && owners.len() == 1)
             }
             EventPhase::Up => {
                 let Some(owners) = self.held.get_mut(&code) else {
@@ -269,7 +293,7 @@ impl OutputOwnership {
             EventPhase::Repeat => self
                 .held
                 .get(&code)
-                .is_none_or(|owners| owners.contains(&owner)),
+                .is_none_or(|owners| owners.contains_key(&owner)),
             _ => true,
         }
     }

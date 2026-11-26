@@ -12,7 +12,7 @@
     KeyI: 34, KeyP: 35, Enter: 36, KeyL: 37, KeyJ: 38, Quote: 39, KeyK: 40,
     Semicolon: 41, Backslash: 42, Comma: 43, Slash: 44, KeyN: 45, KeyM: 46,
     Period: 47, Tab: 48, Space: 49, Backquote: 50, Backspace: 51, Escape: 53,
-    MetaLeft: 55, MetaRight: 54, ShiftLeft: 56, CapsLock: 57, AltLeft: 58, ControlLeft: 59,
+    MetaLeft: 55, MetaRight: 54, ShiftLeft: 56, AltLeft: 58, ControlLeft: 59,
     ShiftRight: 60, AltRight: 61, ControlRight: 62, ArrowRight: 124, ArrowLeft: 123,
     ArrowDown: 125, ArrowUp: 126, F1: 122, F2: 120, F3: 99, F4: 118, F5: 96,
     F6: 97, F7: 98, F8: 100, F9: 101, F10: 109, F11: 103, F12: 111,
@@ -51,6 +51,7 @@
 
   function recordedTrigger(event, heldCodes) {
     const code = event?.code;
+    if (code === "CapsLock") throw new Error("Caps Lock 保留给 macOS，不能作为映射触发键");
     const keyCode = KEY_CODES[code];
     if (keyCode === undefined) throw new Error("无法识别该按键，请改用文本填写");
     const modifiers = [];

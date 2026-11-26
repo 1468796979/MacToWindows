@@ -28,6 +28,12 @@ const DEFAULT_REDO_TRIGGERS: [&str; 3] = [
 ];
 const DEFAULT_SAVE_ACTION: &str = "command:key:1";
 const DEFAULT_REDO_ACTION: &str = "modified:left_command|left_shift+key:6";
+const CONTROL_SIDES: [&str; 3] = [
+    "left_control",
+    "right_control",
+    "left_control|right_control",
+];
+const SHIFT_VARIANTS: [&str; 3] = ["left_shift", "right_shift", "left_shift|right_shift"];
 const LEGACY_STOCK_MODIFIERS: [(&str, &str); 4] = [
     ("left_option", "left_windows"),
     ("right_option", "right_windows"),
@@ -183,6 +189,8 @@ pub struct AppConfig {
     pub default_save_shortcuts_initialized: bool,
     #[serde(default)]
     pub default_redo_shortcuts_initialized: bool,
+    #[serde(default)]
+    pub default_edit_control_sides_initialized: bool,
     #[serde(default = "default_panic_hotkey")]
     pub panic_hotkey: Vec<String>,
     #[serde(default)]
@@ -414,7 +422,7 @@ impl AppConfig {
                         && parse_action(&rule.action) != parse_action(action)
                 });
                 let mut variants = Vec::new();
-                for shift in ["left_shift", "right_shift", "left_shift|right_shift"] {
+                for shift in SHIFT_VARIANTS {
                     let trigger = format!("exact_chord:left_control|{shift}+{key}");
                     if !explicit_override(&trigger) {
                         let action = format!("modified:left_command|{shift}+{key}");
@@ -437,6 +445,45 @@ impl AppConfig {
             }
         }
         upgraded
+    }
+
+    /// Extend the existing stock rules without touching a user's original
+    /// shortcut, including any deliberately disabled variant.
+    pub fn upgrade_default_edit_control_sides(&mut self) -> bool {
+        if self.default_edit_control_sides_initialized {
+            return false;
+        }
+        self.default_edit_control_sides_initialized = true;
+        for id in BUILT_IN_PROFILE_IDS {
+            let Some(profile) = self.profiles.get_mut(id) else {
+                continue;
+            };
+            let uses_stock_edits = LEGACY_STOCK_EDIT_SHORTCUTS
+                .into_iter()
+                .any(|rule| has_stock_keyboard_rule(profile, rule, true));
+            for (trigger, action) in LEGACY_STOCK_EDIT_SHORTCUTS {
+                let key = trigger.strip_prefix("chord:left_control+").unwrap();
+                mirror_control_rule(profile, trigger, "", key, action);
+                if matches!(key, "key:6" | "key:9") {
+                    for shift in SHIFT_VARIANTS {
+                        let source = format!("exact_chord:left_control|{shift}+{key}");
+                        let output = format!("modified:left_command|{shift}+{key}");
+                        mirror_control_rule(profile, &source, &format!("|{shift}"), key, &output);
+                    }
+                }
+            }
+            if uses_stock_edits {
+                for control in CONTROL_SIDES {
+                    let trigger = format!("exact_chord:{control}+key:3");
+                    if !has_matching_global_rule(profile, &trigger) {
+                        profile
+                            .keyboard_rules
+                            .push(default_chord_rule(&trigger, "command:key:3"));
+                    }
+                }
+            }
+        }
+        true
     }
 
     pub fn show_desktop_output(&self) -> Result<Vec<OutputEvent>, ConfigError> {
@@ -543,27 +590,46 @@ fn has_stock_keyboard_rule(
 }
 
 fn add_missing_default_chords(profile: &mut Profile, triggers: [&str; 3], action: &str) {
-    // Disabled rules can be explicit overrides too. Check normalized
-    // conditions in every category with global desktop scope.
-    let existing: Vec<_> = global_profile_rules(profile)
-        .filter_map(|rule| parse_trigger(&rule.trigger))
-        .collect();
     for trigger in triggers {
-        let Some(Trigger::Key {
-            code,
-            modifiers,
-            phase,
-        }) = parse_trigger(trigger)
-        else {
-            continue;
-        };
-        if !existing
-            .iter()
-            .any(|rule| matches_key_input(rule, code, modifiers.required, phase))
-        {
+        if !has_matching_global_rule(profile, trigger) {
             profile
                 .keyboard_rules
                 .push(default_chord_rule(trigger, action));
+        }
+    }
+}
+
+fn has_matching_global_rule(profile: &Profile, trigger: &str) -> bool {
+    let Some(Trigger::Key {
+        code,
+        modifiers,
+        phase,
+    }) = parse_trigger(trigger)
+    else {
+        return false;
+    };
+    // A disabled or catch-all rule may be an intentional override.
+    global_profile_rules(profile)
+        .filter_map(|rule| parse_trigger(&rule.trigger))
+        .any(|rule| matches_key_input(&rule, code, modifiers.required, phase))
+}
+
+fn mirror_control_rule(profile: &mut Profile, source: &str, suffix: &str, key: &str, action: &str) {
+    let exact = format!("exact_chord:left_control{suffix}+{key}");
+    let Some((priority, enabled)) = profile.keyboard_rules.iter().find_map(|rule| {
+        ((rule.trigger == source || rule.trigger == exact) && rule.action == action)
+            .then_some((rule.priority, rule.enabled))
+    }) else {
+        return;
+    };
+    for control in CONTROL_SIDES.into_iter().skip(1) {
+        let trigger = format!("exact_chord:{control}{suffix}+{key}");
+        if !has_matching_global_rule(profile, &trigger) {
+            profile.keyboard_rules.push(Rule {
+                priority,
+                enabled,
+                ..default_chord_rule(&trigger, action)
+            });
         }
     }
 }
@@ -678,6 +744,11 @@ where
         let action = parse_action(&input.action).ok_or_else(|| {
             ConfigError::InvalidRule(format!("profiles.{profile_id}.{category}[{index}].action"))
         })?;
+        if let Some(reason) = unsupported_keyboard_rule(input, &trigger, &action) {
+            return Err(ConfigError::InvalidRule(format!(
+                "profiles.{profile_id}.{category}[{index}].{reason}"
+            )));
+        }
         if input.enabled && matches!(action, Action::InvertScroll) && !is_scroll_trigger(&trigger) {
             return Err(ConfigError::InvalidRule(format!(
                 "profiles.{profile_id}.{category}[{index}].action: scroll reversal requires a scroll trigger"
@@ -701,6 +772,37 @@ where
         });
     }
     Ok(())
+}
+
+fn unsupported_keyboard_rule(
+    rule: &Rule,
+    trigger: &Trigger,
+    action: &Action,
+) -> Option<&'static str> {
+    if !rule.enabled {
+        return None;
+    }
+    match trigger {
+        Trigger::Key {
+            code: PhysicalCode::Key(57),
+            ..
+        }
+        | Trigger::Chord {
+            key: PhysicalCode::Key(57),
+            ..
+        } => {
+            return Some("trigger: Caps Lock 保留给 macOS，不能作为映射触发键");
+        }
+        _ => {}
+    }
+    if (rule.action.starts_with("modified:") || rule.action.starts_with("command:"))
+        && matches!(action, Action::Replace(outputs)
+            if matches!(outputs.as_slice(), [OutputEvent::Key { code, .. }]
+                if modifier_codes().iter().any(|(modifier, _)| code == modifier)))
+    {
+        return Some("action: 带修饰键输出的主键必须是普通键");
+    }
+    None
 }
 
 fn validate_global_scope_fields(
@@ -1027,6 +1129,7 @@ pub fn default_config() -> AppConfig {
         software_input_passthrough: true,
         default_save_shortcuts_initialized: true,
         default_redo_shortcuts_initialized: true,
+        default_edit_control_sides_initialized: false,
         panic_hotkey: default_panic_hotkey(),
         mouse: MouseConfig::default(),
         system_shortcuts: SystemShortcutsConfig::default(),
@@ -1038,6 +1141,7 @@ pub fn default_config() -> AppConfig {
         profiles,
     };
     config.upgrade_default_edit_shortcuts();
+    config.upgrade_default_edit_control_sides();
     config
 }
 
@@ -1048,13 +1152,13 @@ pub fn import_toml(input: &str) -> Result<AppConfig, ConfigError> {
     Ok(config)
 }
 
-/// Load saved settings from releases that accepted scroll reversal on a key
-/// or button. Preserve those entries for editing without enabling them.
+/// Preserve unsupported entries from older saved settings for editing.
 pub fn import_saved_toml(input: &str) -> Result<(AppConfig, bool, Vec<String>), ConfigError> {
     let mut config = parse_toml(input)?;
     let invalid_scroll_mode = !config.mouse.valid_mode();
     let upgraded_scroll = config.mouse.migrate_scroll_mode();
     let mut disabled = Vec::new();
+    let mut unsupported = Vec::new();
     for (profile_id, profile) in &mut config.profiles {
         for (category, rules) in [
             ("keyboard_rules", &mut profile.keyboard_rules),
@@ -1078,6 +1182,16 @@ pub fn import_saved_toml(input: &str) -> Result<(AppConfig, bool, Vec<String>), 
                     rule.enabled = false;
                     disabled.push(format!("profiles.{profile_id}.{category}[{index}]"));
                 }
+                if let Some((trigger, action)) =
+                    parse_trigger(&rule.trigger).zip(parse_action(&rule.action))
+                {
+                    if let Some(reason) = unsupported_keyboard_rule(rule, &trigger, &action) {
+                        rule.enabled = false;
+                        unsupported.push(format!(
+                            "profiles.{profile_id}.{category}[{index}].{reason}"
+                        ));
+                    }
+                }
             }
         }
     }
@@ -1092,7 +1206,14 @@ pub fn import_saved_toml(input: &str) -> Result<(AppConfig, bool, Vec<String>), 
     if invalid_scroll_mode {
         warnings.push("mouse.scroll_mode 无效，滚动方向已恢复为跟随系统".into());
     }
-    Ok((config, upgraded_scroll, warnings))
+    let upgraded_unsupported = !unsupported.is_empty();
+    if upgraded_unsupported {
+        warnings.push(format!(
+            "已停用系统不支持的键盘规则（{}）",
+            unsupported.join("、")
+        ));
+    }
+    Ok((config, upgraded_scroll || upgraded_unsupported, warnings))
 }
 
 fn parse_toml(input: &str) -> Result<AppConfig, ConfigError> {
@@ -1365,7 +1486,162 @@ mod tests {
     fn active_profile_compiles_to_rule_snapshot() {
         let config = default_config();
         let compiled = config.compile_active_profile().unwrap();
-        assert_eq!(compiled.rules().len(), 27);
+        assert_eq!(compiled.rules().len(), 49);
+    }
+
+    #[test]
+    fn stock_find_and_edit_shortcuts_support_each_control_side() {
+        use event_model::{Decision, DeviceSource, EventKind, EventOrigin, NormalizedEvent};
+        use rule_engine::RuleEngine;
+
+        let config = default_config();
+        for id in BUILT_IN_PROFILE_IDS {
+            let rules = compile_profile(id, &config.profiles[id]).unwrap();
+            for control in [
+                ModifierSet::LEFT_CONTROL,
+                ModifierSet::RIGHT_CONTROL,
+                ModifierSet::LEFT_CONTROL | ModifierSet::RIGHT_CONTROL,
+            ] {
+                for (code, shift) in [
+                    (0, ModifierSet::NONE),
+                    (3, ModifierSet::NONE),
+                    (7, ModifierSet::NONE),
+                    (8, ModifierSet::NONE),
+                    (6, ModifierSet::NONE),
+                    (9, ModifierSet::NONE),
+                    (6, ModifierSet::LEFT_SHIFT),
+                    (9, ModifierSet::RIGHT_SHIFT),
+                    (6, ModifierSet::LEFT_SHIFT | ModifierSet::RIGHT_SHIFT),
+                ] {
+                    let mut engine = RuleEngine::new(rules.clone());
+                    let code = PhysicalCode::key(code);
+                    assert_eq!(
+                        engine.handle(&NormalizedEvent {
+                            source: DeviceSource::Keyboard,
+                            kind: EventKind::Keyboard,
+                            phase: EventPhase::Down,
+                            code,
+                            modifiers: control | shift,
+                            location: None,
+                            scroll: None,
+                            timestamp_ns: 0,
+                            app_context: None,
+                            origin: EventOrigin::Hardware,
+                        }),
+                        Decision::Emit(vec![OutputEvent::Key {
+                            code,
+                            phase: EventPhase::Down,
+                            modifiers: ModifierSet::LEFT_COMMAND | shift,
+                        }]),
+                        "{id} {control:?} {code:?} {shift:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn control_side_migration_extends_stock_rules_and_keeps_existing_overrides() {
+        let mut config = default_config();
+        config.default_edit_control_sides_initialized = false;
+        let profile = config.profiles.get_mut("windows_physical").unwrap();
+        profile.keyboard_rules.retain(|rule| {
+            !rule.trigger.starts_with("exact_chord:right_control")
+                && !rule
+                    .trigger
+                    .starts_with("exact_chord:left_control|right_control")
+                && !rule.trigger.ends_with("+key:3")
+        });
+        let disabled = profile
+            .keyboard_rules
+            .iter_mut()
+            .find(|rule| rule.trigger == "chord:left_control+key:8")
+            .unwrap();
+        disabled.priority = 140;
+        disabled.enabled = false;
+        let custom = Rule {
+            name: "Custom right undo".into(),
+            trigger: "chord:right_control+key:6".into(),
+            action: "pass".into(),
+            ..Rule::default()
+        };
+        profile.global_hotkeys.push(custom.clone());
+        let original = profile.keyboard_rules.clone();
+        assert!(config.upgrade_default_edit_control_sides());
+        assert!(!config.upgrade_default_edit_control_sides());
+        let profile = &config.profiles["windows_physical"];
+        assert_eq!(&profile.keyboard_rules[..original.len()], &original);
+        assert!(profile.global_hotkeys.contains(&custom));
+        assert!(!profile
+            .keyboard_rules
+            .iter()
+            .any(|rule| rule.trigger == "exact_chord:right_control+key:6"
+                || rule.trigger == "exact_chord:left_control|right_control+key:6"));
+        assert!(profile
+            .keyboard_rules
+            .iter()
+            .any(|rule| rule.trigger == "exact_chord:right_control+key:8"
+                && !rule.enabled
+                && rule.priority == 140));
+        assert!(profile
+            .keyboard_rules
+            .iter()
+            .any(|rule| rule.trigger == "exact_chord:right_control+key:3" && rule.enabled));
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn unsupported_keyboard_rules_are_rejected_on_import_and_preserved_disabled_on_upgrade() {
+        for (trigger, action, expected) in [
+            (
+                "key:96",
+                "modified:left_command+left_shift",
+                "主键必须是普通键",
+            ),
+            ("key:96", "command:key:56", "主键必须是普通键"),
+            ("key:057", "key:11", "Caps Lock"),
+            ("exact_chord:left_control+key:57", "key:11", "Caps Lock"),
+        ] {
+            let mut config = default_config();
+            let rule = Rule {
+                trigger: trigger.into(),
+                action: action.into(),
+                ..Rule::default()
+            };
+            config
+                .profiles
+                .get_mut("windows_physical")
+                .unwrap()
+                .keyboard_rules
+                .push(rule.clone());
+            let contents = toml::to_string_pretty(&config).unwrap();
+            assert!(import_toml(&contents)
+                .unwrap_err()
+                .to_string()
+                .contains(expected));
+            let (mut recovered, changed, warnings) = import_saved_toml(&contents).unwrap();
+            assert!(changed && warnings.iter().any(|warning| warning.contains(expected)));
+            let upgraded = recovered
+                .profiles
+                .get_mut("windows_physical")
+                .unwrap()
+                .keyboard_rules
+                .last_mut()
+                .unwrap();
+            assert_eq!(
+                *upgraded,
+                Rule {
+                    enabled: false,
+                    ..rule
+                }
+            );
+            upgraded.enabled = true;
+            assert!(recovered
+                .validate_desktop()
+                .unwrap_err()
+                .to_string()
+                .contains(expected));
+        }
     }
 
     #[test]

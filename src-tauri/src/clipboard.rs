@@ -5,12 +5,16 @@ use clipboard_core::{
 use macos_adapter::{ForegroundApplication, PasteboardError, PasteboardService};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
+
+const REOPEN_FOR_PASTE: &str = "请从目标应用重新打开剪贴板历史";
+const QUEUE_TIMEOUT: Duration = Duration::from_secs(2);
+const REMOVAL_CANCELLED: &str = "剪贴板操作排队超时，已取消";
 
 #[derive(Debug, Clone)]
 pub struct ClipboardSelection {
@@ -89,7 +93,7 @@ impl ClipboardManagerCore {
         let target = self
             .target
             .clone()
-            .ok_or_else(|| "没有可恢复的目标应用".to_owned())?;
+            .ok_or_else(|| REOPEN_FOR_PASTE.to_owned())?;
         Ok(ClipboardSelection {
             text: entry.text.clone(),
             target,
@@ -118,9 +122,52 @@ fn unix_ms() -> u64 {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ClipboardPreview {
+    id: u64,
+    preview: String,
+    copied_at_unix_ms: u64,
+}
+
+impl From<&ClipboardEntry> for ClipboardPreview {
+    fn from(entry: &ClipboardEntry) -> Self {
+        const LIMIT: usize = 120;
+        let mut preview = String::new();
+        let mut length = 0;
+        let mut needs_space = false;
+        for character in entry.text.chars() {
+            if character.is_whitespace() {
+                needs_space = length > 0;
+                continue;
+            }
+            if length == LIMIT {
+                preview.push('…');
+                break;
+            }
+            if needs_space {
+                preview.push(' ');
+                length += 1;
+                needs_space = false;
+                if length == LIMIT {
+                    preview.push('…');
+                    break;
+                }
+            }
+            preview.push(character);
+            length += 1;
+        }
+        Self {
+            id: entry.id,
+            preview,
+            copied_at_unix_ms: entry.copied_at_unix_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ClipboardSnapshot {
-    pub entries: Vec<ClipboardEntry>,
+    pub entries: Vec<ClipboardPreview>,
     pub panel_open: bool,
+    pub can_paste: bool,
     pub panel_session: u64,
     pub revision: u64,
     pub last_error: Option<String>,
@@ -216,10 +263,16 @@ impl HistoryState {
         }
     }
 
-    fn snapshot(&self, panel_open: bool) -> ClipboardSnapshot {
+    fn snapshot(&self, panel_open: bool, core: Option<&ClipboardManagerCore>) -> ClipboardSnapshot {
         ClipboardSnapshot {
-            entries: self.history.entries().to_vec(),
+            entries: self
+                .history
+                .entries()
+                .iter()
+                .map(ClipboardPreview::from)
+                .collect(),
             panel_open,
+            can_paste: panel_open && core.is_some_and(|core| core.target.is_some()),
             panel_session: self.panel_session,
             revision: 0,
             last_error: self.errors.message(),
@@ -235,7 +288,7 @@ impl HistoryState {
         core: &mut Option<ClipboardManagerCore>,
         panel_open: &mut bool,
         from_panel: bool,
-        capture: impl FnOnce() -> Result<Option<ForegroundApplication>, String>,
+        target: Option<ForegroundApplication>,
     ) {
         if *panel_open && from_panel {
             return;
@@ -243,16 +296,7 @@ impl HistoryState {
         self.panel_session = self.panel_session.wrapping_add(1);
         self.errors.operation = None;
         if let Some(core) = core.as_mut() {
-            core.target = None;
-            let result = capture().and_then(|target| {
-                core.capture_target_value(target)
-                    .map_err(|error| error.to_string())
-            });
-            if let Err(error) = result {
-                if should_report_show_capture_error(&error) {
-                    self.errors.operation = Some(format!("无法记录前台应用：{error}"));
-                }
-            }
+            let _ = core.capture_target_value(target);
         }
         *panel_open = true;
     }
@@ -394,6 +438,8 @@ impl std::error::Error for ClipboardManagerError {}
 enum WorkerCommand {
     Show {
         from_panel: bool,
+        target: Option<ForegroundApplication>,
+        verify_foreground: bool,
     },
     Refresh {
         reply: Sender<Result<(), String>>,
@@ -404,13 +450,7 @@ enum WorkerCommand {
         generation: u64,
         reply: Sender<Result<(), String>>,
     },
-    Delete {
-        id: u64,
-        reply: Sender<Result<(), String>>,
-    },
-    Clear {
-        reply: Sender<Result<(), String>>,
-    },
+    Remove(RemovalRequest),
     Close {
         session: u64,
         reply: Sender<Result<(), String>>,
@@ -418,6 +458,44 @@ enum WorkerCommand {
     Shutdown {
         reply: Sender<Result<(), String>>,
     },
+}
+
+#[derive(Clone, Copy)]
+enum Removal {
+    Entry(u64),
+    All,
+}
+
+const QUEUED: u8 = 0;
+const STARTED: u8 = 1;
+const CANCELLED: u8 = 2;
+
+struct RemovalRequest {
+    action: Removal,
+    deadline: Instant,
+    status: Arc<AtomicU8>,
+    reply: Sender<Result<(), String>>,
+}
+
+impl RemovalRequest {
+    fn run(
+        &self,
+        state: &mut HistoryState,
+        save: impl FnOnce(&ClipboardHistory) -> Result<RemovalOutcome, String>,
+    ) -> Option<Result<(), String>> {
+        self.status
+            .compare_exchange(QUEUED, STARTED, Ordering::AcqRel, Ordering::Acquire)
+            .ok()?;
+        if Instant::now() >= self.deadline {
+            self.status.store(CANCELLED, Ordering::Release);
+            let _ = self.reply.send(Err(REMOVAL_CANCELLED.into()));
+            return None;
+        }
+        Some(match self.action {
+            Removal::Entry(id) => state.delete(id, save),
+            Removal::All => state.clear(save),
+        })
+    }
 }
 
 pub struct ClipboardManager {
@@ -433,13 +511,17 @@ impl ClipboardManager {
     pub(crate) fn with_full_test_queue() -> (Arc<Self>, impl FnOnce()) {
         let (sender, receiver) = mpsc::sync_channel(1);
         assert!(sender
-            .try_send(WorkerCommand::Show { from_panel: false })
+            .try_send(WorkerCommand::Show {
+                from_panel: false,
+                target: None,
+                verify_foreground: false,
+            })
             .is_ok());
         let manager = Arc::new(Self {
             sender,
             snapshot: Arc::new(Mutex::new(
                 HistoryState::from_load(Ok(LoadOutcome::Loaded(ClipboardHistory::default())))
-                    .snapshot(false),
+                    .snapshot(false, None),
             )),
             select_generation: Arc::new(AtomicU64::new(0)),
             panel_focused: Arc::new(AtomicBool::new(false)),
@@ -470,6 +552,7 @@ impl ClipboardManager {
         let snapshot = Arc::new(Mutex::new(ClipboardSnapshot {
             entries: Vec::new(),
             panel_open: false,
+            can_paste: false,
             panel_session: 0,
             revision: 0,
             last_error: None,
@@ -513,6 +596,7 @@ impl ClipboardManager {
             .unwrap_or(ClipboardSnapshot {
                 entries: Vec::new(),
                 panel_open: false,
+                can_paste: false,
                 panel_session: 0,
                 revision: 0,
                 last_error: Some("剪贴板状态锁不可用".into()),
@@ -530,14 +614,36 @@ impl ClipboardManager {
             .unwrap_or_else(|_| Some("剪贴板状态锁不可用".into()))
     }
 
-    pub fn try_show(&self) -> bool {
+    pub fn try_show(&self, target_pid: Option<i32>) -> bool {
+        self.try_show_with_capture(target_pid, || {
+            macos_adapter::frontmost_application().ok().flatten()
+        })
+    }
+
+    fn try_show_with_capture(
+        &self,
+        target_pid: Option<i32>,
+        capture: impl FnOnce() -> Option<ForegroundApplication>,
+    ) -> bool {
         let Ok(_admission) = self.admission.try_lock() else {
             return false;
         };
-        let from_panel = self.panel_focused.load(Ordering::Acquire);
+        // This snapshot belongs to the hotkey. A queued Show cannot query a
+        // new foreground app after a slow history operation or focus change.
+        let target = capture()
+            .filter(|target| target_pid.is_none_or(|pid| target.process_id() == Some(pid)));
+        let from_panel = self.panel_focused.load(Ordering::Acquire)
+            && target
+                .as_ref()
+                .and_then(ForegroundApplication::process_id)
+                .is_some_and(|pid| u32::try_from(pid) == Ok(std::process::id()));
         if self
             .sender
-            .try_send(WorkerCommand::Show { from_panel })
+            .try_send(WorkerCommand::Show {
+                from_panel,
+                target,
+                verify_foreground: target_pid.is_none(),
+            })
             .is_err()
         {
             return false;
@@ -565,6 +671,11 @@ impl ClipboardManager {
                 .map_err(|_| ClipboardManagerError::WorkerUnavailable)?;
             if !snapshot.panel_open || snapshot.panel_session != session {
                 return Err(ClipboardManagerError::RequestFailed("操作已取消".into()));
+            }
+            if !snapshot.can_paste {
+                return Err(ClipboardManagerError::RequestFailed(
+                    REOPEN_FOR_PASTE.into(),
+                ));
             }
             let generation = self
                 .select_generation
@@ -598,11 +709,25 @@ impl ClipboardManager {
     }
 
     pub fn delete(&self, id: u64) -> Result<(), ClipboardManagerError> {
-        self.request(|reply| WorkerCommand::Delete { id, reply })
+        self.remove(Removal::Entry(id), QUEUE_TIMEOUT)
     }
 
     pub fn clear(&self) -> Result<(), ClipboardManagerError> {
-        self.request(|reply| WorkerCommand::Clear { reply })
+        self.remove(Removal::All, QUEUE_TIMEOUT)
+    }
+
+    fn remove(&self, action: Removal, timeout: Duration) -> Result<(), ClipboardManagerError> {
+        let (reply, response) = mpsc::channel();
+        let status = Arc::new(AtomicU8::new(QUEUED));
+        self.sender
+            .try_send(WorkerCommand::Remove(RemovalRequest {
+                action,
+                deadline: Instant::now() + timeout,
+                status: Arc::clone(&status),
+                reply,
+            }))
+            .map_err(|_| ClipboardManagerError::WorkerUnavailable)?;
+        wait_for_removal(&status, response, timeout)
     }
 
     pub fn close_panel(&self, session: u64) -> Result<(), ClipboardManagerError> {
@@ -659,6 +784,35 @@ impl ClipboardManager {
     }
 }
 
+fn wait_for_removal(
+    status: &AtomicU8,
+    response: Receiver<Result<(), String>>,
+    timeout: Duration,
+) -> Result<(), ClipboardManagerError> {
+    let result = match response.recv_timeout(timeout) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            if status
+                .compare_exchange(QUEUED, CANCELLED, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Err(ClipboardManagerError::RequestFailed(
+                    REMOVAL_CANCELLED.into(),
+                ));
+            }
+            // The worker already owns the request. Return its actual
+            // outcome, including a committed removal pending disk sync.
+            response
+                .recv()
+                .map_err(|_| ClipboardManagerError::WorkerUnavailable)?
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return Err(ClipboardManagerError::WorkerUnavailable);
+        }
+    };
+    result.map_err(ClipboardManagerError::RequestFailed)
+}
+
 fn save_history(path: &PathBuf, history: &ClipboardHistory) -> Result<(), String> {
     ClipboardStore::save_atomic(path, history)
         .map_err(|error| format!("保存剪贴板历史失败：{error}"))
@@ -690,7 +844,14 @@ fn worker_loop(
         )
     });
     let mut panel_open = false;
-    publish_snapshot(&app, &snapshot, &state, panel_open, "clipboard-updated");
+    publish_snapshot(
+        &app,
+        &snapshot,
+        &state,
+        core.as_ref(),
+        panel_open,
+        Some("clipboard-updated"),
+    );
 
     let poll_interval = Duration::from_millis(25);
     let command_wakeup = Duration::from_millis(20);
@@ -734,7 +895,14 @@ fn worker_loop(
         if refresh_memory_history(&mut core, &mut state, Instant::now(), |history| {
             save_history(&history_path, history)
         }) {
-            publish_snapshot(&app, &snapshot, &state, panel_open, "clipboard-updated");
+            publish_snapshot(
+                &app,
+                &snapshot,
+                &state,
+                core.as_ref(),
+                panel_open,
+                Some("clipboard-updated"),
+            );
         }
     }
 }
@@ -794,21 +962,39 @@ fn handle_command(
             .map_err(|error| format!("保存剪贴板历史失败：{error}"))
     };
     match command {
-        WorkerCommand::Show { from_panel } => {
-            state.open_panel(core, panel_open, from_panel, || {
-                frontmost_application_on_main_thread(app)
+        WorkerCommand::Show {
+            from_panel,
+            target,
+            verify_foreground,
+        } => {
+            // A session event may lack a window-server target PID. A later
+            // read can confirm the captured app, but cannot supply a new one.
+            let target = verify_show_target(target, verify_foreground && !from_panel, |target| {
+                frontmost_application_on_main_thread(app).is_ok_and(|current| {
+                    current.is_some_and(|current| target.same_instance(&current))
+                })
             });
+            state.open_panel(core, panel_open, from_panel, target);
             refresh_memory_history(core, state, Instant::now(), |history| {
                 save_history(history_path, history)
             });
-            publish_snapshot(app, snapshot, state, *panel_open, "clipboard-show");
+            publish_snapshot(
+                app,
+                snapshot,
+                state,
+                core.as_ref(),
+                *panel_open,
+                Some("clipboard-show"),
+            );
             show_window(app);
         }
         WorkerCommand::Refresh { reply } => {
-            refresh_memory_history(core, state, Instant::now(), |history| {
+            if refresh_memory_history(core, state, Instant::now(), |history| {
                 save_history(history_path, history)
-            });
-            publish_snapshot(app, snapshot, state, *panel_open, "clipboard-updated");
+            }) {
+                // The invoking window receives the snapshot in the IPC reply.
+                publish_snapshot(app, snapshot, state, core.as_ref(), *panel_open, None);
+            }
             // A readable in-memory snapshot remains useful while disk is failing.
             let _ = reply.send(Ok(()));
         }
@@ -831,25 +1017,32 @@ fn handle_command(
                 } else {
                     show_window(app);
                 }
-                publish_snapshot(app, snapshot, state, *panel_open, "clipboard-updated");
+                publish_snapshot(
+                    app,
+                    snapshot,
+                    state,
+                    core.as_ref(),
+                    *panel_open,
+                    Some("clipboard-updated"),
+                );
             }
             let _ = reply.send(result);
         }
-        WorkerCommand::Delete { id, reply } => {
-            let result = state.delete(id, save_after_removal);
-            if result.is_ok() {
-                sync_core_history(core, state);
+        WorkerCommand::Remove(request) => {
+            if let Some(result) = request.run(state, save_after_removal) {
+                if result.is_ok() {
+                    sync_core_history(core, state);
+                }
+                publish_snapshot(
+                    app,
+                    snapshot,
+                    state,
+                    core.as_ref(),
+                    *panel_open,
+                    Some("clipboard-updated"),
+                );
+                let _ = request.reply.send(result);
             }
-            publish_snapshot(app, snapshot, state, *panel_open, "clipboard-updated");
-            let _ = reply.send(result);
-        }
-        WorkerCommand::Clear { reply } => {
-            let result = state.clear(save_after_removal);
-            if result.is_ok() {
-                sync_core_history(core, state);
-            }
-            publish_snapshot(app, snapshot, state, *panel_open, "clipboard-updated");
-            let _ = reply.send(result);
         }
         WorkerCommand::Close { session, reply } => {
             if state.panel_session != session || !*panel_open {
@@ -861,7 +1054,14 @@ fn handle_command(
                 dismiss_panel(core, panel_open);
             }
             state.errors.operation = result.as_ref().err().cloned();
-            publish_snapshot(app, snapshot, state, *panel_open, "clipboard-updated");
+            publish_snapshot(
+                app,
+                snapshot,
+                state,
+                core.as_ref(),
+                *panel_open,
+                Some("clipboard-updated"),
+            );
             let _ = reply.send(result);
         }
         WorkerCommand::Shutdown { reply } => {
@@ -869,7 +1069,14 @@ fn handle_command(
             let result = state.save_current(Instant::now(), |history| {
                 save_history(history_path, history)
             });
-            publish_snapshot(app, snapshot, state, *panel_open, "clipboard-updated");
+            publish_snapshot(
+                app,
+                snapshot,
+                state,
+                core.as_ref(),
+                *panel_open,
+                Some("clipboard-updated"),
+            );
             let _ = reply.send(result);
             return true;
         }
@@ -877,8 +1084,12 @@ fn handle_command(
     false
 }
 
-fn should_report_show_capture_error(error: &str) -> bool {
-    error != PasteboardError::ApplicationUnavailable.to_string()
+fn verify_show_target(
+    target: Option<ForegroundApplication>,
+    require_confirmation: bool,
+    confirms_target: impl FnOnce(&ForegroundApplication) -> bool,
+) -> Option<ForegroundApplication> {
+    target.filter(|target| !require_confirmation || confirms_target(target))
 }
 
 fn dismiss_panel(core: &mut Option<ClipboardManagerCore>, panel_open: &mut bool) {
@@ -916,6 +1127,12 @@ fn select_and_paste(
     )?;
     wait_for_frontmost(app, &selection.target, select_generation, generation)?;
     thread::sleep(Duration::from_millis(50));
+    check_current()?;
+    if !frontmost_application_on_main_thread(app)?
+        .is_some_and(|current| selection.target.same_instance(&current))
+    {
+        return Err(REOPEN_FOR_PASTE.into());
+    }
     check_current()?;
     let expected_change_count = core
         .write_text(&selection.text)
@@ -1006,17 +1223,22 @@ fn publish_snapshot(
     app: &AppHandle,
     snapshot: &Arc<Mutex<ClipboardSnapshot>>,
     state: &HistoryState,
+    core: Option<&ClipboardManagerCore>,
     panel_open: bool,
-    event: &str,
+    event: Option<&str>,
 ) {
     let Ok(mut current) = snapshot.lock() else {
         return;
     };
-    let mut value = state.snapshot(panel_open);
+    let mut value = state.snapshot(panel_open, core);
     value.revision = current.revision.wrapping_add(1);
-    *current = value.clone();
-    drop(current);
-    let _ = app.emit_to("clipboard", event, value);
+    if let Some(event) = event {
+        *current = value.clone();
+        drop(current);
+        let _ = app.emit_to("clipboard", event, value);
+    } else {
+        *current = value;
+    }
 }
 
 fn show_window(app: &AppHandle) {
@@ -1056,8 +1278,10 @@ fn hide_window_and_wait(app: &AppHandle, hide_app: bool) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        dismiss_panel, refresh_memory_history, sync_core_history, ClipboardManagerCore,
-        HistoryState,
+        dismiss_panel, mpsc, refresh_memory_history, sync_core_history, wait_for_removal,
+        AtomicBool, AtomicU64, AtomicU8, ClipboardManager, ClipboardManagerCore,
+        ClipboardManagerError, ClipboardSnapshot, HistoryState, Removal, RemovalRequest,
+        WorkerCommand, QUEUED,
     };
     use clipboard_core::{ClipboardHistory, IngestOutcome};
     use macos_adapter::{PasteboardBackend, PasteboardError, PasteboardService};
@@ -1077,6 +1301,177 @@ mod tests {
         state: Arc<Mutex<MockState>>,
     }
 
+    fn manager_with_snapshot(
+        snapshot: ClipboardSnapshot,
+    ) -> (ClipboardManager, mpsc::Receiver<WorkerCommand>) {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let manager = ClipboardManager {
+            sender,
+            snapshot: Arc::new(Mutex::new(snapshot)),
+            select_generation: Arc::new(AtomicU64::new(0)),
+            panel_focused: Arc::new(AtomicBool::new(false)),
+            admission: Arc::new(Mutex::new(())),
+        };
+        (manager, receiver)
+    }
+
+    #[test]
+    fn queued_open_uses_the_target_captured_before_the_foreground_changes() {
+        let mut state = history_state_with(&["sample"]);
+        let id = state.history.entries()[0].id;
+        let (manager, receiver) = manager_with_snapshot(state.snapshot(false, None));
+        manager.panel_focused.store(true, super::Ordering::Release);
+        let (mut core, mock) = mock_core(&state.history);
+        let mut source = PasteboardService::with_backend(Box::new(MockBackend {
+            state: Arc::clone(&mock),
+        }));
+        mock.lock().unwrap().frontmost = Some("com.example.first".into());
+        assert!(manager.try_show_with_capture(None, || source.frontmost_application().unwrap()));
+        mock.lock().unwrap().frontmost = Some("com.example.second".into());
+        let WorkerCommand::Show {
+            from_panel,
+            target,
+            verify_foreground,
+        } = receiver.try_recv().unwrap()
+        else {
+            panic!("expected queued show");
+        };
+        assert!(!from_panel);
+        assert!(verify_foreground);
+        let mut open = false;
+        state.open_panel(&mut core, &mut open, from_panel, target.clone());
+        assert!(state.snapshot(open, core.as_ref()).can_paste);
+        assert_eq!(
+            core.unwrap().select(id).unwrap().target.bundle_id,
+            "com.example.first"
+        );
+        let unverified = super::verify_show_target(target, verify_foreground, |captured| {
+            let current = source.frontmost_application().unwrap().unwrap();
+            captured.bundle_id == current.bundle_id
+        });
+        assert!(unverified.is_none());
+    }
+
+    #[test]
+    fn unknown_target_prevents_selection_before_it_reaches_the_worker() {
+        let mut state = history_state_with(&["sample"]);
+        let mut open = false;
+        let (mut core, _) = mock_core(&state.history);
+        state.open_panel(&mut core, &mut open, false, None);
+        let (manager, receiver) = manager_with_snapshot(state.snapshot(open, core.as_ref()));
+        let error = manager
+            .select(state.history.entries()[0].id, state.panel_session)
+            .unwrap_err();
+        assert_eq!(error.to_string(), super::REOPEN_FOR_PASTE);
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn queued_clear_and_delete_are_cancelled_on_timeout_without_writing() {
+        let mut state = history_state_with(&["sample"]);
+        let (manager, receiver) = manager_with_snapshot(state.snapshot(true, None));
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("history.json");
+        super::ClipboardStore::save_atomic(&path, &state.history).unwrap();
+        let previous = state.history.clone();
+        for action in [Removal::Entry(previous.entries()[0].id), Removal::All] {
+            let error = manager.remove(action, Duration::ZERO).unwrap_err();
+            assert!(error.to_string().contains("排队超时，已取消"));
+            assert!(
+                matches!(receiver.try_recv().unwrap(), WorkerCommand::Remove(request)
+                if request.run(&mut state, |_| panic!("cancelled command must not write")).is_none())
+            );
+        }
+        assert_eq!(state.history, previous);
+        assert_eq!(
+            super::ClipboardStore::load_or_recover(&path)
+                .unwrap()
+                .history(),
+            previous
+        );
+    }
+
+    #[test]
+    fn started_removal_returns_the_actual_result_after_the_queue_deadline() {
+        let status = Arc::new(AtomicU8::new(QUEUED));
+        let (reply, response) = mpsc::channel();
+        let request = RemovalRequest {
+            action: Removal::All,
+            deadline: Instant::now() + Duration::from_secs(30),
+            status: Arc::clone(&status),
+            reply,
+        };
+        let (started, claimed) = mpsc::channel();
+        let (finish, proceed) = mpsc::channel();
+        std::thread::scope(|tasks| {
+            tasks.spawn(move || {
+                let mut state = history_state_with(&["sample"]);
+                let result = request
+                    .run(&mut state, |_| {
+                        started.send(()).unwrap();
+                        proceed.recv().unwrap();
+                        Err("disk rejected the removal".into())
+                    })
+                    .unwrap();
+                request.reply.send(result).unwrap();
+                assert_eq!(state.history.entries().len(), 1);
+            });
+            claimed.recv().unwrap();
+            let (completed, observed) = mpsc::channel();
+            tasks.spawn(move || {
+                completed
+                    .send(wait_for_removal(&status, response, Duration::ZERO))
+                    .unwrap();
+            });
+            let while_active = observed.recv_timeout(Duration::from_millis(20));
+            finish.send(()).unwrap();
+            assert!(matches!(while_active, Err(mpsc::RecvTimeoutError::Timeout)));
+            assert!(
+                matches!(observed.recv().unwrap(), Err(ClipboardManagerError::RequestFailed(error)) if error == "disk rejected the removal")
+            );
+        });
+    }
+
+    #[test]
+    fn worker_can_expire_a_queued_removal_before_the_requester_wakes() {
+        let mut state = history_state_with(&["sample"]);
+        let status = Arc::new(AtomicU8::new(QUEUED));
+        let (reply, response) = mpsc::channel();
+        let request = RemovalRequest {
+            action: Removal::All,
+            deadline: Instant::now(),
+            status: Arc::clone(&status),
+            reply,
+        };
+        assert!(request
+            .run(&mut state, |_| panic!("expired command must not write"))
+            .is_none());
+        let error = wait_for_removal(&status, response, Duration::ZERO).unwrap_err();
+        assert_eq!(error.to_string(), super::REMOVAL_CANCELLED);
+        assert_eq!(state.history.entries().len(), 1);
+    }
+
+    #[test]
+    fn snapshot_sends_only_a_bounded_unicode_preview() {
+        let large = format!(
+            "  alpha\n  beta  {}",
+            "😀".repeat(clipboard_core::MAX_CHARS - 20)
+        );
+        let state = history_state_with(&[&large]);
+        let snapshot = state.snapshot(true, None);
+        let preview = &snapshot.entries[0].preview;
+        assert!(preview.starts_with("alpha beta 😀"));
+        assert!(preview.ends_with('…'));
+        assert_eq!(preview.chars().count(), 121);
+        let tauri::ipc::InvokeResponseBody::Json(encoded) =
+            tauri::ipc::IpcResponse::body(snapshot).unwrap()
+        else {
+            panic!("expected JSON");
+        };
+        assert!(encoded.len() < 1024);
+        assert_eq!(state.history.entries()[0].text, large);
+    }
+
     #[test]
     fn external_reopen_refreshes_the_target_and_panel_reopen_reuses_it() {
         let mut state = history_state_with(&["sample"]);
@@ -1089,36 +1484,32 @@ mod tests {
                 state: Arc::clone(&mock),
             }));
             let mut source = source;
-            state.open_panel(&mut core, &mut open, false, || {
-                source.frontmost_application().map_err(|e| e.to_string())
-            });
-            assert_eq!(state.snapshot(open).panel_session, session);
+            let captured = source.frontmost_application().unwrap();
+            state.open_panel(&mut core, &mut open, false, captured);
+            assert_eq!(state.snapshot(open, core.as_ref()).panel_session, session);
             assert_eq!(
                 core.as_ref().unwrap().select(id).unwrap().target.bundle_id,
                 target
             );
         }
-        state.open_panel(&mut core, &mut open, true, || {
-            panic!("panel is not an external target")
-        });
-        assert_eq!(state.snapshot(open).panel_session, 2);
-        state.open_panel(&mut core, &mut open, false, || Ok(None));
+        state.open_panel(&mut core, &mut open, true, None);
+        assert_eq!(state.snapshot(open, core.as_ref()).panel_session, 2);
+        assert!(state.snapshot(open, core.as_ref()).can_paste);
+        state.open_panel(&mut core, &mut open, false, None);
+        assert!(!state.snapshot(open, core.as_ref()).can_paste);
         assert!(core.as_ref().unwrap().select(id).is_err());
     }
 
     #[test]
     fn a_completed_older_selection_cannot_invalidate_the_newer_generation() {
-        use super::{mpsc, AtomicBool, AtomicU64, ClipboardManager, Ordering, WorkerCommand};
-        let (sender, receiver) = mpsc::sync_channel(32);
+        use super::Ordering;
         let mut state = history_state_with(&["sample"]);
         state.panel_session = 1;
-        let manager = ClipboardManager {
-            sender,
-            snapshot: Arc::new(Mutex::new(state.snapshot(true))),
-            select_generation: Arc::new(AtomicU64::new(0)),
-            panel_focused: Arc::new(AtomicBool::new(false)),
-            admission: Arc::new(Mutex::new(())),
-        };
+        let (core, mock) = mock_core(&state.history);
+        mock.lock().unwrap().frontmost = Some("com.example.editor".into());
+        let mut core = core.unwrap();
+        core.capture_target().unwrap();
+        let (manager, receiver) = manager_with_snapshot(state.snapshot(true, Some(&core)));
         std::thread::scope(|tasks| {
             let first = tasks.spawn(|| manager.select(1, 1));
             let WorkerCommand::Select { reply: old, .. } = receiver.recv().unwrap() else {
@@ -1152,7 +1543,7 @@ mod tests {
                 ))
             })
             .unwrap();
-        let snapshot = state.snapshot(true);
+        let snapshot = state.snapshot(true, None);
         assert!(snapshot.entries.is_empty() && snapshot.persistence_pending);
         assert!(snapshot.storage_error.unwrap().contains("磁盘同步尚未完成"));
     }
@@ -1250,16 +1641,6 @@ mod tests {
     }
 
     #[test]
-    fn showing_without_external_frontmost_application_does_not_report_error() {
-        assert!(!super::should_report_show_capture_error(
-            "ApplicationUnavailable"
-        ));
-        assert!(super::should_report_show_capture_error(
-            "读取前台应用失败：主线程操作超时"
-        ));
-    }
-
-    #[test]
     fn dismissing_panel_only_closes_and_drops_target_application() {
         let state = Arc::new(Mutex::new(MockState {
             frontmost: Some("com.example.editor".into()),
@@ -1291,7 +1672,11 @@ mod tests {
         let mut state = HistoryState::load(&path);
         assert!(state.history.entries().is_empty());
         let notice = state.errors.manual_recovery.clone().unwrap();
-        assert!(state.snapshot(false).last_error.unwrap().contains(&notice));
+        assert!(state
+            .snapshot(false, None)
+            .last_error
+            .unwrap()
+            .contains(&notice));
 
         let mut current = ClipboardHistory::default();
         current.ingest("later history".into(), 2);
@@ -1301,13 +1686,13 @@ mod tests {
             .save_current(now, |history| super::save_history(&path, history))
             .unwrap();
         assert_eq!(
-            state.snapshot(false).last_error.as_deref(),
+            state.snapshot(false, None).last_error.as_deref(),
             Some(notice.as_str())
         );
         let reloaded = HistoryState::load(&path);
         assert_eq!(reloaded.history, current);
         assert_eq!(
-            reloaded.snapshot(false).last_error.as_deref(),
+            reloaded.snapshot(false, None).last_error.as_deref(),
             Some(notice.as_str())
         );
     }
@@ -1353,8 +1738,8 @@ mod tests {
             attempts.set(attempts.get() + 1);
             Err("disk unavailable".into())
         });
-        assert_eq!(state.snapshot(true).entries.len(), 2);
-        assert!(state.snapshot(true).persistence_pending);
+        assert_eq!(state.snapshot(true, None).entries.len(), 2);
+        assert!(state.snapshot(true, None).persistence_pending);
         assert_eq!(state.errors.storage.as_deref(), Some("disk unavailable"));
         // Both Show and Refresh use this same in-memory refresh operation.
         for elapsed in [100, 500, 999] {
@@ -1505,7 +1890,7 @@ mod tests {
         // the operation slot; storage errors remain visible in snapshots.
         state.errors.operation = None;
         assert!(state
-            .snapshot(false)
+            .snapshot(false, None)
             .last_error
             .unwrap()
             .contains("save error"));
@@ -1540,7 +1925,7 @@ mod tests {
         assert!(!called.get());
         assert!(state.dirty);
         assert!(state
-            .snapshot(true)
+            .snapshot(true, None)
             .last_error
             .unwrap()
             .contains("unsupported schema"));

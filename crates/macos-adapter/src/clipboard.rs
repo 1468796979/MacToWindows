@@ -32,6 +32,14 @@ pub struct ForegroundApplication {
 }
 
 impl ForegroundApplication {
+    pub fn process_id(&self) -> Option<i32> {
+        #[cfg(target_os = "macos")]
+        if self.pid > 0 {
+            return Some(self.pid);
+        }
+        None
+    }
+
     pub fn same_instance(&self, other: &Self) -> bool {
         #[cfg(target_os = "macos")]
         {
@@ -68,9 +76,8 @@ impl ForegroundApplication {
     }
 }
 
-/// Reads the frontmost application using the platform's application APIs.
-/// Callers that need AppKit thread affinity should invoke this on the main
-/// thread.
+/// Reads the current application from the shared NSWorkspace. Unlike
+/// activation, this property can be read from the Event Tap thread.
 pub fn frontmost_application() -> Result<Option<ForegroundApplication>, PasteboardError> {
     platform::frontmost_application()
 }
@@ -239,14 +246,21 @@ mod platform {
     }
 
     pub fn frontmost_application() -> Result<Option<ForegroundApplication>, PasteboardError> {
-        let application = NSWorkspace::sharedWorkspace().frontmostApplication();
-        Ok(application.and_then(|instance| {
-            let bundle_id = instance.bundleIdentifier()?;
-            Some(ForegroundApplication {
-                bundle_id: bundle_id.to_string(),
-                pid: instance.processIdentifier(),
-                instance: Some(instance),
-            })
+        Ok(objc2::rc::autoreleasepool(|_| {
+            NSWorkspace::sharedWorkspace()
+                .frontmostApplication()
+                .and_then(|instance| {
+                    let pid = instance.processIdentifier();
+                    if pid <= 0 || instance.isTerminated() {
+                        return None;
+                    }
+                    let bundle_id = instance.bundleIdentifier()?;
+                    Some(ForegroundApplication {
+                        bundle_id: bundle_id.to_string(),
+                        pid,
+                        instance: Some(instance),
+                    })
+                })
         }))
     }
 

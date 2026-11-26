@@ -715,7 +715,7 @@ pub(crate) fn same_process_stream(a: KeyboardSourceId, b: KeyboardSourceId) -> b
 
 #[derive(Debug, Default, Clone)]
 pub(crate) struct ApplicationSwitch {
-    alt: Option<PhysicalCode>,
+    alt: Option<(PhysicalCode, M)>,
     tab_down: bool,
     // A Tab Down already consumed before the settings changed must finish Up.
     consumed_tabs: HashSet<PhysicalCode>,
@@ -729,6 +729,14 @@ pub(crate) struct SwitchResult {
 impl ApplicationSwitch {
     pub fn active(&self) -> bool {
         self.alt.is_some()
+    }
+
+    pub fn consumes(&self, code: PhysicalCode) -> bool {
+        self.consumed_tabs.contains(&code)
+    }
+
+    pub fn forget_consumed_tabs(&mut self) {
+        self.consumed_tabs.clear();
     }
 
     pub fn release(&mut self, modifiers: M) -> Vec<OutputEvent> {
@@ -747,13 +755,18 @@ impl ApplicationSwitch {
         &mut self,
         event: &NormalizedEvent,
         engine: &RuleEngine,
-        allow_start: bool,
+        start_policy: Option<KeyboardMappingPolicy>,
     ) -> Option<SwitchResult> {
         if !matches!(event.kind, EventKind::Keyboard | EventKind::FlagsChanged) {
             return None;
         }
-        if let Some(alt) = self.alt {
-            if event.code == alt && event.phase == EventPhase::Up {
+        if let Some((alt, flag)) = self.alt {
+            if event.code == alt
+                && (event.phase == EventPhase::Up
+                    || (event.kind == EventKind::FlagsChanged
+                        && event.phase == EventPhase::Changed
+                        && !event.modifiers.contains(flag)))
+            {
                 return Some(SwitchResult {
                     decision: Decision::Emit(self.release(event.modifiers)),
                     original_modifiers: Some(without_alt(event.modifiers)),
@@ -805,14 +818,14 @@ impl ApplicationSwitch {
                 original_modifiers: None,
             });
         }
-        if !allow_start
-            || self.alt.is_some()
+        let policy = start_policy?;
+        if self.alt.is_some()
             || event.code != PhysicalCode::key(48)
             || event.phase != EventPhase::Down
         {
             return None;
         }
-        let actual = engine.shortcut_action(event);
+        let actual = engine.action_for_event(event, policy);
         let is_switch = |action: &Action| {
             matches!(action,
             Action::Replace(outputs) if outputs.as_slice() == [OutputEvent::SystemShortcut(SystemShortcut::SwitchApplication)])
@@ -822,7 +835,9 @@ impl ApplicationSwitch {
         }
         if actual.is_none() {
             let allowed = M::LEFT_OPTION | M::RIGHT_OPTION | M::LEFT_SHIFT | M::RIGHT_SHIFT;
-            if event.modifiers.bits() & !allowed.bits() != 0 {
+            if policy != KeyboardMappingPolicy::ShortcutsOnly
+                || event.modifiers.bits() & !allowed.bits() != 0
+            {
                 return None;
             }
         }
@@ -833,8 +848,7 @@ impl ApplicationSwitch {
             (PhysicalCode::right_option(), M::RIGHT_OPTION),
         ]
         .into_iter()
-        .find(|(_, bit)| event.modifiers.contains(*bit))?
-        .0;
+        .find(|(_, bit)| event.modifiers.contains(*bit))?;
         let mut canonical = event.clone();
         canonical.modifiers = M::LEFT_COMMAND | shifts(event.modifiers);
         if actual.is_none()
@@ -888,6 +902,7 @@ pub(crate) struct SoftwareResult {
 
 impl RuntimeController {
     pub(crate) fn reset_keyboard_continuity(&mut self) {
+        self.local_switcher.forget_consumed_tabs();
         let _ = self
             .output_ownership
             .release_owner(OutputOwner::Native(InputStream::Local));
@@ -929,6 +944,7 @@ impl RuntimeController {
             }
         }
         self.close_software_switchers(None, inject);
+        self.close_local_switcher(inject);
     }
 
     pub(crate) fn close_software_switchers<F>(
@@ -955,6 +971,7 @@ impl RuntimeController {
                 OutputOwner::ApplicationSwitch(stream),
                 &outputs,
                 M::NONE,
+                None,
                 &mut *inject,
             ) {
                 self.software.get_mut(&id).unwrap().switcher = checkpoint;
@@ -1166,7 +1183,7 @@ impl RuntimeController {
                 &event,
                 false,
                 bypass,
-                raw.is_unmanaged_flags_change(),
+                Some(raw),
                 inject,
             ),
             None => SoftwareResult {
@@ -1193,7 +1210,7 @@ impl RuntimeController {
             event,
             force_full,
             KeyboardBypass::default(),
-            false,
+            None,
             inject,
         )
     }
@@ -1204,7 +1221,7 @@ impl RuntimeController {
         event: &NormalizedEvent,
         force_full: bool,
         bypass: KeyboardBypass,
-        unmanaged_flags_change: bool,
+        raw: Option<macos_adapter::EventTapEvent>,
         mut inject: F,
     ) -> SoftwareResult
     where
@@ -1239,8 +1256,11 @@ impl RuntimeController {
             }
         };
         let external_activity = self.consume_external_keyboard_activity();
-        if !self
-            .close_software_switchers(if external_activity { None } else { Some(id) }, &mut inject)
+        if !self.close_local_switcher(&mut inject)
+            || !self.close_software_switchers(
+                if external_activity { None } else { Some(id) },
+                &mut inject,
+            )
         {
             self.diagnostics.record_passed();
             return self.software_fallback(id, event);
@@ -1304,6 +1324,7 @@ impl RuntimeController {
                     OutputOwner::ApplicationSwitch(stream),
                     &releases,
                     event.modifiers,
+                    None,
                     &mut inject,
                 ) {
                     self.software.insert(id, session);
@@ -1317,10 +1338,9 @@ impl RuntimeController {
         } else if let Some(action) = session.clipboard.handle(event) {
             session.engine.interrupt_gestures();
             if action == ClipboardHotkeyAction::Show
-                && !self
-                    .clipboard
-                    .as_ref()
-                    .is_some_and(|manager| manager.try_show())
+                && !self.clipboard.as_ref().is_some_and(|manager| {
+                    manager.try_show(raw.and_then(macos_adapter::EventTapEvent::target_process_id))
+                })
             {
                 session.clipboard.active = false;
                 let rewrite_flags =
@@ -1335,7 +1355,9 @@ impl RuntimeController {
         } else if let Some(result) = session.switcher.handle(
             event,
             &session.engine,
-            self.status == RuntimeStatus::Running && policy == KeyboardMappingPolicy::ShortcutsOnly,
+            (self.status == RuntimeStatus::Running
+                && policy == KeyboardMappingPolicy::ShortcutsOnly)
+                .then_some(policy),
         ) {
             session.engine.interrupt_gestures();
             if result.original_modifiers.is_some() {
@@ -1357,6 +1379,7 @@ impl RuntimeController {
                     OutputOwner::ApplicationSwitch(stream),
                     &releases,
                     event.modifiers,
+                    None,
                     &mut inject,
                 ) {
                     self.software.insert(id, session);
@@ -1368,7 +1391,7 @@ impl RuntimeController {
             let (decision, binding_kind) = session.engine.handle_with_binding_kind(event, policy);
             owner = OutputOwner::for_binding(stream, event.code, binding_kind);
             if decision == Decision::Pass
-                && unmanaged_flags_change
+                && raw.is_some_and(macos_adapter::EventTapEvent::is_unmanaged_flags_change)
                 && policy == KeyboardMappingPolicy::Full
             {
                 original_modifiers = Some(session.engine.modifiers_for_event(event));
@@ -1397,6 +1420,7 @@ impl RuntimeController {
                 owner,
                 &effects,
                 session.engine.modifiers_for_event(event),
+                raw.and_then(macos_adapter::EventTapEvent::target_process_id),
                 &mut inject,
             ) {
                 Ok(rejected) => {

@@ -26,7 +26,7 @@ mod software_keyboard_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod software_native_tests;
 use output_ownership::{InputStream, OutputOwner, OutputOwnership};
-use software_keyboard::{SoftwareResult, SoftwareSession};
+use software_keyboard::{ApplicationSwitch, SoftwareResult, SoftwareSession};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub enum RuntimeStatus {
@@ -234,6 +234,7 @@ pub struct RuntimeController {
     engine: RuleEngine,
     active_rules: CompiledRules,
     software: HashMap<macos_adapter::KeyboardSourceId, SoftwareSession>,
+    local_switcher: ApplicationSwitch,
     output_ownership: OutputOwnership,
     output_transaction: u64,
     adapter: SafeAdapter,
@@ -249,6 +250,7 @@ pub struct RuntimeController {
     disable_generation: u64,
     config_revision: u64,
     pending_releases: Vec<OutputEvent>,
+    force_switch_tab_release: bool,
     last_error: Option<String>,
 }
 
@@ -504,7 +506,11 @@ impl EventRuntime {
                                     &event,
                                     &mut local_keys,
                                     bypass,
-                                    || clipboard.as_ref().is_some_and(|manager| manager.try_show()),
+                                    || {
+                                        clipboard.as_ref().is_some_and(|manager| {
+                                            manager.try_show(raw.target_process_id())
+                                        })
+                                    },
                                     |outputs, marker| unsafe {
                                         macos_adapter::inject_outputs_with_context(
                                             outputs,
@@ -801,6 +807,7 @@ impl RuntimeController {
             engine: RuleEngine::with_external_output_ownership(rules.clone()),
             active_rules: rules,
             software: HashMap::new(),
+            local_switcher: ApplicationSwitch::default(),
             output_ownership: OutputOwnership::default(),
             output_transaction: 0,
             adapter,
@@ -816,6 +823,7 @@ impl RuntimeController {
             disable_generation: 0,
             config_revision: 0,
             pending_releases: Vec::new(),
+            force_switch_tab_release: false,
             last_error: None,
         }
     }
@@ -878,6 +886,22 @@ impl RuntimeController {
         let mut releases = std::mem::take(&mut self.pending_releases);
         self.engine.clear_bindings();
         let mut all = self.output_ownership.release_mapped(InputStream::Local);
+        let switch_releases = self.output_ownership.filter(
+            OutputOwner::ApplicationSwitch(InputStream::Local),
+            &self.local_switcher.release(event_model::ModifierSet::NONE),
+        );
+        // The physical Tab Down was consumed. Its synthetic Up is required
+        // even while the physical key is held and its eventual Up is ignored.
+        self.force_switch_tab_release |= switch_releases.iter().any(|output| {
+            matches!(
+                output,
+                OutputEvent::Key {
+                    code: event_model::PhysicalCode::Key(48),
+                    ..
+                }
+            )
+        });
+        all.extend(switch_releases);
         for (id, session) in &mut self.software {
             let stream = InputStream::Software(*id);
             session.engine.clear_bindings();
@@ -918,17 +942,22 @@ impl RuntimeController {
         let batch = prepare_cleanup_outputs(
             outputs,
             macos_adapter::physical_modifier_snapshot(),
-            macos_adapter::physical_code_is_down,
+            |code| {
+                !(self.force_switch_tab_release && code == event_model::PhysicalCode::key(48))
+                    && macos_adapter::physical_code_is_down(code)
+            },
         );
         #[cfg(test)]
         let batch = prepare_cleanup_outputs(outputs, event_model::ModifierSet::NONE, |_| false);
         if batch.is_empty() {
             self.pending_releases.clear();
+            self.force_switch_tab_release = false;
             return Ok(());
         }
         match inject(&batch, self.own_marker()) {
             Ok(()) => {
                 self.pending_releases.clear();
+                self.force_switch_tab_release = false;
                 Ok(())
             }
             Err(error) => {
@@ -1053,13 +1082,14 @@ impl RuntimeController {
     where
         F: FnMut(&[OutputEvent], u64) -> Result<(), InjectionError>,
     {
-        self.process_event_with_scroll_default(event, false, inject)
+        self.process_event_with_scroll_default(event, false, None, inject)
     }
 
     fn process_event_with_scroll_default<F>(
         &mut self,
         event: &NormalizedEvent,
         invert_unmapped_scroll: bool,
+        target_pid: Option<i32>,
         mut inject: F,
     ) -> Decision
     where
@@ -1078,6 +1108,7 @@ impl RuntimeController {
                 event_model::EventKind::Keyboard | event_model::EventKind::FlagsChanged
             )
         {
+            self.close_local_switcher(&mut inject);
             self.engine.interrupt_gestures();
             self.diagnostics.record_external_keyboard_passed();
             self.diagnostics.record_passed();
@@ -1096,6 +1127,9 @@ impl RuntimeController {
             let _ = self.flush_with(&outputs, &mut inject);
             self.diagnostics.record_passed();
             return Decision::Pass;
+        }
+        if let Some(decision) = self.process_local_switcher(event, &mut inject) {
+            return decision;
         }
         if self.status != RuntimeStatus::Running {
             return self.pass_local_event(event);
@@ -1144,6 +1178,7 @@ impl RuntimeController {
                     owner,
                     &outputs,
                     self.engine.modifiers_for_event(event),
+                    target_pid,
                     &mut inject,
                 ) {
                     Ok(true) if clipboard_only(&outputs) => {
@@ -1180,6 +1215,77 @@ impl RuntimeController {
         }
     }
 
+    fn process_local_switcher<F>(
+        &mut self,
+        event: &NormalizedEvent,
+        inject: &mut F,
+    ) -> Option<Decision>
+    where
+        F: FnMut(&[OutputEvent], u64) -> Result<(), InjectionError>,
+    {
+        if !self.local_switcher.active() && event.code != event_model::PhysicalCode::key(48) {
+            return None;
+        }
+        let stream = InputStream::Local;
+        let may_start = self.status == RuntimeStatus::Running
+            && !self.engine.state().physical_down(event.code)
+            && !self.output_ownership.has_native(stream, event.code);
+        let checkpoint = self.local_switcher.clone();
+        let switched = self.local_switcher.handle(
+            event,
+            &self.engine,
+            may_start.then_some(KeyboardMappingPolicy::Full),
+        )?;
+        self.engine.interrupt_gestures();
+        if let Decision::Emit(outputs) = &switched.decision {
+            if let Err(error) = self.dispatch_outputs_for(
+                stream,
+                OutputOwner::ApplicationSwitch(stream),
+                outputs,
+                self.engine.modifiers_for_event(event),
+                None,
+                &mut *inject,
+            ) {
+                self.local_switcher = checkpoint;
+                self.degrade_with(format!("切换应用失败：{error}"), inject);
+                return Some(self.pass_local_event(event));
+            }
+            self.diagnostics.record_injected();
+        }
+        if switched.original_modifiers.is_none() {
+            self.diagnostics.record_suppressed();
+            return Some(Decision::Suppress);
+        }
+        // Alt and Shift still have their original local engine bindings.
+        // Advance those bindings after dispatching switcher-only outputs.
+        None
+    }
+
+    fn close_local_switcher<F>(&mut self, inject: &mut F) -> bool
+    where
+        F: FnMut(&[OutputEvent], u64) -> Result<(), InjectionError>,
+    {
+        if !self.local_switcher.active() {
+            return true;
+        }
+        let stream = InputStream::Local;
+        let checkpoint = self.local_switcher.clone();
+        let outputs = self.local_switcher.release(event_model::ModifierSet::NONE);
+        if let Err(error) = self.dispatch_outputs_for(
+            stream,
+            OutputOwner::ApplicationSwitch(stream),
+            &outputs,
+            event_model::ModifierSet::NONE,
+            None,
+            &mut *inject,
+        ) {
+            self.local_switcher = checkpoint;
+            self.degrade_with(format!("切换应用释放失败：{error}"), inject);
+            return false;
+        }
+        true
+    }
+
     #[cfg(target_os = "macos")]
     fn process_local_raw(
         &mut self,
@@ -1193,6 +1299,7 @@ impl RuntimeController {
         let bypass = bypass.applies(event);
         if (bypass || !keys.native_keys.0.is_empty()) && !is_emergency_hotkey(event) {
             let already_bound = self.engine.state().physical_down(event.code)
+                || self.local_switcher.consumes(event.code)
                 || self
                     .output_ownership
                     .has_native(InputStream::Local, event.code)
@@ -1223,7 +1330,12 @@ impl RuntimeController {
                         unsafe { raw.scroll_inverted_from_device() }
                             .is_some_and(|actual| actual != desired)
                     });
-            self.process_event_with_scroll_default(event, invert_unmapped_scroll, &mut inject)
+            self.process_event_with_scroll_default(
+                event,
+                invert_unmapped_scroll,
+                raw.target_process_id(),
+                &mut inject,
+            )
         };
         if decision == Decision::Pass {
             if let Some(metadata) = raw.keyboard_metadata() {
@@ -1259,6 +1371,7 @@ impl RuntimeController {
         self.consume_external_keyboard_activity();
         self.interrupt_keyboard_gestures();
         let _ = self.close_software_switchers(None, inject);
+        self.close_local_switcher(inject);
         self.pass_local_event(event)
     }
 
@@ -1304,6 +1417,7 @@ impl RuntimeController {
         owner: OutputOwner,
         outputs: &[OutputEvent],
         restore_flags: event_model::ModifierSet,
+        target_pid: Option<i32>,
         mut inject: F,
     ) -> Result<bool, InjectionError>
     where
@@ -1326,7 +1440,7 @@ impl RuntimeController {
                     clipboard_rejected |= !self
                         .clipboard
                         .as_ref()
-                        .is_some_and(|manager| manager.try_show());
+                        .is_some_and(|manager| manager.try_show(target_pid));
                 }
                 OutputEvent::SystemShortcut(SystemShortcut::ShowDesktop) => {
                     restore_modifiers = true;
@@ -2159,6 +2273,7 @@ pub mod commands {
                 imported.upgrade_default_save_shortcuts();
                 imported.upgrade_default_edit_shortcuts();
                 imported.upgrade_default_redo_shortcuts();
+                imported.upgrade_default_edit_control_sides();
                 *candidate = imported;
                 Ok(())
             })
@@ -2215,6 +2330,190 @@ mod tests {
             app_context: None,
             origin: EventOrigin::Hardware,
         }
+    }
+
+    #[test]
+    fn overlapping_undo_and_redo_deliver_distinct_downs_and_one_release() {
+        let mut runtime = RuntimeController::from_config(AppConfig::default()).unwrap();
+        runtime.status = RuntimeStatus::Running;
+        let mut outputs = Vec::new();
+        for (code, phase) in [
+            (6, EventPhase::Down),
+            (16, EventPhase::Down),
+            (6, EventPhase::Up),
+            (16, EventPhase::Repeat),
+            (16, EventPhase::Up),
+        ] {
+            assert_eq!(
+                runtime.process_event(
+                    &keyboard_event(code, phase, ModifierSet::LEFT_CONTROL, EventKind::Keyboard),
+                    |batch| {
+                        outputs.extend_from_slice(batch);
+                        Ok(())
+                    }
+                ),
+                Decision::Suppress
+            );
+        }
+        let shift = ModifierSet::LEFT_COMMAND | ModifierSet::LEFT_SHIFT;
+        assert_eq!(
+            outputs,
+            [
+                (EventPhase::Down, ModifierSet::LEFT_COMMAND),
+                (EventPhase::Down, shift),
+                (EventPhase::Repeat, shift),
+                (EventPhase::Up, shift),
+            ]
+            .map(|(phase, modifiers)| OutputEvent::Key {
+                code: PhysicalCode::key(6),
+                phase,
+                modifiers
+            })
+        );
+    }
+
+    #[test]
+    fn local_application_switch_keeps_command_and_preserves_reverse_tab() {
+        let mut runtime = RuntimeController::from_config(AppConfig::default()).unwrap();
+        runtime.status = RuntimeStatus::Running;
+        let mut outputs = Vec::new();
+        let alt = ModifierSet::LEFT_COMMAND;
+        let shift = ModifierSet::LEFT_SHIFT;
+        let mut input = |code, phase, mods, kind| {
+            outputs.clear();
+            let decision =
+                runtime.process_event(&keyboard_event(code, phase, mods, kind), |batch| {
+                    outputs.extend_from_slice(batch);
+                    Ok(())
+                });
+            (decision, outputs.clone())
+        };
+        input(55, EventPhase::Changed, alt, EventKind::FlagsChanged);
+        let (_, first) = input(48, EventPhase::Down, alt, EventKind::Keyboard);
+        assert!(first.iter().any(|event| matches!(
+            event,
+            OutputEvent::Key {
+                code: PhysicalCode::Key(55),
+                phase: EventPhase::Down,
+                ..
+            }
+        )));
+        assert_eq!(
+            first.last(),
+            Some(&OutputEvent::Key {
+                code: PhysicalCode::key(48),
+                phase: EventPhase::Down,
+                modifiers: alt,
+            })
+        );
+        assert_eq!(
+            input(48, EventPhase::Up, alt, EventKind::Keyboard).1,
+            vec![OutputEvent::Key {
+                code: PhysicalCode::key(48),
+                phase: EventPhase::Up,
+                modifiers: alt,
+            }]
+        );
+        input(
+            56,
+            EventPhase::Changed,
+            alt | shift,
+            EventKind::FlagsChanged,
+        );
+        assert_eq!(
+            input(48, EventPhase::Down, alt | shift, EventKind::Keyboard).1,
+            vec![OutputEvent::Key {
+                code: PhysicalCode::key(48),
+                phase: EventPhase::Down,
+                modifiers: alt | shift,
+            }]
+        );
+        let (_, release) = input(55, EventPhase::Changed, shift, EventKind::FlagsChanged);
+        assert!(matches!(
+            release.as_slice(),
+            [
+                OutputEvent::Key {
+                    code: PhysicalCode::Key(48),
+                    phase: EventPhase::Up,
+                    ..
+                },
+                OutputEvent::Key {
+                    code: PhysicalCode::Key(55),
+                    phase: EventPhase::Up,
+                    ..
+                },
+                OutputEvent::Key {
+                    code: PhysicalCode::Key(58),
+                    phase: EventPhase::Up,
+                    ..
+                },
+            ]
+        ));
+        assert_eq!(
+            input(48, EventPhase::Up, shift, EventKind::Keyboard),
+            (Decision::Suppress, Vec::new())
+        );
+        assert!(!runtime.local_switcher.active());
+    }
+
+    #[test]
+    fn disabling_while_switching_releases_the_synthetic_tab_and_consumes_the_physical_tail() {
+        let mut runtime = RuntimeController::from_config(AppConfig::default()).unwrap();
+        runtime.status = RuntimeStatus::Running;
+        let alt = ModifierSet::LEFT_COMMAND;
+        runtime.process_event(
+            &keyboard_event(48, EventPhase::Down, alt, EventKind::Keyboard),
+            |_| Ok(()),
+        );
+        let releases = runtime.apply(RuntimeCommand::Disable).unwrap();
+        assert!(runtime.force_switch_tab_release);
+        assert!(matches!(
+            releases.as_slice(),
+            [
+                OutputEvent::Key {
+                    code: PhysicalCode::Key(48),
+                    phase: EventPhase::Up,
+                    ..
+                },
+                OutputEvent::Key {
+                    code: PhysicalCode::Key(55),
+                    phase: EventPhase::Up,
+                    ..
+                },
+            ]
+        ));
+        let up = keyboard_event(48, EventPhase::Up, alt, EventKind::Keyboard);
+        assert_eq!(
+            runtime.process_event(&up, |_| panic!("Tab Up already delivered")),
+            Decision::Suppress
+        );
+        assert!(!runtime.local_switcher.active());
+    }
+
+    #[test]
+    fn an_explicit_local_tab_override_prevents_the_switcher_from_starting() {
+        let mut config = AppConfig::default();
+        config
+            .profiles
+            .get_mut("windows_physical")
+            .unwrap()
+            .keyboard_rules
+            .push(mac_to_windows_config::Rule {
+                trigger: "key:48".into(),
+                action: "suppress".into(),
+                priority: 400,
+                ..Default::default()
+            });
+        let mut runtime = RuntimeController::from_config(config).unwrap();
+        runtime.status = RuntimeStatus::Running;
+        for phase in [EventPhase::Down, EventPhase::Up] {
+            let event = keyboard_event(48, phase, ModifierSet::LEFT_COMMAND, EventKind::Keyboard);
+            assert_eq!(
+                runtime.process_event(&event, |_| panic!("Tab is suppressed by the override")),
+                Decision::Suppress
+            );
+        }
+        assert!(!runtime.local_switcher.active());
     }
 
     fn controller_with_rule() -> RuntimeController {

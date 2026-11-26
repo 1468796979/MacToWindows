@@ -339,6 +339,17 @@ impl EventTapEvent {
         self.event_type == TAP_DISABLED_BY_TIMEOUT || self.event_type == TAP_DISABLED_BY_USER_INPUT
     }
 
+    /// Returns the target PID when the window server has annotated the event.
+    pub fn target_process_id(self) -> Option<i32> {
+        #[cfg(target_os = "macos")]
+        if !self.raw_event.is_null() && !self.is_tap_disabled() {
+            // kCGEventTargetUnixProcessID, distinct from the input source PID.
+            let pid = unsafe { platform::CGEventGetIntegerValueField(self.raw_event, 40) };
+            return i32::try_from(pid).ok().filter(|pid| *pid > 0);
+        }
+        None
+    }
+
     /// A native flagsChanged event whose key is outside the eight managed modifiers.
     pub fn is_unmanaged_flags_change(self) -> bool {
         #[cfg(target_os = "macos")]

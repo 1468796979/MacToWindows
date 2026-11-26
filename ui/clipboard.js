@@ -1,5 +1,8 @@
 const core = window.clipboardCore;
-const state = { entries: [], selectedId: null, error: "", selecting: null, panelOpen: false, panelSession: 0, revision: 0 };
+const state = {
+  entries: [], selectedId: null, error: "", selecting: null, removing: false,
+  panelOpen: false, canPaste: false, panelSession: 0, revision: 0,
+};
 let refreshInFlight = null;
 const $ = (id) => document.getElementById(id);
 const backendInvoke = (command, args) => {
@@ -43,6 +46,7 @@ function applySnapshot(snapshot) {
   state.entries = normalized.entries;
   state.error = normalized.lastError || "";
   state.panelOpen = normalized.panelOpen;
+  state.canPaste = normalized.canPaste;
   if (!state.panelOpen) state.selectedId = null;
   if (!state.entries.some((entry) => entry.id === state.selectedId)) state.selectedId = null;
   render();
@@ -59,11 +63,17 @@ async function refreshSnapshot() {
 
 function render() {
   const list = $("clipboard-list");
+  const focusedId = document.activeElement?.dataset?.clipboardEntryId;
+  let restoreFocus;
   list.replaceChildren();
   $("clipboard-close").disabled = false;
-  $("clipboard-clear").disabled = Boolean(state.selecting);
+  const busy = Boolean(state.selecting) || state.removing;
+  $("clipboard-clear").setAttribute("aria-disabled", String(busy));
   $("clipboard-empty").hidden = state.entries.length > 0;
   $("clipboard-error").textContent = state.error;
+  $("clipboard-hint").textContent = state.removing ? "正在更新剪贴板历史…"
+    : state.canPaste ? "选择后恢复原应用并自动粘贴"
+      : "请从目标应用重新打开剪贴板历史";
   state.entries.forEach((entry) => {
     const item = document.createElement("article");
     const selected = entry.id === state.selectedId;
@@ -71,15 +81,16 @@ function render() {
     item.setAttribute("role", "option");
     item.setAttribute("aria-selected", String(selected));
     item.addEventListener("click", () => {
-      if (state.selecting) return;
+      if (busy) return;
       state.selectedId = entry.id;
-      selectEntry(entry.id);
+      if (state.canPaste) selectEntry(entry.id);
+      else render();
     });
 
     const content = document.createElement("div");
     const text = document.createElement("div");
     text.className = "clipboard-text";
-    text.textContent = core.previewText(entry.text);
+    text.textContent = entry.preview;
     const time = document.createElement("div");
     time.className = "clipboard-time";
     time.textContent = formatTime(entry.copied_at_unix_ms);
@@ -89,22 +100,38 @@ function render() {
     remove.className = "clipboard-delete";
     remove.type = "button";
     remove.textContent = "删除";
-    remove.disabled = Boolean(state.selecting);
-    remove.addEventListener("click", async (event) => {
+    remove.dataset.clipboardEntryId = String(entry.id);
+    remove.setAttribute("aria-disabled", String(busy));
+    if (remove.dataset.clipboardEntryId === focusedId) restoreFocus = remove;
+    remove.addEventListener("click", (event) => {
       event.stopPropagation();
-      try {
-        await backendInvoke("delete_clipboard_item", { id: entry.id });
-        await refreshSnapshot();
-      }
-      catch (error) { state.error = error?.message || String(error); render(); }
+      return removeHistory("delete_clipboard_item", { id: entry.id });
     });
     item.append(content, remove);
     list.append(item);
   });
+  if (focusedId !== undefined) {
+    (restoreFocus || $("clipboard-close")).focus({ preventScroll: true });
+  }
+}
+
+async function removeHistory(command, args) {
+  if (state.selecting || state.removing) return;
+  state.removing = true;
+  const session = state.panelSession;
+  render();
+  try {
+    await backendInvoke(command, args);
+  } catch (error) {
+    if (session === state.panelSession) state.error = error?.message || String(error);
+  } finally {
+    state.removing = false;
+    render();
+  }
 }
 
 async function selectEntry(id) {
-  if (state.selecting || !state.panelOpen) return;
+  if (state.selecting || state.removing || !state.panelOpen || !state.canPaste) return;
   const request = { session: state.panelSession };
   state.selecting = request;
   render();
@@ -141,14 +168,7 @@ async function closePanel() {
 }
 
 $("clipboard-close").addEventListener("click", closePanel);
-$("clipboard-clear").addEventListener("click", async () => {
-  if (state.selecting) return;
-  try {
-    await backendInvoke("clear_clipboard_history");
-    await refreshSnapshot();
-  }
-  catch (error) { state.error = error?.message || String(error); render(); }
-});
+$("clipboard-clear").addEventListener("click", () => removeHistory("clear_clipboard_history"));
 document.addEventListener("keydown", (event) => {
   if (event.defaultPrevented || event.isComposing) return;
   if (event.key === "Escape") { event.preventDefault(); closePanel(); return; }
@@ -174,7 +194,6 @@ if (listen) {
     applySnapshot(event.payload);
     $("clipboard-list").scrollTop = 0;
     window.focus();
-    refreshSnapshot().catch(() => {});
   }))
     .catch((error) => { state.error = error?.message || String(error); render(); });
   Promise.resolve(listen("clipboard-updated", (event) => {
@@ -182,7 +201,7 @@ if (listen) {
   }))
     .catch((error) => { state.error = error?.message || String(error); render(); });
 }
-backendInvoke("clipboard_history").then(applySnapshot).catch((error) => { state.error = error?.message || String(error); render(); });
+refreshSnapshot().catch((error) => { state.error = error?.message || String(error); render(); });
 render();
 const refreshVisiblePanel = () => {
   refreshSnapshot().catch(() => {});

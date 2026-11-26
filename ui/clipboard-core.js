@@ -7,16 +7,12 @@
     return {
       entries: Array.isArray(snapshot?.entries) ? snapshot.entries : [],
       panelOpen: Boolean(snapshot?.panel_open ?? snapshot?.panelOpen),
+      canPaste: Boolean(snapshot?.can_paste),
       panelSession: snapshot?.panel_session ?? 0,
       revision: snapshot?.revision ?? 0,
       lastError: snapshot?.last_error ?? snapshot?.lastError ?? null,
       operationError: snapshot?.operation_error ?? snapshot?.operationError ?? null,
     };
-  }
-
-  function previewText(value, maxLength = 120) {
-    const text = String(value ?? "").replace(/\s+/g, " ").trim();
-    return text.length > maxLength ? text.slice(0, maxLength) + "…" : text;
   }
 
   function moveSelection(index, delta, count) {
@@ -27,5 +23,5 @@
     return (current + delta + count) % count;
   }
 
-  return { normalizeSnapshot, previewText, moveSelection };
+  return { normalizeSnapshot, moveSelection };
 });

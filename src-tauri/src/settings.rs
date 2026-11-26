@@ -250,11 +250,12 @@ fn read_valid(path: &Path) -> Result<(AppConfig, bool, Vec<String>), String> {
         .and_then(toml::Value::as_integer)
         .unwrap_or(1)
         == 1;
-    let (mut config, upgraded_scroll, warnings) =
+    let (mut config, upgraded_saved_rules, warnings) =
         import_saved_toml(&contents).map_err(|e| e.to_string())?;
     let upgraded_save_shortcuts = config.upgrade_default_save_shortcuts();
     let upgraded_edit_shortcuts = config.upgrade_default_edit_shortcuts();
     let upgraded_redo_shortcuts = config.upgrade_default_redo_shortcuts();
+    let upgraded_control_sides = config.upgrade_default_edit_control_sides();
     config.validate_desktop().map_err(|e| e.to_string())?;
     Ok((
         config,
@@ -262,7 +263,8 @@ fn read_valid(path: &Path) -> Result<(AppConfig, bool, Vec<String>), String> {
             || upgraded_save_shortcuts
             || upgraded_edit_shortcuts
             || upgraded_redo_shortcuts
-            || upgraded_scroll,
+            || upgraded_control_sides
+            || upgraded_saved_rules,
         warnings,
     ))
 }

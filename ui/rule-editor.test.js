@@ -6,6 +6,12 @@ const {
   recordedTrigger,
 } = require("./rule-editor-core.js");
 
+test("the recorder explains why Caps Lock cannot be used as a trigger", () => {
+  const recorder = createRecorder();
+  recorder.start();
+  assert.throws(() => recorder.keyDown({ code: "CapsLock" }), /Caps Lock 保留给 macOS/);
+});
+
 test("normalizeRule trims fields and supplies a readable default name", () => {
   assert.deepEqual(
     normalizeRule({
