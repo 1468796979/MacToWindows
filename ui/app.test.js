@@ -37,8 +37,10 @@ async function appUi({ initial = snapshot(), invoke, connected = true } = {}) {
     focus() {}
   }
   const nodes = new Map(); const windowListeners = new Map(); const backendListeners = new Map();
+  const documentListeners = new Map();
   const calls = []; const blobs = []; const downloads = [];
   const document = {
+    hidden: false,
     getElementById(id) { if (!nodes.has(id)) nodes.set(id, new Element()); return nodes.get(id); },
     createElement(tag) {
       const element = new Element(tag);
@@ -46,6 +48,7 @@ async function appUi({ initial = snapshot(), invoke, connected = true } = {}) {
       return element;
     },
     querySelector() { return this.getElementById("dialog-backdrop"); },
+    addEventListener(type, handler) { documentListeners.set(type, handler); },
   };
   const window = { ruleEditorCore: require("./rule-editor-core.js"), addEventListener(type, handler) {
     if (!windowListeners.has(type)) windowListeners.set(type, []); windowListeners.get(type).push(handler);
@@ -55,6 +58,7 @@ async function appUi({ initial = snapshot(), invoke, connected = true } = {}) {
       calls.push({ command, args });
       if (invoke) return Promise.resolve().then(() => invoke(command, args, calls));
       if (command === "settings_snapshot") return Promise.resolve(initial);
+      if (command === "set_rule_recording") return Promise.resolve();
       return Promise.reject(new Error("Unexpected command " + command));
     } },
     event: { listen(name, handler) { backendListeners.set(name, handler); return Promise.resolve(() => {}); } },
@@ -73,6 +77,7 @@ async function appUi({ initial = snapshot(), invoke, connected = true } = {}) {
       await settle();
     },
     async runtimeChanged() { await backendListeners.get("runtime-changed")?.({}); await settle(); },
+    async hideDocument() { document.hidden = true; documentListeners.get("visibilitychange")?.(); await settle(); },
     async idle() { await vm.runInContext("writeQueue", context); await settle(); },
   };
 }
@@ -220,6 +225,31 @@ test("configuration writes are serialized and use the latest confirmed revision"
   assert.equal(ui.current().config_revision, 2);
 });
 
+test("saving a desktop shortcut preserves edits made while the save was pending", async () => {
+  const pending = deferred();
+  const ui = await appUi({ invoke(command, args) {
+    if (command === "settings_snapshot") return snapshot();
+    assert.equal(command, "set_show_desktop_shortcut");
+    if (args.trigger === "key:11") return pending.promise;
+    assert.equal(args.trigger, "key:12");
+    assert.equal(args.expectedRevision, 1);
+    return snapshot(2, { show_desktop_shortcut: "key:12" });
+  } });
+  const field = ui.get("show-desktop-shortcut");
+  field.value = "key:11";
+  await field.fire("input");
+  const firstSave = ui.get("show-desktop-save").click();
+  await settle();
+  field.value = "key:12";
+  await field.fire("input");
+  pending.resolve(snapshot(1, { show_desktop_shortcut: "key:11" }));
+  await firstSave;
+  assert.equal(ui.current().show_desktop_shortcut, "key:11");
+  assert.equal(field.value, "key:12");
+  await ui.get("show-desktop-save").click();
+  assert.equal(ui.current().show_desktop_shortcut, "key:12");
+});
+
 test("successful enable refreshes Degraded status and rejects an older delayed response", async () => {
   const old = deferred(); let reads = 0;
   const disabled = snapshot(); disabled.runtime.status = "Degraded";
@@ -275,6 +305,33 @@ test("tray runtime events refresh the settings without fabricating diagnostic va
   assert.equal(ui.get("events-seen").textContent, 99);
 });
 
+test("startup shows a live permission failure even with an unknown cached permission", async () => {
+  const current = snapshot();
+  current.runtime.permission = "Unknown";
+  current.runtime.listen_access = false;
+  current.runtime.event_runtime_started = false;
+  const ui = await appUi({ initial: current });
+  assert.match(ui.get("status-copy").textContent, /输入权限未就绪.*输入监控/);
+});
+
+test("startup displays an Event Tap error independently of authorization", async () => {
+  const current = snapshot();
+  current.runtime.event_runtime_started = false;
+  current.runtime.event_runtime_error = "新的原生错误";
+  const ui = await appUi({ initial: current });
+  assert.match(ui.get("status-copy").textContent, /Event Tap 未能启动/);
+  assert.match(ui.get("settings-feedback").textContent, /新的原生错误/);
+});
+
+test("an input source failure is shown while Windows mode continues running", async () => {
+  const current = snapshot();
+  current.runtime.status = "Running";
+  current.runtime.input_source_error = "输入源服务异常";
+  const ui = await appUi({ initial: current });
+  assert.match(ui.get("status-title").textContent, /Windows 模式已启用/);
+  assert.match(ui.get("settings-feedback").textContent, /输入源服务异常/);
+});
+
 test("failed exports never download a fabricated configuration", async () => {
   const ui = await appUi({ invoke(command) {
     if (command === "settings_snapshot") return snapshot();
@@ -288,6 +345,7 @@ test("failed exports never download a fabricated configuration", async () => {
 
 test("recording through actual key handlers preserves sides and resets on blur", async () => {
   const ui = await appUi();
+  await ui.get("add-rule").click();
   await ui.get("record-trigger").click();
   await ui.event("keydown", { key: "Control", code: "ControlRight", ctrlKey: true });
   await ui.event("keydown", { key: "Shift", code: "ShiftRight", ctrlKey: true, shiftKey: true });
@@ -303,6 +361,50 @@ test("recording through actual key handlers preserves sides and resets on blur",
   await ui.event("keyup", { key: "Shift", code: "ShiftLeft", ctrlKey: true });
   await ui.event("keyup", { key: "Control", code: "ControlRight", ctrlKey: false });
   assert.equal(ui.get("rule-trigger").value, "modifier_chord:right_control|left_shift");
+});
+
+test("recording waits for the native bypass and stops it on completion", async () => {
+  const pending = deferred();
+  const ui = await appUi({ invoke(command, args) {
+    if (command === "settings_snapshot") return snapshot();
+    assert.equal(command, "set_rule_recording");
+    return args.active ? pending.promise : undefined;
+  } });
+  await ui.get("add-rule").click();
+  const request = ui.get("record-trigger").click();
+  await ui.event("keydown", { key: "n", code: "KeyN" });
+  assert.equal(ui.get("rule-trigger").value, "");
+  pending.resolve();
+  await request;
+  await ui.event("keydown", { key: "b", code: "KeyB" });
+  assert.equal(ui.get("rule-trigger").value, "key:11");
+  assert.deepEqual(ui.calls.filter(({ command }) => command === "set_rule_recording").map(({ args }) => args.active), [true, false]);
+});
+
+test("cancelling a pending recording clears the bypass before a later recording starts", async () => {
+  const first = deferred();
+  let starts = 0;
+  const ui = await appUi({ invoke(command, args) {
+    if (command === "settings_snapshot") return snapshot();
+    assert.equal(command, "set_rule_recording");
+    if (args.active && ++starts === 1) return first.promise;
+  } });
+  const recordingCalls = () => ui.calls.filter(({ command }) => command === "set_rule_recording").map(({ args }) => args.active);
+  await ui.get("add-rule").click();
+  const pending = ui.get("record-trigger").click();
+  await settle();
+  await ui.event("keydown", { key: "Escape", code: "Escape" });
+  assert.match(ui.get("recording-state").textContent, /已取消/);
+  const retry = ui.get("record-trigger").click();
+  await settle();
+  assert.deepEqual(recordingCalls(), [true]);
+  first.resolve();
+  await Promise.all([pending, retry]);
+  assert.deepEqual(recordingCalls(), [true, false, true]);
+  await ui.hideDocument();
+  assert.deepEqual(recordingCalls(), [true, false, true, false]);
+  await ui.event("keydown", { key: "b", code: "KeyB" });
+  assert.equal(ui.get("rule-trigger").value, "");
 });
 
 test("an unavailable backend leaves controls paused without fake data", async () => {

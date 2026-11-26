@@ -723,6 +723,7 @@ pub mod platform {
         pub fn CGEventSourceButtonState(state: i32, button: u32) -> bool;
         pub fn CGEventGetTimestamp(event: EventRef) -> u64;
         pub fn CGEventPost(tap: u32, event: EventRef);
+        fn CGEventPostToPid(pid: i32, event: EventRef);
         pub fn CGEventCreateKeyboardEvent(
             source: *mut c_void,
             keycode: u16,
@@ -1333,6 +1334,22 @@ pub mod platform {
 
     pub fn inject_outputs(outputs: &[OutputEvent], marker: u64) -> Result<(), InjectionError> {
         unsafe { inject_outputs_with_context(outputs, marker, ptr::null_mut(), ptr::null_mut()) }
+    }
+
+    pub(super) fn inject_outputs_to_application(
+        outputs: &[OutputEvent],
+        marker: u64,
+        frontmost_pid: impl FnOnce() -> Option<i32>,
+    ) -> Result<(), InjectionError> {
+        if !preflight_permissions().1 {
+            return Err(InjectionError::PermissionDenied);
+        }
+        let batch = unsafe { build_output_batch(outputs, marker, ptr::null_mut()) }?;
+        let pid = frontmost_pid().ok_or(InjectionError::InvalidEvent)?;
+        for event in batch {
+            unsafe { CGEventPostToPid(pid, event.0) };
+        }
+        Ok(())
     }
 
     fn copy_keyboard_with_modifiers(

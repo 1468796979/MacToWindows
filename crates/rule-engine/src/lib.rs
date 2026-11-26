@@ -99,6 +99,8 @@ pub enum EngineError {
     },
     #[error("rule {id}: a release-only modifier chord requires exactly one system shortcut")]
     InvalidModifierChord { id: String },
+    #[error("rule {id}: scroll reversal requires a scroll trigger")]
+    InvalidScrollAction { id: String },
 }
 
 #[derive(Clone, Debug)]
@@ -109,7 +111,7 @@ pub struct CompiledRules {
 impl CompiledRules {
     pub fn compile(input: Vec<Rule>) -> Result<Self, EngineError> {
         let mut rules: Vec<Rule> = Vec::new();
-        for rule in input.into_iter().filter(|rule| rule.enabled) {
+        for mut rule in input.into_iter().filter(|rule| rule.enabled) {
             if matches!(rule.trigger, Trigger::ModifierChord { .. })
                 && (!matches!(
                     rule.trigger,
@@ -121,7 +123,14 @@ impl CompiledRules {
             {
                 return Err(EngineError::InvalidModifierChord { id: rule.id });
             }
-            if let Action::Replace(outputs) = &rule.action {
+            let scroll_trigger = matches!(rule.trigger, Trigger::Scroll { .. });
+            if matches!(rule.action, Action::InvertScroll) && !scroll_trigger {
+                return Err(EngineError::InvalidScrollAction { id: rule.id });
+            }
+            if let Action::Replace(outputs) = &mut rule.action {
+                if scroll_trigger {
+                    complete_scroll_action(outputs);
+                }
                 if outputs.len() > MAX_OUTPUT_EVENTS {
                     return Err(EngineError::TooManyOutputs {
                         id: rule.id,
@@ -198,6 +207,44 @@ impl CompiledRules {
                 )
         })
     }
+}
+
+/// Wheel events have no matching key-up. Finish any targets the action still
+/// holds in this same batch, releasing later presses before earlier ones.
+fn complete_scroll_action(outputs: &mut Vec<OutputEvent>) {
+    let mut held = Vec::new();
+    for output in outputs.iter() {
+        if let Some(code) = held_output_code(output) {
+            if !held.iter().any(|&(target, _)| target == code) {
+                held.push((code, output));
+            }
+        } else if let OutputEvent::Key {
+            phase: EventPhase::Up,
+            ..
+        }
+        | OutputEvent::MouseButton {
+            phase: EventPhase::Up,
+            ..
+        } = output
+        {
+            let code = output_code(output);
+            held.retain(|&(target, _)| Some(target) != code);
+        }
+    }
+    let releases: Vec<_> = held
+        .into_iter()
+        .rev()
+        .filter_map(|(_, down)| {
+            let mut release = release_event(down)?;
+            if let (Some(modifier), OutputEvent::Key { modifiers, .. }) =
+                (output_modifier(down), &mut release)
+            {
+                modifiers.remove(modifier);
+            }
+            Some(release)
+        })
+        .collect();
+    outputs.extend(releases);
 }
 
 fn shortcut_rule(rule: &Rule) -> bool {
@@ -404,6 +451,11 @@ impl RuntimeState {
                 }
             }
         }
+        self.clear_bindings();
+        output
+    }
+
+    fn clear_bindings(&mut self) {
         self.bindings.clear();
         self.logical_down.clear();
         self.physical_down.clear();
@@ -412,7 +464,6 @@ impl RuntimeState {
         self.modifier_chord_fired = false;
         self.gestures_blocked_until_modifiers_up = false;
         self.shift_taps.clear();
-        output
     }
 }
 
@@ -421,6 +472,7 @@ pub struct RuleEngine {
     state: RuntimeState,
     pinyin_active: bool,
     software_input: bool,
+    coalesce_targets: bool,
 }
 
 impl RuleEngine {
@@ -430,6 +482,16 @@ impl RuleEngine {
             state: RuntimeState::default(),
             pinyin_active: false,
             software_input: false,
+            coalesce_targets: true,
+        }
+    }
+
+    /// Let a shared output dispatcher see every source binding's transition.
+    /// The dispatcher can then pair holders across engines and native input.
+    pub fn with_external_output_ownership(rules: CompiledRules) -> Self {
+        Self {
+            coalesce_targets: false,
+            ..Self::new(rules)
         }
     }
     pub fn replace_rules(&mut self, rules: CompiledRules) {
@@ -445,6 +507,11 @@ impl RuleEngine {
     }
     pub fn release_all(&mut self) -> Vec<OutputEvent> {
         self.state.release_all()
+    }
+    /// Clear rules' source bindings when the external dispatcher drains their
+    /// mapped targets, leaving native targets for their actual key-up events.
+    pub fn clear_bindings(&mut self) {
+        self.state.clear_bindings();
     }
     pub fn checkpoint(&self) -> RuntimeState {
         self.state.clone()
@@ -478,6 +545,30 @@ impl RuleEngine {
 
     pub fn handle(&mut self, event: &NormalizedEvent) -> event_model::Decision {
         self.handle_with_policy(event, KeyboardMappingPolicy::Full)
+    }
+
+    /// Report whether the source keeps its native target, even when its flags
+    /// need rewriting. A held source keeps this identity until release.
+    pub fn handle_with_binding(
+        &mut self,
+        event: &NormalizedEvent,
+        policy: KeyboardMappingPolicy,
+    ) -> (event_model::Decision, bool) {
+        let previous = self
+            .state
+            .bindings
+            .get(&event.code)
+            .map(|binding| binding.follow_modifiers);
+        let decision = self.handle_with_policy(event, policy);
+        let native = previous
+            .or_else(|| {
+                self.state
+                    .bindings
+                    .get(&event.code)
+                    .map(|binding| binding.follow_modifiers)
+            })
+            .unwrap_or(true);
+        (decision, native)
     }
 
     pub fn set_keyboard_mapping_policy(&mut self, policy: KeyboardMappingPolicy) {
@@ -878,7 +969,7 @@ impl RuleEngine {
                 let count = self.state.logical_down.entry(code).or_default();
                 let first = *count == 0;
                 *count += 1;
-                if !first {
+                if self.coalesce_targets && !first {
                     continue;
                 }
                 if let OutputEvent::Key {
@@ -916,7 +1007,8 @@ impl RuleEngine {
             if let Some(code) = held_output_code(&held) {
                 let count = self.state.logical_down.entry(code).or_default();
                 *count = count.saturating_sub(1);
-                if *count == 0 {
+                let last = *count == 0;
+                if last || !self.coalesce_targets {
                     if let Some(mut release) = release_event(&held) {
                         if let OutputEvent::Key { modifiers, .. } = &mut release {
                             if binding.follow_modifiers || modifier_for_code(code).is_some() {
@@ -925,6 +1017,8 @@ impl RuleEngine {
                         }
                         output.push(release);
                     }
+                }
+                if last {
                     self.state.logical_down.remove(&code);
                 }
             }

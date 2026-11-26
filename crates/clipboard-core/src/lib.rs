@@ -1,13 +1,14 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::fs::{self, File};
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const MAX_ENTRIES: usize = 50;
 pub const MAX_CHARS: usize = 1_048_576;
 const SCHEMA_VERSION: u32 = 1;
+const RECOVERY_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClipboardEntry {
@@ -148,84 +149,193 @@ pub enum LoadOutcome {
         history: ClipboardHistory,
         path: PathBuf,
     },
+    RecoveredBackup(ClipboardHistory),
 }
 
 impl LoadOutcome {
     pub fn history(self) -> ClipboardHistory {
         match self {
-            Self::Loaded(history) | Self::RecoveredCorrupt { history, .. } => history,
+            Self::Loaded(history)
+            | Self::RecoveredBackup(history)
+            | Self::RecoveredCorrupt { history, .. } => history,
         }
     }
+}
+
+// Flatten the history so a manually restored backup remains a normal history file.
+#[derive(Serialize, Deserialize)]
+struct RecoveryBackup<T> {
+    recovery_version: u32,
+    #[serde(flatten)]
+    history: T,
 }
 
 pub struct ClipboardStore;
 
 impl ClipboardStore {
+    pub fn manual_recovery_dir(path: &Path) -> PathBuf {
+        path.with_extension("manual-recovery")
+    }
+
     pub fn load_or_recover(path: impl AsRef<Path>) -> Result<LoadOutcome, StoreError> {
         let path = path.as_ref();
-        if !path.exists() {
-            return Ok(LoadOutcome::Loaded(ClipboardHistory::default()));
-        }
-        let contents = match fs::read_to_string(path) {
-            Ok(contents) => contents,
+        let corrupt = match fs::read(path) {
+            Ok(contents) => match decode_history(&contents) {
+                Ok(history) => return Ok(LoadOutcome::Loaded(history)),
+                Err(StoreError::Json(_)) => {
+                    Some(path.with_extension(format!("corrupt.{}", suffix())))
+                }
+                Err(error) => return Err(error),
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(StoreError::Io(error)),
         };
-        match serde_json::from_str::<ClipboardHistory>(&contents) {
-            Ok(history) if history.schema_version == SCHEMA_VERSION => {
-                Ok(LoadOutcome::Loaded(history.sanitize()))
+
+        let backup_path = path.with_extension("bak");
+        let backup = match fs::read(&backup_path) {
+            Ok(contents) => {
+                let backup =
+                    serde_json::from_slice::<RecoveryBackup<ClipboardHistory>>(&contents).ok();
+                match backup {
+                    Some(backup)
+                        if backup.recovery_version == RECOVERY_VERSION
+                            && backup.history.schema_version == SCHEMA_VERSION =>
+                    {
+                        Some(backup.history.sanitize())
+                    }
+                    _ => {
+                        // A legacy backup might contain the history immediately before a clear.
+                        // Preserve its bytes for manual recovery and keep it out of rotation.
+                        let directory = Self::manual_recovery_dir(path);
+                        fs::create_dir_all(&directory)?;
+                        let saved = directory.join(format!("history.{}.bak", suffix()));
+                        fs::rename(&backup_path, &saved)?;
+                        sync_directory(&saved)?;
+                        sync_directory(&backup_path)?;
+                        None
+                    }
+                }
             }
-            Ok(history) => Err(StoreError::UnsupportedSchema(history.schema_version)),
-            Err(_) => {
-                let corrupt_path = path.with_extension(format!("corrupt.{}", unix_ms()));
-                fs::rename(path, &corrupt_path)?;
-                Ok(LoadOutcome::RecoveredCorrupt {
-                    history: ClipboardHistory::default(),
-                    path: corrupt_path,
-                })
-            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(StoreError::Io(error)),
+        };
+        if let Some(corrupt_path) = &corrupt {
+            fs::rename(path, corrupt_path)?;
+            sync_directory(path)?;
         }
+        if let Some(history) = backup {
+            write_atomic(path, &serde_json::to_vec_pretty(&history)?)?;
+            return Ok(LoadOutcome::RecoveredBackup(history));
+        }
+        let history = ClipboardHistory::default();
+        Ok(match corrupt {
+            Some(path) => LoadOutcome::RecoveredCorrupt { history, path },
+            None => LoadOutcome::Loaded(history),
+        })
     }
 
     pub fn save_atomic(
         path: impl AsRef<Path>,
         history: &ClipboardHistory,
     ) -> Result<(), StoreError> {
-        let path = path.as_ref();
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        Self::save_with_backup(path.as_ref(), history, false)
+    }
+
+    pub fn save_after_removal(
+        path: impl AsRef<Path>,
+        history: &ClipboardHistory,
+    ) -> Result<(), StoreError> {
+        Self::save_with_backup(path.as_ref(), history, true)
+    }
+
+    fn save_with_backup(
+        path: &Path,
+        history: &ClipboardHistory,
+        removed: bool,
+    ) -> Result<(), StoreError> {
+        let previous = match fs::read(path) {
+            Ok(contents) => Some(decode_history(&contents)?),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(StoreError::Io(error)),
+        };
+        // An acknowledged clear or delete must remain in effect when only the backup survives.
+        let recovery_history = match &previous {
+            Some(previous) if !removed => previous,
+            _ => history,
+        };
+        let backup = RecoveryBackup {
+            recovery_version: RECOVERY_VERSION,
+            history: recovery_history,
+        };
         let data = serde_json::to_vec_pretty(history)?;
-        let tmp_path = path.with_extension(format!("tmp.{}.{}", std::process::id(), unix_ms()));
-        let mut file = File::create(&tmp_path)?;
-        use std::io::Write;
-        file.write_all(&data)?;
-        file.sync_all()?;
-        if path.exists() {
-            let backup = path.with_extension("bak");
-            let backup_tmp = backup.with_extension(format!("tmp.{}", unix_ms()));
-            fs::copy(path, &backup_tmp)?;
-            File::open(&backup_tmp)?.sync_all()?;
-            fs::rename(backup_tmp, backup)?;
+        let backup_data = serde_json::to_vec_pretty(&backup)?;
+        let staged = stage_file(path, &data)?;
+        let result = (|| {
+            write_atomic(&path.with_extension("bak"), &backup_data)?;
+            fs::rename(&staged, path)?;
+            sync_directory(path)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&staged);
         }
-        fs::rename(&tmp_path, path)?;
-        if let Some(parent) = path.parent() {
-            File::open(parent)?.sync_all()?;
-        }
-        Ok(())
+        Ok(result?)
     }
 }
 
-fn unix_ms() -> u128 {
-    SystemTime::now()
+fn decode_history(contents: &[u8]) -> Result<ClipboardHistory, StoreError> {
+    let history: ClipboardHistory = serde_json::from_slice(contents)?;
+    if history.schema_version != SCHEMA_VERSION {
+        return Err(StoreError::UnsupportedSchema(history.schema_version));
+    }
+    Ok(history.sanitize())
+}
+
+fn stage_file(path: &Path, data: &[u8]) -> io::Result<PathBuf> {
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        fs::create_dir_all(parent)?;
+    }
+    let staged = path.with_extension(format!("tmp.{}", suffix()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)?;
+    if let Err(error) = file.write_all(data).and_then(|_| file.sync_all()) {
+        let _ = fs::remove_file(&staged);
+        return Err(error);
+    }
+    Ok(staged)
+}
+
+fn write_atomic(path: &Path, data: &[u8]) -> io::Result<()> {
+    let staged = stage_file(path, data)?;
+    let result = fs::rename(&staged, path).and_then(|_| sync_directory(path));
+    if result.is_err() {
+        let _ = fs::remove_file(&staged);
+    }
+    result
+}
+
+fn sync_directory(path: &Path) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    File::open(parent)?.sync_all()
+}
+
+fn suffix() -> String {
+    let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_millis()
+        .as_nanos();
+    format!("{}.{}", std::process::id(), now)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        ClipboardHistory, ClipboardStore, IngestOutcome, LoadOutcome, MAX_CHARS, MAX_ENTRIES,
+        ClipboardHistory, ClipboardStore, IngestOutcome, LoadOutcome, StoreError, MAX_CHARS,
+        MAX_ENTRIES,
     };
     use std::fs;
     use std::path::PathBuf;
@@ -325,7 +435,120 @@ mod tests {
         let loaded = ClipboardStore::load_or_recover(&path).unwrap().history();
         assert_eq!(loaded.entries(), history.entries());
         let _ = fs::remove_file(&path);
-        let _ = fs::remove_file(path.with_extension("toml.bak"));
+        let _ = fs::remove_file(path.with_extension("bak"));
+    }
+
+    #[test]
+    fn recovers_only_valid_current_backups_without_rotating_them() {
+        let directory = temp_path("current-recovery");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("history.json");
+        let mut history = ClipboardHistory::default();
+        history.ingest("earlier".into(), 1);
+        ClipboardStore::save_atomic(&path, &history).unwrap();
+        history.ingest("latest".into(), 2);
+        ClipboardStore::save_atomic(&path, &history).unwrap();
+        let backup = fs::read(path.with_extension("bak")).unwrap();
+        fs::write(&path, b"invalid json").unwrap();
+
+        let loaded = ClipboardStore::load_or_recover(&path).unwrap();
+        assert!(matches!(loaded, LoadOutcome::RecoveredBackup(_)));
+        assert_eq!(loaded.history().entries()[0].text, "earlier");
+        assert_eq!(fs::read(path.with_extension("bak")).unwrap(), backup);
+        fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            ClipboardStore::load_or_recover(&path).unwrap(),
+            LoadOutcome::RecoveredBackup(_)
+        ));
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn legacy_backup_is_preserved_without_auto_restoring_old_history() {
+        let directory = temp_path("legacy-backup");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("history.json");
+        let mut history = ClipboardHistory::default();
+        history.ingest("before clear".into(), 1);
+        let legacy = serde_json::to_vec(&history).unwrap();
+        fs::write(path.with_extension("bak"), &legacy).unwrap();
+        fs::write(&path, b"invalid json").unwrap();
+
+        let mut history = ClipboardStore::load_or_recover(&path).unwrap().history();
+        assert!(history.entries().is_empty());
+        assert!(!path.with_extension("bak").exists());
+        let recovery = ClipboardStore::manual_recovery_dir(&path);
+        let legacy_path = fs::read_dir(&recovery)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(fs::read(&legacy_path).unwrap(), legacy);
+
+        history.ingest("new entry".into(), 2);
+        ClipboardStore::save_atomic(&path, &history).unwrap();
+        history.ingest("another new entry".into(), 3);
+        ClipboardStore::save_atomic(&path, &history).unwrap();
+        assert_eq!(fs::read(legacy_path).unwrap(), legacy);
+        assert_eq!(
+            ClipboardStore::load_or_recover(&path).unwrap().history(),
+            history
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn backup_recovery_respects_delete_clear_and_subsequent_copy() {
+        let directory = temp_path("recovery-removals");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("history.json");
+        let mut history = ClipboardHistory::default();
+        history.ingest("delete me".into(), 1);
+        history.ingest("keep me".into(), 2);
+        ClipboardStore::save_atomic(&path, &history).unwrap();
+        assert!(history.remove(1));
+        ClipboardStore::save_after_removal(&path, &history).unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(
+            ClipboardStore::load_or_recover(&path).unwrap().history(),
+            history
+        );
+
+        history.clear();
+        ClipboardStore::save_after_removal(&path, &history).unwrap();
+        fs::write(&path, b"invalid json").unwrap();
+        assert_eq!(
+            ClipboardStore::load_or_recover(&path).unwrap().history(),
+            history
+        );
+        history.ingest("first after clear".into(), 3);
+        ClipboardStore::save_atomic(&path, &history).unwrap();
+        fs::remove_file(&path).unwrap();
+        let recovered = ClipboardStore::load_or_recover(&path).unwrap().history();
+        assert!(recovered.entries().is_empty());
+        assert_eq!(recovered.next_id, 3);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn preserves_both_files_when_manually_recoverable_backup_cannot_be_moved() {
+        let directory = temp_path("blocked-recovery");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("history.json");
+        let legacy = serde_json::to_vec(&ClipboardHistory::default()).unwrap();
+        let backup = path.with_extension("bak");
+        fs::write(&backup, &legacy).unwrap();
+        fs::write(&path, b"invalid json").unwrap();
+        fs::write(ClipboardStore::manual_recovery_dir(&path), b"collision").unwrap();
+
+        assert!(matches!(
+            ClipboardStore::load_or_recover(&path),
+            Err(StoreError::Io(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), b"invalid json");
+        assert_eq!(fs::read(backup).unwrap(), legacy);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

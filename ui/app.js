@@ -1,6 +1,6 @@
 const state = {
   snapshot: null, feedback: "", permissionMessage: "", writesPending: 0,
-  desktopDraftDirty: false, lastAppliedRequest: 0,
+  desktopDraftVersion: 0, savedDesktopDraftVersion: 0, lastAppliedRequest: 0,
 };
 const $ = (id) => document.getElementById(id);
 const ruleEditor = window.ruleEditorCore;
@@ -56,22 +56,30 @@ function renderRules() {
   if (!rules.length) list.append(textElement("p", "muted", state.snapshot ? "没有匹配的规则。" : "正在读取配置…"));
 }
 
+function permissionsMissing(runtime) {
+  if (runtime?.listen_access === false || runtime?.post_access === false) return true;
+  if (runtime?.listen_access === true && runtime?.post_access === true) return false;
+  return runtime?.permission === "Denied";
+}
+
 function renderStatus() {
   const runtime = state.snapshot?.runtime;
   const enabled = runtime?.status === "Running";
   const degraded = runtime?.status === "Degraded";
+  const tapUnavailable = runtime?.event_runtime_started === false && runtime?.event_runtime_error;
   $("toggle-mode").classList.toggle("is-on", enabled);
   $("toggle-mode").setAttribute("aria-pressed", String(enabled));
   $("toggle-label").textContent = enabled ? "已启用" : "已暂停";
   $("health-pill").textContent = degraded ? "降级透传" : (enabled ? "运行中" : "已暂停");
   $("health-pill").className = "pill " + (degraded || enabled ? "accent-pill" : "muted-pill");
   $("status-title").textContent = degraded ? "Windows 模式已降级" : (enabled ? "Windows 模式已启用" : "Windows 模式未启用");
-  $("status-copy").textContent = runtime?.permission === "Denied"
+  $("status-copy").textContent = permissionsMissing(runtime)
     ? "输入权限未就绪。" + permissionSettingsPath
-    : degraded ? "输入源或事件注入异常，已暂停映射；请处理错误后重新启用。"
-      : enabled ? "全局键鼠事件正在按当前规则转换。" : "原生键鼠输入正常透传。启用后会按当前预设处理全局事件。";
+    : tapUnavailable ? "Event Tap 未能启动。请查看下方错误后重新检查权限。"
+      : degraded ? "键鼠事件处理异常，已暂停映射。请处理错误后重新启用。"
+        : enabled ? "全局键鼠事件正在按当前规则转换。" : "原生键鼠输入正常透传。启用后会按当前预设处理全局事件。";
   $("permission-feedback").textContent = state.permissionMessage;
-  const errors = [state.feedback, state.snapshot?.config_error, runtime?.last_error,
+  const errors = [state.feedback, state.snapshot?.config_error, runtime?.last_error, runtime?.event_runtime_error, runtime?.input_source_error,
     runtime?.pending_releases ? `仍有 ${runtime.pending_releases} 个逻辑按键等待安全释放。` : ""].filter(Boolean);
   $("settings-feedback").textContent = errors.join("\n");
   $("events-seen").textContent = runtime?.events_seen ?? 0;
@@ -97,7 +105,9 @@ function renderSettings() {
     select.append(option);
   }
   select.value = state.snapshot?.active_profile || "";
-  if (!state.desktopDraftDirty) $("show-desktop-shortcut").value = state.snapshot?.show_desktop_shortcut || "";
+  if (state.desktopDraftVersion === state.savedDesktopDraftVersion) {
+    $("show-desktop-shortcut").value = state.snapshot?.show_desktop_shortcut || "";
+  }
   const passthrough = state.snapshot?.software_input_passthrough !== false;
   $("software-input-passthrough").className = "switch" + (passthrough ? " on" : "");
   $("software-input-passthrough").setAttribute("aria-checked", String(passthrough));
@@ -185,7 +195,7 @@ $("permission-button").addEventListener("click", async () => {
   try {
     await runtimeMutation("reload_permissions");
     const view = state.snapshot.runtime;
-    state.permissionMessage = view.permission === "Denied" || !view.listen_access || !view.post_access
+    state.permissionMessage = permissionsMissing(view)
       ? "权限检查未通过。" + permissionSettingsPath : "权限与运行状态已刷新。";
   } catch (error) { state.permissionMessage = "权限检查失败：" + message(error); }
   renderStatus();
@@ -209,21 +219,48 @@ $("panic-test").addEventListener("click", async () => {
   }
 });
 $("refresh-diagnostics").addEventListener("click", () => syncSettings().catch(showSyncError));
-$("show-desktop-shortcut").addEventListener("input", () => { state.desktopDraftDirty = true; });
+$("show-desktop-shortcut").addEventListener("input", () => { state.desktopDraftVersion += 1; });
 $("show-desktop-save").addEventListener("click", async () => {
   const trigger = $("show-desktop-shortcut").value.trim();
+  const draftVersion = state.desktopDraftVersion;
   try {
     await mutateSettings("set_show_desktop_shortcut", () => ({ trigger }));
-    state.desktopDraftDirty = false;
+    state.savedDesktopDraftVersion = draftVersion;
     renderSettings();
   } catch (_) {}
 });
 
-let recordingRuleTrigger = false;
+let recordingStatus = "idle";
+let recordingIntent = 0;
+let recordingQueue = Promise.resolve();
+let nativeRecordingMayBeActive = false;
+
+// A cancellation must reach the backend after any start already in flight.
+function enqueueRecording(operation) {
+  const result = recordingQueue.then(operation);
+  recordingQueue = result.catch(() => {});
+  return result;
+}
+
 function stopRecording(label = "") {
-  recordingRuleTrigger = false;
-  recorder.cancel();
+  const intent = ++recordingIntent;
+  const shouldStop = recordingStatus !== "idle" || nativeRecordingMayBeActive;
+  recordingStatus = "idle";
+  recorder.reset();
   $("recording-state").textContent = label;
+  if (!shouldStop) return;
+  enqueueRecording(async () => {
+    if (!nativeRecordingMayBeActive) return;
+    try {
+      await backendInvoke("set_rule_recording", { active: false });
+      nativeRecordingMayBeActive = false;
+    } catch (error) {
+      if (intent === recordingIntent) {
+        const failure = "结束录制失败：" + message(error);
+        $("recording-state").textContent = [label, failure].filter(Boolean).join(" ");
+      }
+    }
+  });
 }
 function closeRuleDialog() {
   stopRecording();
@@ -241,10 +278,25 @@ $("rule-dialog-close").addEventListener("click", closeRuleDialog);
 $("rule-cancel").addEventListener("click", closeRuleDialog);
 document.querySelector("[data-close-rule-dialog]").addEventListener("click", closeRuleDialog);
 $("record-trigger").addEventListener("click", () => {
-  recorder.start();
-  recordingRuleTrigger = true;
-  $("recording-state").textContent = "请按下组合键；纯修饰键在全部松开后完成（Esc 取消）。";
+  if ($("rule-dialog").hidden || recordingStatus !== "idle") return;
+  const intent = ++recordingIntent;
+  recordingStatus = "starting";
+  $("recording-state").textContent = "正在准备录制…";
   $("rule-trigger").focus();
+  return enqueueRecording(async () => {
+    if (intent !== recordingIntent) return;
+    nativeRecordingMayBeActive = true;
+    try {
+      await backendInvoke("set_rule_recording", { active: true });
+    } catch (error) {
+      if (intent === recordingIntent) stopRecording("无法开始录制：" + message(error));
+      return;
+    }
+    if (intent !== recordingIntent) return;
+    recorder.start();
+    recordingStatus = "recording";
+    $("recording-state").textContent = "请按下组合键；纯修饰键在全部松开后完成（Esc 取消）。";
+  });
 });
 function acceptRecordedTrigger(trigger) {
   if (!trigger) return;
@@ -253,29 +305,37 @@ function acceptRecordedTrigger(trigger) {
 }
 window.addEventListener("keydown", (event) => {
   if (event.isComposing) return;
-  if (recordingRuleTrigger && event.key === "Escape") {
-    event.preventDefault();
+  if (recordingStatus === "idle") {
+    if (event.key === "Escape" && !$("rule-dialog").hidden) closeRuleDialog();
+    return;
+  }
+  event.preventDefault();
+  if (event.key === "Escape") {
     stopRecording("已取消录制");
     return;
   }
-  if (recordingRuleTrigger) event.preventDefault();
+  if (recordingStatus === "starting") return;
   try { acceptRecordedTrigger(recorder.keyDown(event)); }
   catch (error) { stopRecording(message(error)); }
-  if (!recordingRuleTrigger && event.key === "Escape" && !$("rule-dialog").hidden) closeRuleDialog();
 });
 window.addEventListener("keyup", (event) => {
-  if (event.isComposing) return;
-  if (recordingRuleTrigger) event.preventDefault();
+  if (event.isComposing || recordingStatus === "idle") return;
+  event.preventDefault();
+  if (recordingStatus === "starting") return;
   try { acceptRecordedTrigger(recorder.keyUp(event)); }
   catch (error) { stopRecording(message(error)); }
 });
-window.addEventListener("blur", () => {
-  recorder.reset();
-  if (recordingRuleTrigger) stopRecording("窗口失去焦点，已取消录制");
+function cancelRecordingOnBlur() {
+  if (recordingStatus !== "idle") stopRecording("窗口失去焦点，已取消录制");
+}
+window.addEventListener("blur", cancelRecordingOnBlur);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) cancelRecordingOnBlur();
 });
 $("rule-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   if (state.writesPending) return;
+  if (recordingStatus !== "idle") stopRecording("已取消录制");
   $("rule-feedback").textContent = "";
   try {
     const rule = ruleEditor.normalizeRule({ name: $("rule-name").value, trigger: $("rule-trigger").value, action: $("rule-action").value, enabled: true });

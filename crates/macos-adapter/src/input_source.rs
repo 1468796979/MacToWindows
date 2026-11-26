@@ -21,6 +21,16 @@ pub enum InputSourceError {
     Api(String),
 }
 
+impl std::fmt::Display for InputSourceError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsupported => formatter.write_str("当前平台不支持输入源切换"),
+            Self::ServiceStopped => formatter.write_str("输入源服务已停止"),
+            Self::Api(message) => formatter.write_str(message),
+        }
+    }
+}
+
 pub struct InputSourceService {
     snapshot: Arc<RwLock<InputSourceSnapshot>>,
     last_error: Arc<RwLock<Option<InputSourceError>>>,
@@ -45,8 +55,8 @@ impl InputSourceService {
             .unwrap_or_default()
     }
 
-    pub fn take_last_error(&self) -> Option<InputSourceError> {
-        self.last_error.write().ok()?.take()
+    pub fn last_error(&self) -> Option<InputSourceError> {
+        self.last_error.read().ok()?.clone()
     }
 
     pub fn request(&self, command: InputSourceCommand) -> Result<(), InputSourceError> {
@@ -77,6 +87,35 @@ fn next_index(current: usize, count: usize) -> Option<usize> {
     }
 }
 
+fn pinyin_toggle_target<'a>(
+    current: &InputSourceSnapshot,
+    enabled: &'a [(String, bool)],
+) -> Result<Option<&'a str>, InputSourceError> {
+    let (preferred, want_pinyin) = if current.current_is_pinyin {
+        (current.last_latin_id.as_deref(), false)
+    } else if current.current_id.is_some() && current.current_id == current.last_latin_id {
+        let Some(previous) = current.last_pinyin_id.as_deref() else {
+            return Ok(None);
+        };
+        (Some(previous), true)
+    } else {
+        return Ok(None);
+    };
+    enabled
+        .iter()
+        .filter(|(id, ascii)| {
+            if want_pinyin {
+                is_pinyin_identifier(id)
+            } else {
+                *ascii && !is_pinyin_identifier(id)
+            }
+        })
+        .map(|(id, _)| id.as_str())
+        .min_by_key(|id| Some(*id) != preferred)
+        .map(Some)
+        .ok_or_else(|| InputSourceError::Api("没有启用的目标输入源".into()))
+}
+
 /// Keep a just-selected source visible until TIS reports the same source.
 ///
 /// `TISSelectInputSource` can return before `TISCopyCurrentKeyboardInputSource`
@@ -98,8 +137,8 @@ fn reconcile_selection_snapshot(
 #[cfg(target_os = "macos")]
 mod platform {
     use super::{
-        is_pinyin_identifier, next_index, reconcile_selection_snapshot, InputSourceCommand,
-        InputSourceError, InputSourceService, InputSourceSnapshot,
+        is_pinyin_identifier, next_index, pinyin_toggle_target, reconcile_selection_snapshot,
+        InputSourceCommand, InputSourceError, InputSourceService, InputSourceSnapshot,
     };
     use std::ffi::{c_char, c_void, CStr};
     use std::ptr;
@@ -242,6 +281,7 @@ mod platform {
                     if let Ok(mut target) = last_error.write() {
                         *target = Some(error);
                     }
+                    continue;
                 }
             }
             let selected_target = match request.command {
@@ -253,6 +293,9 @@ mod platform {
                     *target = Some(error.clone());
                 }
                 continue;
+            }
+            if let Ok(mut target) = last_error.write() {
+                *target = None;
             }
             if let Ok(Some(target)) = selected_target {
                 // TISSelectInputSource returns before the selected source is
@@ -387,23 +430,9 @@ mod platform {
         current: &InputSourceSnapshot,
     ) -> Result<Option<String>, InputSourceError> {
         let sources = enabled_sources()?;
-        let fallback_latin = sources
-            .iter()
-            .find(|(id, is_ascii)| *is_ascii && !is_pinyin_identifier(id))
-            .map(|(id, _)| id.as_str());
-        let target = if current.current_is_pinyin {
-            current.last_latin_id.as_deref().or(fallback_latin)
-        } else if current.current_id.as_deref() == current.last_latin_id.as_deref() {
-            current.last_pinyin_id.as_deref()
-        } else {
-            None
-        };
-        let Some(target) = target else {
+        let Some(target) = pinyin_toggle_target(current, &sources)? else {
             return Ok(None);
         };
-        if !sources.iter().any(|(id, _)| id == target) {
-            return Err(InputSourceError::Api("目标输入源未启用".into()));
-        }
         select_source_id(target)?;
         Ok(Some(target.to_string()))
     }
@@ -537,6 +566,30 @@ mod tests {
         assert_eq!(next_index(0, 3), Some(1));
         assert_eq!(next_index(2, 3), Some(0));
         assert_eq!(next_index(0, 0), None);
+    }
+
+    #[test]
+    fn pinyin_toggle_prefers_enabled_latin_and_falls_back_if_the_layout_was_removed() {
+        let mut current = InputSourceSnapshot {
+            current_is_pinyin: true,
+            last_latin_id: Some("ABC".into()),
+            ..Default::default()
+        };
+        let sources = [("US".into(), true), ("ABC".into(), true)];
+        assert_eq!(pinyin_toggle_target(&current, &sources), Ok(Some("ABC")));
+        assert_eq!(
+            pinyin_toggle_target(&current, &sources[..1]),
+            Ok(Some("US"))
+        );
+        assert!(pinyin_toggle_target(&current, &[]).is_err());
+
+        current.current_is_pinyin = false;
+        current.current_id = Some("ABC".into());
+        current.last_pinyin_id = Some("Pinyin-old".into());
+        assert_eq!(
+            pinyin_toggle_target(&current, &[("Pinyin-new".into(), false)]),
+            Ok(Some("Pinyin-new"))
+        );
     }
 
     #[test]

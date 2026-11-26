@@ -16,16 +16,26 @@ pub(crate) enum InputStream {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum OutputOwner {
-    Mapped(InputStream),
+    // A stream can map several physical inputs to the same target.
+    Mapped(InputStream, PhysicalCode),
+    // Native input targets its own key or button, even when flags are rewritten.
     Native(InputStream),
     Transient(InputStream, u64),
     ApplicationSwitch(InputStream),
 }
 
 impl OutputOwner {
+    pub(crate) fn for_binding(stream: InputStream, source: PhysicalCode, native: bool) -> Self {
+        if native {
+            Self::Native(stream)
+        } else {
+            Self::Mapped(stream, source)
+        }
+    }
+
     fn stream(self) -> InputStream {
         match self {
-            Self::Mapped(stream)
+            Self::Mapped(stream, _)
             | Self::Native(stream)
             | Self::Transient(stream, _)
             | Self::ApplicationSwitch(stream) => stream,
@@ -154,14 +164,26 @@ impl OutputOwnership {
     /// Native holders are released only when the caller has established that
     /// their source has retired; normal pause must not release physical input.
     pub(crate) fn release_owner(&mut self, owner: OutputOwner) -> Vec<OutputEvent> {
+        self.release_matching(|candidate| candidate == owner)
+    }
+
+    pub(crate) fn release_mapped(&mut self, stream: InputStream) -> Vec<OutputEvent> {
+        self.release_matching(|owner| matches!(owner, OutputOwner::Mapped(s, _) if s == stream))
+    }
+
+    fn release_matching(
+        &mut self,
+        matches_owner: impl Fn(OutputOwner) -> bool,
+    ) -> Vec<OutputEvent> {
         let mut targets: Vec<_> = self
             .held
             .iter()
-            .filter_map(|(code, owners)| owners.contains(&owner).then_some(*code))
+            .flat_map(|(&code, owners)| owners.iter().copied().map(move |owner| (code, owner)))
+            .filter(|&(_, owner)| matches_owner(owner))
             .collect();
         // Finish main keys before their modifiers. Stable order makes cleanup
         // repeatable without depending on HashMap iteration order.
-        targets.sort_by_key(|code| match code {
+        targets.sort_by_key(|(code, _)| match code {
             PhysicalCode::Key(value) => (modifier_bits(*code).is_some(), 0_u8, *value),
             PhysicalCode::MouseButton(button) => {
                 use event_model::MouseButton;
@@ -176,7 +198,7 @@ impl OutputOwnership {
             PhysicalCode::Scroll(_) => (false, 2, 0),
         });
         let mut releases = Vec::new();
-        for code in targets {
+        for (code, owner) in targets {
             let output = match code {
                 PhysicalCode::MouseButton(button) => OutputEvent::MouseButton {
                     button,
@@ -289,6 +311,10 @@ mod tests {
         })
     }
 
+    fn mapped(stream: InputStream) -> OutputOwner {
+        OutputOwner::Mapped(stream, PhysicalCode::key(11))
+    }
+
     fn key(code: u16, phase: EventPhase, modifiers: ModifierSet) -> OutputEvent {
         OutputEvent::Key {
             code: PhysicalCode::key(code),
@@ -315,8 +341,8 @@ mod tests {
     #[test]
     fn target_is_released_only_after_all_sources_release() {
         let mut ownership = OutputOwnership::default();
-        let local = OutputOwner::Mapped(InputStream::Local);
-        let remote = OutputOwner::Mapped(software(10));
+        let local = mapped(InputStream::Local);
+        let remote = mapped(software(10));
         let down = key(8, EventPhase::Down, ModifierSet::NONE);
         let up = key(8, EventPhase::Up, ModifierSet::NONE);
         assert_eq!(ownership.filter(local, &[down.clone()]), [down.clone()]);
@@ -373,13 +399,13 @@ mod tests {
             &native(56, EventPhase::Down, ModifierSet::LEFT_SHIFT),
         );
         ownership.filter(
-            OutputOwner::Mapped(remote),
+            mapped(remote),
             &[key(58, EventPhase::Down, ModifierSet::LEFT_OPTION)],
         );
         let expected = ModifierSet::LEFT_COMMAND | ModifierSet::LEFT_SHIFT;
         assert_eq!(
             ownership.filter(
-                OutputOwner::Mapped(remote),
+                mapped(remote),
                 &[key(8, EventPhase::Down, ModifierSet::LEFT_COMMAND)]
             ),
             [key(8, EventPhase::Down, expected)]
@@ -396,7 +422,7 @@ mod tests {
         let mut ownership = OutputOwnership::default();
         let remote = software(10);
         let down = key(55, EventPhase::Down, ModifierSet::LEFT_COMMAND);
-        ownership.filter(OutputOwner::Mapped(remote), &[down]);
+        ownership.filter(mapped(remote), &[down]);
         assert!(!ownership.native_pass(
             InputStream::Local,
             &native(55, EventPhase::Down, ModifierSet::LEFT_COMMAND)
@@ -410,7 +436,7 @@ mod tests {
         ));
         assert_eq!(
             ownership.filter(
-                OutputOwner::Mapped(remote),
+                mapped(remote),
                 &[key(55, EventPhase::Up, ModifierSet::NONE)]
             ),
             [key(55, EventPhase::Up, ModifierSet::NONE)]
@@ -427,7 +453,7 @@ mod tests {
         assert!(ownership.native_pass(stream, &native(8, EventPhase::Repeat, ModifierSet::NONE)));
         assert_eq!(ownership.held[&PhysicalCode::key(8)].len(), 1);
         assert!(ownership.native_pass(stream, &native(8, EventPhase::Up, ModifierSet::NONE)));
-        let owner = OutputOwner::Mapped(stream);
+        let owner = mapped(stream);
         assert_eq!(
             ownership
                 .filter(owner, &[key(8, EventPhase::Down, ModifierSet::NONE)])
@@ -458,10 +484,7 @@ mod tests {
         for phase in [EventPhase::Up, EventPhase::Repeat] {
             assert!(ownership.native_pass(stream, &native(8, phase, ModifierSet::NONE)));
             assert_eq!(
-                ownership.filter(
-                    OutputOwner::Mapped(stream),
-                    &[key(8, phase, ModifierSet::NONE)]
-                ),
+                ownership.filter(mapped(stream), &[key(8, phase, ModifierSet::NONE)]),
                 [key(8, phase, ModifierSet::NONE)]
             );
             assert!(ownership.held.is_empty());
@@ -496,7 +519,7 @@ mod tests {
             ..native(0, EventPhase::Down, ModifierSet::NONE)
         };
         assert!(ownership.native_pass(InputStream::Local, &mouse));
-        let owner = OutputOwner::Mapped(software(10));
+        let owner = mapped(software(10));
         let down = OutputEvent::MouseButton {
             button: MouseButton::Left,
             phase: EventPhase::Down,
@@ -545,7 +568,7 @@ mod tests {
     fn existing_semantic_modifier_aliases_are_not_duplicated() {
         let mut ownership = OutputOwnership::default();
         let stream = software(10);
-        let owner = OutputOwner::Mapped(stream);
+        let owner = mapped(stream);
         for (code, semantic, native) in [
             (55, ModifierSet::LEFT_WINDOWS, ModifierSet::LEFT_COMMAND),
             (54, ModifierSet::RIGHT_WINDOWS, ModifierSet::RIGHT_COMMAND),
@@ -580,7 +603,7 @@ mod tests {
             &native(55, EventPhase::Down, ModifierSet::LEFT_COMMAND),
         );
         ownership.filter(
-            OutputOwner::Mapped(current),
+            mapped(current),
             &[key(55, EventPhase::Down, ModifierSet::LEFT_COMMAND)],
         );
         assert_eq!(
@@ -594,7 +617,7 @@ mod tests {
             ModifierSet::LEFT_COMMAND
         );
         assert_eq!(
-            ownership.release_owner(OutputOwner::Mapped(current)),
+            ownership.release_owner(mapped(current)),
             [key(55, EventPhase::Up, ModifierSet::NONE)]
         );
         assert!(ownership.held.is_empty());
@@ -627,7 +650,7 @@ mod tests {
     fn explicit_command_copy_does_not_inherit_its_own_mapped_control() {
         let mut ownership = OutputOwnership::default();
         let stream = software(10);
-        let owner = OutputOwner::Mapped(stream);
+        let owner = mapped(stream);
         ownership.filter(
             owner,
             &[
@@ -656,7 +679,7 @@ mod tests {
         let mut ownership = OutputOwnership::default();
         let stream = software(10);
         ownership.filter(
-            OutputOwner::Mapped(stream),
+            mapped(stream),
             &[key(59, EventPhase::Down, ModifierSet::LEFT_CONTROL)],
         );
         ownership.native_pass(
@@ -665,7 +688,7 @@ mod tests {
         );
         assert_eq!(
             ownership.filter(
-                OutputOwner::Mapped(stream),
+                mapped(stream),
                 &[key(8, EventPhase::Down, ModifierSet::LEFT_COMMAND)]
             ),
             [key(
@@ -681,7 +704,7 @@ mod tests {
         let mut ownership = OutputOwnership::default();
         let stream = software(10);
         ownership.filter(
-            OutputOwner::Mapped(stream),
+            mapped(stream),
             &[key(58, EventPhase::Down, ModifierSet::LEFT_OPTION)],
         );
         assert_eq!(

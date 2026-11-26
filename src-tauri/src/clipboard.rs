@@ -3,7 +3,7 @@ use clipboard_core::{
 };
 use macos_adapter::{ForegroundApplication, PasteboardError, PasteboardService};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -11,16 +11,16 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ClipboardSelection {
     pub text: String,
-    pub target_bundle_id: String,
+    pub target: ForegroundApplication,
 }
 
 pub struct ClipboardManagerCore {
     history: ClipboardHistory,
     pasteboard: PasteboardService,
-    target_bundle_id: Option<String>,
+    target: Option<ForegroundApplication>,
     own_bundle_id: Option<String>,
 }
 
@@ -33,7 +33,7 @@ impl ClipboardManagerCore {
         Self {
             history,
             pasteboard,
-            target_bundle_id: None,
+            target: None,
             own_bundle_id,
         }
     }
@@ -69,12 +69,12 @@ impl ClipboardManagerCore {
         &mut self,
         target: Option<ForegroundApplication>,
     ) -> Result<ForegroundApplication, PasteboardError> {
-        self.target_bundle_id = None;
+        self.target = None;
         let target = target.ok_or(PasteboardError::ApplicationUnavailable)?;
         if self.own_bundle_id.as_deref() == Some(target.bundle_id.as_str()) {
             return Err(PasteboardError::ApplicationUnavailable);
         }
-        self.target_bundle_id = Some(target.bundle_id.clone());
+        self.target = Some(target.clone());
         Ok(target)
     }
 
@@ -85,13 +85,13 @@ impl ClipboardManagerCore {
             .iter()
             .find(|entry| entry.id == id)
             .ok_or_else(|| "剪贴板条目不存在".to_owned())?;
-        let target_bundle_id = self
-            .target_bundle_id
+        let target = self
+            .target
             .clone()
             .ok_or_else(|| "没有可恢复的目标应用".to_owned())?;
         Ok(ClipboardSelection {
             text: entry.text.clone(),
-            target_bundle_id,
+            target,
         })
     }
 
@@ -106,11 +106,6 @@ impl ClipboardManagerCore {
     #[cfg(test)]
     fn ingest_for_test(&mut self, text: &str) {
         self.history.ingest(text.to_owned(), unix_ms());
-    }
-
-    #[cfg(test)]
-    fn set_target_for_test(&mut self, target: Option<String>) {
-        self.target_bundle_id = target;
     }
 }
 
@@ -135,16 +130,22 @@ pub struct ClipboardSnapshot {
 #[derive(Default, Debug, PartialEq, Eq, Clone)]
 struct ClipboardErrors {
     storage: Option<String>,
+    manual_recovery: Option<String>,
     read: Option<String>,
     operation: Option<String>,
 }
 
 impl ClipboardErrors {
     fn message(&self) -> Option<String> {
-        let messages: Vec<&str> = [&self.storage, &self.read, &self.operation]
-            .into_iter()
-            .filter_map(|message| message.as_deref())
-            .collect();
+        let messages: Vec<&str> = [
+            &self.storage,
+            &self.manual_recovery,
+            &self.read,
+            &self.operation,
+        ]
+        .into_iter()
+        .filter_map(|message| message.as_deref())
+        .collect();
         (!messages.is_empty()).then(|| messages.join("\n"))
     }
 }
@@ -161,6 +162,18 @@ struct HistoryState {
 }
 
 impl HistoryState {
+    fn load(path: &Path) -> Self {
+        let mut state = Self::from_load(ClipboardStore::load_or_recover(path));
+        let saved = ClipboardStore::manual_recovery_dir(path);
+        if std::fs::read_dir(&saved).is_ok_and(|mut entries| entries.next().is_some()) {
+            state.errors.manual_recovery = Some(format!(
+                "旧历史备份已保留到 {}，请确认备份内容后手动恢复。",
+                saved.display()
+            ));
+        }
+        state
+    }
+
     fn from_load(result: Result<LoadOutcome, StoreError>) -> Self {
         let (history, storage_error, storage_ready) = match result {
             Ok(LoadOutcome::Loaded(history)) => (history, None, true),
@@ -169,6 +182,9 @@ impl HistoryState {
                 Some(format!("历史文件损坏，已备份到 {}", path.display())),
                 true,
             ),
+            Ok(LoadOutcome::RecoveredBackup(history)) => {
+                (history, Some("已从有效备份恢复剪贴板历史".into()), true)
+            }
             Err(error) => (
                 ClipboardHistory::default(),
                 Some(format!(
@@ -499,7 +515,7 @@ fn worker_loop(
     select_generation: Arc<AtomicU64>,
     marker: u64,
 ) {
-    let mut state = HistoryState::from_load(ClipboardStore::load_or_recover(&history_path));
+    let mut state = HistoryState::load(&history_path);
     let pasteboard = match PasteboardService::start() {
         Ok(service) => Some(service),
         Err(error) => {
@@ -612,6 +628,10 @@ fn handle_command(
     marker: u64,
     command: WorkerCommand,
 ) -> bool {
+    let save_after_removal = |history: &ClipboardHistory| {
+        ClipboardStore::save_after_removal(history_path, history)
+            .map_err(|error| format!("保存剪贴板历史失败：{error}"))
+    };
     match command {
         WorkerCommand::Show => {
             refresh_memory_history(core, state, Instant::now(), |history| {
@@ -620,7 +640,7 @@ fn handle_command(
             if !*panel_open {
                 state.errors.operation = None;
                 if let Some(core) = core.as_mut() {
-                    core.target_bundle_id = None;
+                    core.target = None;
                     let result = frontmost_application_on_main_thread(app).and_then(|target| {
                         core.capture_target_value(target)
                             .map_err(|error| error.to_string())
@@ -666,7 +686,7 @@ fn handle_command(
             let _ = reply.send(result);
         }
         WorkerCommand::Delete { id, reply } => {
-            let result = state.delete(id, |history| save_history(history_path, history));
+            let result = state.delete(id, save_after_removal);
             if result.is_ok() {
                 sync_core_history(core, state);
             }
@@ -674,7 +694,7 @@ fn handle_command(
             let _ = reply.send(result);
         }
         WorkerCommand::Clear { reply } => {
-            let result = state.clear(|history| save_history(history_path, history));
+            let result = state.clear(save_after_removal);
             if result.is_ok() {
                 sync_core_history(core, state);
             }
@@ -707,7 +727,7 @@ fn should_report_show_capture_error(error: &str) -> bool {
 
 fn dismiss_panel(core: &mut Option<ClipboardManagerCore>, panel_open: &mut bool) {
     if let Some(core) = core.as_mut() {
-        core.target_bundle_id = None;
+        core.target = None;
     }
     *panel_open = false;
 }
@@ -733,12 +753,6 @@ fn select_and_paste(
         return Err(error);
     };
     let selection = core.select(id)?;
-    core.write_text(&selection.text)
-        .map_err(|error| format!("写入系统剪贴板失败：{error}"))?;
-    if select_generation.load(Ordering::Acquire) != generation {
-        *panel_open = false;
-        return Err("操作已取消".into());
-    }
     if let Err(error) = hide_window_and_wait(app) {
         if select_generation.load(Ordering::Acquire) != generation {
             *panel_open = false;
@@ -755,7 +769,7 @@ fn select_and_paste(
     }
     if let Err(message) = activate_application_on_main_thread(
         app,
-        &selection.target_bundle_id,
+        &selection.target,
         Arc::clone(select_generation),
         generation,
     ) {
@@ -771,12 +785,7 @@ fn select_and_paste(
         *panel_open = false;
         return Err("操作已取消".into());
     }
-    if let Err(error) = wait_for_frontmost(
-        app,
-        &selection.target_bundle_id,
-        select_generation,
-        generation,
-    ) {
+    if let Err(error) = wait_for_frontmost(app, &selection.target, select_generation, generation) {
         if select_generation.load(Ordering::Acquire) != generation {
             *panel_open = false;
             return Err("操作已取消".into());
@@ -795,24 +804,23 @@ fn select_and_paste(
         *panel_open = false;
         return Err("操作已取消".into());
     }
-    let outputs = [
-        event_model::OutputEvent::Key {
-            code: event_model::PhysicalCode::key(9),
-            phase: event_model::EventPhase::Down,
-            modifiers: event_model::ModifierSet::LEFT_COMMAND,
-        },
-        event_model::OutputEvent::Key {
-            code: event_model::PhysicalCode::key(9),
-            phase: event_model::EventPhase::Up,
-            modifiers: event_model::ModifierSet::LEFT_COMMAND,
-        },
-    ];
-    if let Err(error) = macos_adapter::inject_outputs(&outputs, marker) {
+    let result = core
+        .write_text(&selection.text)
+        .map_err(|error| format!("写入系统剪贴板失败：{error}"))
+        .and_then(|_| {
+            let select_generation = Arc::clone(select_generation);
+            run_on_main_thread_result(app, move |timed_out| {
+                selection.target.paste_if_frontmost(marker, || {
+                    !timed_out.load(Ordering::Acquire)
+                        && select_generation.load(Ordering::Acquire) == generation
+                })
+            })?
+        });
+    if let Err(message) = result {
         if select_generation.load(Ordering::Acquire) != generation {
             *panel_open = false;
             return Err("操作已取消".into());
         }
-        let message = format!("自动粘贴失败：{error}");
         *last_error = Some(message.clone());
         *panel_open = true;
         show_window(app);
@@ -820,14 +828,14 @@ fn select_and_paste(
     }
     *panel_open = false;
     *last_error = None;
-    core.target_bundle_id = None;
+    core.target = None;
     Ok(())
 }
 
 fn run_on_main_thread_result<T, F>(app: &AppHandle, operation: F) -> Result<T, String>
 where
     T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
+    F: FnOnce(&AtomicBool) -> T + Send + 'static,
 {
     let (result_tx, result_rx) = mpsc::sync_channel(1);
     let cancelled = Arc::new(AtomicBool::new(false));
@@ -836,7 +844,7 @@ where
         if closure_cancelled.load(Ordering::Acquire) {
             return;
         }
-        let _ = result_tx.send(operation());
+        let _ = result_tx.send(operation(&closure_cancelled));
     })
     .map_err(|error| format!("主线程操作失败：{error}"))?;
     match result_rx.recv_timeout(Duration::from_millis(500)) {
@@ -851,29 +859,31 @@ where
 fn frontmost_application_on_main_thread(
     app: &AppHandle,
 ) -> Result<Option<ForegroundApplication>, String> {
-    run_on_main_thread_result(app, macos_adapter::frontmost_application)?
+    run_on_main_thread_result(app, |_| macos_adapter::frontmost_application())?
         .map_err(|error| format!("读取前台应用失败：{error}"))
 }
 
 fn activate_application_on_main_thread(
     app: &AppHandle,
-    bundle_id: &str,
+    target: &ForegroundApplication,
     select_generation: Arc<AtomicU64>,
     generation: u64,
 ) -> Result<(), String> {
-    let bundle_id = bundle_id.to_owned();
-    run_on_main_thread_result(app, move || {
-        if select_generation.load(Ordering::Acquire) != generation {
+    let target = target.clone();
+    run_on_main_thread_result(app, move |timed_out| {
+        if timed_out.load(Ordering::Acquire)
+            || select_generation.load(Ordering::Acquire) != generation
+        {
             return Err(PasteboardError::ApplicationUnavailable);
         }
-        macos_adapter::activate_application(&bundle_id)
+        target.activate()
     })?
     .map_err(|error| format!("恢复前台应用失败：{error}"))
 }
 
 fn wait_for_frontmost(
     app: &AppHandle,
-    target_bundle_id: &str,
+    target: &ForegroundApplication,
     select_generation: &Arc<AtomicU64>,
     generation: u64,
 ) -> Result<(), String> {
@@ -883,7 +893,7 @@ fn wait_for_frontmost(
             return Err("操作已取消".into());
         }
         match frontmost_application_on_main_thread(app)? {
-            Some(application) if application.bundle_id == target_bundle_id => return Ok(()),
+            Some(application) if target.same_instance(&application) => return Ok(()),
             Some(_) | None => {}
         }
         if Instant::now() >= deadline {
@@ -945,7 +955,7 @@ fn hide_window_and_wait(app: &AppHandle) -> Result<(), String> {
 mod tests {
     use super::{
         dismiss_panel, refresh_memory_history, sync_core_history, ClipboardManagerCore,
-        ClipboardSelection, HistoryState,
+        HistoryState,
     };
     use clipboard_core::{ClipboardHistory, IngestOutcome};
     use macos_adapter::{PasteboardBackend, PasteboardError, PasteboardService};
@@ -1003,14 +1013,10 @@ mod tests {
         let mut core = ClipboardManagerCore::new_for_test(service);
         core.ingest_for_test("alpha");
         let id = core.history().entries()[0].id;
-        core.set_target_for_test(Some("com.example.editor".into()));
-        assert_eq!(
-            core.select(id).unwrap(),
-            ClipboardSelection {
-                text: "alpha".into(),
-                target_bundle_id: "com.example.editor".into()
-            }
-        );
+        core.capture_target().unwrap();
+        let selection = core.select(id).unwrap();
+        assert_eq!(selection.text, "alpha");
+        assert_eq!(selection.target.bundle_id, "com.example.editor");
         assert_eq!(core.history().entries().len(), 1);
     }
 
@@ -1073,17 +1079,55 @@ mod tests {
 
     #[test]
     fn dismissing_panel_only_closes_and_drops_target_application() {
-        let state = Arc::new(Mutex::new(MockState::default()));
+        let state = Arc::new(Mutex::new(MockState {
+            frontmost: Some("com.example.editor".into()),
+            ..MockState::default()
+        }));
         let service = PasteboardService::with_backend(Box::new(MockBackend { state }));
         let mut core = ClipboardManagerCore::new_for_test(service);
-        core.set_target_for_test(Some("com.example.editor".into()));
+        core.capture_target().unwrap();
         let mut panel_open = true;
 
         let mut core = Some(core);
         dismiss_panel(&mut core, &mut panel_open);
 
         assert!(!panel_open);
-        assert!(core.as_ref().unwrap().target_bundle_id.is_none());
+        assert!(core.as_ref().unwrap().target.is_none());
+    }
+
+    #[test]
+    fn manual_recovery_notice_survives_saving_and_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("history.json");
+        std::fs::write(
+            path.with_extension("bak"),
+            br#"{"schema_version":1,"next_id":2,"entries":[{"id":1,"text":"previous history","copied_at_unix_ms":1}]}"#,
+        )
+        .unwrap();
+        std::fs::write(&path, b"invalid json").unwrap();
+
+        let mut state = HistoryState::load(&path);
+        assert!(state.history.entries().is_empty());
+        let notice = state.errors.manual_recovery.clone().unwrap();
+        assert!(state.snapshot(false).last_error.unwrap().contains(&notice));
+
+        let mut current = ClipboardHistory::default();
+        current.ingest("later history".into(), 2);
+        let now = Instant::now();
+        state.collected(current.clone(), now);
+        state
+            .save_current(now, |history| super::save_history(&path, history))
+            .unwrap();
+        assert_eq!(
+            state.snapshot(false).last_error.as_deref(),
+            Some(notice.as_str())
+        );
+        let reloaded = HistoryState::load(&path);
+        assert_eq!(reloaded.history, current);
+        assert_eq!(
+            reloaded.snapshot(false).last_error.as_deref(),
+            Some(notice.as_str())
+        );
     }
 
     fn history_state_with(texts: &[&str]) -> HistoryState {

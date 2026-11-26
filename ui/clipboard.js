@@ -1,5 +1,5 @@
 const core = window.clipboardCore;
-const state = { entries: [], selectedIndex: -1, error: "", selecting: false, panelOpen: false };
+const state = { entries: [], selectedId: null, error: "", selecting: false, panelOpen: false };
 let refreshInFlight = null;
 const $ = (id) => document.getElementById(id);
 const backendInvoke = (command, args) => {
@@ -38,14 +38,11 @@ function applySnapshot(snapshot) {
   if (!staleClosedSnapshot) state.panelOpen = normalized.panelOpen;
   if (!normalized.panelOpen && !staleClosedSnapshot) {
     state.selecting = false;
-    state.selectedIndex = -1;
+    state.selectedId = null;
   } else if (normalized.operationError) {
     state.selecting = false;
   }
-  if (state.entries.length === 0) state.selectedIndex = -1;
-  else if (state.selectedIndex >= 0) {
-    state.selectedIndex = Math.min(state.selectedIndex, state.entries.length - 1);
-  }
+  if (!state.entries.some((entry) => entry.id === state.selectedId)) state.selectedId = null;
   render();
 }
 
@@ -65,15 +62,15 @@ function render() {
   $("clipboard-clear").disabled = state.selecting;
   $("clipboard-empty").hidden = state.entries.length > 0;
   $("clipboard-error").textContent = state.error;
-  state.entries.forEach((entry, index) => {
+  state.entries.forEach((entry) => {
     const item = document.createElement("article");
-    item.className = "clipboard-item" + (index === state.selectedIndex ? " selected" : "");
+    const selected = entry.id === state.selectedId;
+    item.className = "clipboard-item" + (selected ? " selected" : "");
     item.setAttribute("role", "option");
-    item.setAttribute("aria-selected", String(index === state.selectedIndex));
+    item.setAttribute("aria-selected", String(selected));
     item.addEventListener("click", () => {
       if (state.selecting) return;
-      state.selectedIndex = index;
-      render();
+      state.selectedId = entry.id;
       selectEntry(entry.id);
     });
 
@@ -112,7 +109,7 @@ async function selectEntry(id) {
     await backendInvoke("select_clipboard_item", { id });
     state.selecting = false;
     state.panelOpen = false;
-    state.selectedIndex = core.resetSelection();
+    state.selectedId = null;
     render();
   } catch (error) {
     state.selecting = false;
@@ -124,7 +121,7 @@ async function selectEntry(id) {
 async function closePanel() {
   state.selecting = false;
   state.panelOpen = false;
-  state.selectedIndex = core.resetSelection();
+  state.selectedId = null;
   render();
   try {
     await backendInvoke("close_clipboard_panel");
@@ -146,14 +143,15 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") { event.preventDefault(); closePanel(); return; }
   const target = event.target instanceof Element ? event.target : null;
   if (target?.closest("button, a, input, select, textarea, [role=button], [contenteditable]:not([contenteditable=false])")) return;
-  if (event.key === "ArrowDown" && state.entries.length) {
-    event.preventDefault(); state.selectedIndex = core.moveSelection(state.selectedIndex, 1, state.entries.length); render();
+  if ((event.key === "ArrowDown" || event.key === "ArrowUp") && state.entries.length) {
+    event.preventDefault();
+    const currentIndex = state.entries.findIndex((entry) => entry.id === state.selectedId);
+    const nextIndex = core.moveSelection(currentIndex, event.key === "ArrowDown" ? 1 : -1, state.entries.length);
+    state.selectedId = state.entries[nextIndex].id;
+    render();
   }
-  if (event.key === "ArrowUp" && state.entries.length) {
-    event.preventDefault(); state.selectedIndex = core.moveSelection(state.selectedIndex, -1, state.entries.length); render();
-  }
-  if (event.key === "Enter" && state.selectedIndex >= 0) {
-    event.preventDefault(); selectEntry(state.entries[state.selectedIndex].id);
+  if (event.key === "Enter" && state.selectedId !== null) {
+    event.preventDefault(); selectEntry(state.selectedId);
   }
 });
 document.addEventListener("click", (event) => {
@@ -164,7 +162,7 @@ if (listen) {
   Promise.resolve(listen("clipboard-show", (event) => {
     state.selecting = false;
     state.panelOpen = true;
-    state.selectedIndex = core.resetSelection();
+    state.selectedId = null;
     applySnapshot(event.payload);
     $("clipboard-list").scrollTop = 0;
     window.focus();

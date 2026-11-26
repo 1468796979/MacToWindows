@@ -1,5 +1,5 @@
 use super::*;
-use mac_to_windows_config::{import_toml, save_atomic, Profile};
+use mac_to_windows_config::{import_saved_toml, save_atomic, Profile};
 use std::path::Path;
 
 #[derive(Default)]
@@ -172,7 +172,7 @@ pub(super) fn set_enabled(
     Err("规则不存在，请刷新配置".into())
 }
 
-fn read_valid(path: &Path) -> Result<(AppConfig, bool), String> {
+fn read_valid(path: &Path) -> Result<(AppConfig, bool, Vec<String>), String> {
     let contents = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let document: toml::Value = contents.parse::<toml::Value>().map_err(|e| e.to_string())?;
     let legacy = document
@@ -180,9 +180,23 @@ fn read_valid(path: &Path) -> Result<(AppConfig, bool), String> {
         .and_then(toml::Value::as_integer)
         .unwrap_or(1)
         == 1;
-    let config = import_toml(&contents).map_err(|e| e.to_string())?;
+    let (config, disabled_rules) = import_saved_toml(&contents).map_err(|e| e.to_string())?;
     config.validate_desktop().map_err(|e| e.to_string())?;
-    Ok((config, legacy))
+    Ok((config, legacy, disabled_rules))
+}
+
+fn startup_warning(message: Option<String>, disabled_rules: &[String]) -> Option<String> {
+    if disabled_rules.is_empty() {
+        return message;
+    }
+    let disabled = format!(
+        "已停用触发键无效的滚轮反转规则（{}）",
+        disabled_rules.join("、")
+    );
+    Some(match message {
+        Some(message) => format!("{message}。{disabled}"),
+        None => disabled,
+    })
 }
 
 pub(super) fn load_startup(path: &Path) -> (AppConfig, Option<String>) {
@@ -190,12 +204,12 @@ pub(super) fn load_startup(path: &Path) -> (AppConfig, Option<String>) {
         let backup = path.with_extension("toml.bak");
         if backup.exists() {
             return match read_valid(&backup) {
-                Ok((config, _)) => {
+                Ok((config, _, disabled_rules)) => {
                     let error = match save_atomic(path, &config) {
                         Ok(()) => "主配置缺失，已恢复有效备份".into(),
                         Err(e) => format!("已在内存恢复配置备份，但写回失败：{e}"),
                     };
-                    (config, Some(error))
+                    (config, startup_warning(Some(error), &disabled_rules))
                 }
                 Err(error) => (
                     AppConfig::default(),
@@ -212,7 +226,7 @@ pub(super) fn load_startup(path: &Path) -> (AppConfig, Option<String>) {
         return (config, error);
     }
     match read_valid(path) {
-        Ok((config, legacy)) => {
+        Ok((config, legacy, disabled_rules)) => {
             let error = if legacy {
                 save_atomic(path, &config)
                     .err()
@@ -220,11 +234,11 @@ pub(super) fn load_startup(path: &Path) -> (AppConfig, Option<String>) {
             } else {
                 None
             };
-            (config, error)
+            (config, startup_warning(error, &disabled_rules))
         }
         Err(error) => {
             let backup = path.with_extension("toml.bak");
-            if let Ok((config, _)) = read_valid(&backup) {
+            if let Ok((config, _, disabled_rules)) = read_valid(&backup) {
                 let suffix = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -233,13 +247,11 @@ pub(super) fn load_startup(path: &Path) -> (AppConfig, Option<String>) {
                 let restored = std::fs::rename(path, &corrupt)
                     .map_err(|e| e.to_string())
                     .and_then(|_| save_atomic(path, &config).map_err(|e| e.to_string()));
-                return (
-                    config,
-                    Some(match restored {
-                        Ok(()) => format!("配置读取失败，已恢复有效备份并保留损坏文件：{error}"),
-                        Err(e) => format!("已在内存恢复配置备份，但写回失败：{e}"),
-                    }),
-                );
+                let message = match restored {
+                    Ok(()) => format!("配置读取失败，已恢复有效备份并保留损坏文件：{error}"),
+                    Err(e) => format!("已在内存恢复配置备份，但写回失败：{e}"),
+                };
+                return (config, startup_warning(Some(message), &disabled_rules));
             }
             (
                 AppConfig::default(),
@@ -255,6 +267,45 @@ pub(super) fn load_startup(path: &Path) -> (AppConfig, Option<String>) {
 mod tests {
     use super::*;
     use mac_to_windows_config::export_toml;
+
+    #[test]
+    fn startup_keeps_previous_rules_and_disables_only_invalid_scroll_reversal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        let mut config = AppConfig::default();
+        config.active_profile = "custom".into();
+        let rule = mac_to_windows_config::Rule {
+            name: "旧版错误滚轮反转规则".into(),
+            trigger: "key:3".into(),
+            action: "invert_scroll".into(),
+            ..Default::default()
+        };
+        config
+            .profiles
+            .get_mut("custom")
+            .unwrap()
+            .keyboard_rules
+            .push(rule.clone());
+        let old_file = toml::to_string(&config).unwrap();
+        std::fs::write(&path, &old_file).unwrap();
+
+        assert!(
+            matches!(mac_to_windows_config::import_toml(&old_file), Err(error)
+            if error.to_string().contains("profiles.custom.keyboard_rules"))
+        );
+        let (loaded, warning) = load_startup(&path);
+        assert!(warning.unwrap().contains("已停用触发键无效的滚轮反转规则"));
+        config
+            .profiles
+            .get_mut("custom")
+            .unwrap()
+            .keyboard_rules
+            .last_mut()
+            .unwrap()
+            .enabled = false;
+        assert_eq!(loaded, config);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), old_file);
+    }
 
     fn state(path: PathBuf) -> AppState {
         let mut state = AppState::from_config(AppConfig::default()).unwrap();

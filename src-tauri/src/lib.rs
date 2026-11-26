@@ -4,7 +4,7 @@ use mac_to_windows_config::AppConfig;
 use macos_adapter::{
     EventAdapter, InjectionError, InputSourceCommand, InputSourceService, SafeAdapter,
 };
-use rule_engine::{CompiledRules, RuleEngine};
+use rule_engine::{CompiledRules, KeyboardMappingPolicy, RuleEngine};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -16,6 +16,8 @@ use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 
 mod clipboard;
 mod output_ownership;
+#[cfg(test)]
+mod output_ownership_tests;
 mod settings;
 mod software_keyboard;
 #[cfg(test)]
@@ -62,6 +64,7 @@ pub enum ClipboardHotkeyAction {
 #[derive(Debug, Default)]
 pub struct ClipboardHotkeyLatch {
     active: bool,
+    forwarding_v: bool,
     left_option_down: bool,
     right_option_down: bool,
     option_state_seen: bool,
@@ -69,10 +72,7 @@ pub struct ClipboardHotkeyLatch {
 
 impl ClipboardHotkeyLatch {
     pub fn reset(&mut self) {
-        self.active = false;
-        self.left_option_down = false;
-        self.right_option_down = false;
-        self.option_state_seen = false;
+        *self = Self::default();
     }
 
     pub fn handle(&mut self, event: &NormalizedEvent) -> Option<ClipboardHotkeyAction> {
@@ -97,10 +97,7 @@ impl ClipboardHotkeyLatch {
             }
             return None;
         }
-        if event.source != event_model::DeviceSource::Keyboard
-            || event.code != event_model::PhysicalCode::key(9)
-            || matches!(event.origin, event_model::EventOrigin::TextInjection { .. })
-        {
+        if !is_clipboard_key(event) {
             return None;
         }
         let left_option_active = if self.option_state_seen {
@@ -130,6 +127,70 @@ impl ClipboardHotkeyLatch {
             _ => None,
         }
     }
+
+    #[cfg(any(target_os = "macos", test))]
+    fn delivery(
+        &mut self,
+        event: &NormalizedEvent,
+        show: impl FnOnce() -> bool,
+    ) -> Option<ClipboardHotkeyDelivery> {
+        if self.forwarding_v && is_clipboard_key(event) {
+            if event.phase == event_model::EventPhase::Up {
+                self.forwarding_v = false;
+            }
+            return Some(ClipboardHotkeyDelivery::Forward);
+        }
+        match self.handle(event)? {
+            ClipboardHotkeyAction::Show if !show() => {
+                self.active = false;
+                self.forwarding_v = true;
+                Some(ClipboardHotkeyDelivery::Forward)
+            }
+            _ => Some(ClipboardHotkeyDelivery::Suppress),
+        }
+    }
+}
+
+fn is_clipboard_key(event: &NormalizedEvent) -> bool {
+    event.source == event_model::DeviceSource::Keyboard
+        && event.code == event_model::PhysicalCode::key(9)
+        && !matches!(event.origin, event_model::EventOrigin::TextInjection { .. })
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug, PartialEq, Eq)]
+enum ClipboardHotkeyDelivery {
+    Forward,
+    Suppress,
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+struct RuleRecordingKeys(std::collections::HashSet<event_model::PhysicalCode>);
+
+#[cfg(any(target_os = "macos", test))]
+impl RuleRecordingKeys {
+    fn forward(&mut self, event: &NormalizedEvent, recording: bool, already_bound: bool) -> bool {
+        use event_model::{EventKind, EventPhase, ModifierSet, PhysicalCode};
+
+        let phase = match (event.kind, event.phase) {
+            (EventKind::FlagsChanged, EventPhase::Changed) => match event.code {
+                PhysicalCode::Key(57) => return recording && !already_bound,
+                _ if event.modifiers == ModifierSet::NONE => EventPhase::Up,
+                _ => EventPhase::Down,
+            },
+            (EventKind::Keyboard | EventKind::FlagsChanged, phase) => phase,
+            _ => return false,
+        };
+        match phase {
+            EventPhase::Up => self.0.remove(&event.code),
+            EventPhase::Down if recording && !already_bound => {
+                self.0.insert(event.code);
+                true
+            }
+            _ => self.0.contains(&event.code),
+        }
+    }
 }
 
 pub struct RuntimeController {
@@ -140,6 +201,7 @@ pub struct RuntimeController {
     output_transaction: u64,
     adapter: SafeAdapter,
     input_source: Option<InputSourceService>,
+    input_source_request_error: Option<String>,
     clipboard: Option<Arc<clipboard::ClipboardManager>>,
     diagnostics: Arc<Diagnostics>,
     external_keyboard_pending: Arc<AtomicBool>,
@@ -208,7 +270,9 @@ impl AppState {
 pub struct EventRuntime {
     started: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
+    rule_recording: Arc<AtomicBool>,
     thread: Mutex<Option<JoinHandle<()>>>,
+    start_error: Mutex<Option<String>>,
 }
 
 impl EventRuntime {
@@ -225,11 +289,28 @@ impl EventRuntime {
             return Ok(());
         }
         self.stop.store(false, Ordering::Release);
+        let result = self.start_thread(runtime, clipboard);
+        if let Ok(mut error) = self.start_error.lock() {
+            *error = result.as_ref().err().cloned();
+        }
+        result
+    }
+
+    fn last_start_error(&self) -> Option<String> {
+        self.start_error.lock().ok()?.clone()
+    }
+
+    fn start_thread(
+        &self,
+        runtime: Arc<Mutex<RuntimeController>>,
+        clipboard: Option<Arc<clipboard::ClipboardManager>>,
+    ) -> Result<(), String> {
         #[cfg(target_os = "macos")]
         {
             let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
             let stopped = Arc::clone(&self.stop);
             let started = Arc::clone(&self.started);
+            let rule_recording = Arc::clone(&self.rule_recording);
             let thread = std::thread::Builder::new()
                 .name("mac-to-windows-event-tap".into())
                 .spawn(move || {
@@ -252,12 +333,14 @@ impl EventRuntime {
                         });
                     let mut normalizer = macos_adapter::EventNormalizer::new(marker);
                     let mut clipboard_hotkey = ClipboardHotkeyLatch::default();
+                    let mut recording_keys = RuleRecordingKeys::default();
                     let keyboard_sources = macos_adapter::KeyboardSourceCache::start();
                     let mut keyboard_routes = macos_adapter::KeyboardRoutingState::default();
                     let tap = macos_adapter::EventTap::create(event_mask(), move |raw| {
                         if raw.is_tap_disabled() {
                             normalizer.reset();
                             clipboard_hotkey.reset();
+                            recording_keys.0.clear();
                             keyboard_routes.reset();
                             if let Ok(mut controller) = callback_runtime.lock() {
                                 controller.reset_keyboard_continuity();
@@ -292,34 +375,70 @@ impl EventRuntime {
                         let Some(event) = normalizer.normalize(raw) else {
                             return macos_adapter::EventTapAction::Pass;
                         };
-                        if let Some(action) = clipboard_hotkey.handle(&event) {
-                            if action == ClipboardHotkeyAction::Show {
-                                if let Some(manager) = &clipboard {
-                                    let _ = manager.try_show();
+                        let mut inject = |outputs: &[OutputEvent], marker| unsafe {
+                            macos_adapter::inject_outputs_with_context(
+                                outputs,
+                                marker,
+                                raw.proxy(),
+                                raw.raw_event(),
+                            )
+                        };
+                        let recording = rule_recording.load(Ordering::Acquire);
+                        if (recording || !recording_keys.0.is_empty())
+                            && !is_emergency_hotkey(&event)
+                        {
+                            if let Ok(mut controller) = callback_runtime.lock() {
+                                let already_bound =
+                                    controller.engine.state().physical_down(event.code)
+                                        || controller
+                                            .output_ownership
+                                            .has_native(InputStream::Local, event.code)
+                                        || (is_clipboard_key(&event)
+                                            && (clipboard_hotkey.active
+                                                || clipboard_hotkey.forwarding_v));
+                                if recording_keys.forward(&event, recording, already_bound) {
+                                    if event.kind == event_model::EventKind::FlagsChanged {
+                                        clipboard_hotkey.handle(&event);
+                                    }
+                                    return if controller
+                                        .pass_unmapped_local_keyboard(&event, &mut inject)
+                                        == Decision::Pass
+                                    {
+                                        macos_adapter::EventTapAction::Pass
+                                    } else {
+                                        macos_adapter::EventTapAction::Suppress
+                                    };
                                 }
                             }
+                        }
+                        let hotkey = clipboard_hotkey.delivery(&event, || {
+                            clipboard.as_ref().is_some_and(|manager| manager.try_show())
+                        });
+                        if hotkey == Some(ClipboardHotkeyDelivery::Suppress) {
                             return macos_adapter::EventTapAction::Suppress;
                         }
+                        let forward_hotkey = hotkey == Some(ClipboardHotkeyDelivery::Forward);
                         let decision = callback_runtime
                             .lock()
                             .map(|mut controller| {
-                                let decision = controller.process_event_marked(
-                                    &event,
-                                    |outputs, marker| unsafe {
-                                        macos_adapter::inject_outputs_with_context(
-                                            outputs,
-                                            marker,
-                                            raw.proxy(),
-                                            raw.raw_event(),
-                                        )
-                                    },
-                                );
+                                let decision = if forward_hotkey {
+                                    controller.pass_unmapped_local_keyboard(&event, &mut inject)
+                                } else {
+                                    controller.process_event_marked(&event, &mut inject)
+                                };
                                 if decision == Decision::Pass {
                                     if let Some(metadata) = raw.keyboard_metadata() {
+                                        let modifiers = if forward_hotkey
+                                            && controller.status == RuntimeStatus::Running
+                                        {
+                                            controller.engine.modifiers_for_event(&event)
+                                        } else {
+                                            metadata.modifiers
+                                        };
                                         let flags =
                                             controller.output_ownership.modifiers_with_preserved(
                                                 InputStream::Local,
-                                                metadata.modifiers,
+                                                modifiers,
                                             );
                                         if flags != metadata.modifiers {
                                             let _ = unsafe {
@@ -387,6 +506,7 @@ impl EventRuntime {
     }
 
     pub fn shutdown(&self, runtime: &Mutex<RuntimeController>) -> Result<(), String> {
+        self.rule_recording.store(false, Ordering::Release);
         self.stop.store(true, Ordering::Release);
         let thread = self
             .thread
@@ -585,7 +705,9 @@ pub struct RuntimeView {
     pub listen_access: bool,
     pub post_access: bool,
     pub event_runtime_started: bool,
+    pub event_runtime_error: Option<String>,
     pub input_source: String,
+    pub input_source_error: Option<String>,
     pub clipboard_status: String,
     pub last_error: Option<String>,
     pub pending_releases: usize,
@@ -600,13 +722,14 @@ impl RuntimeController {
         #[cfg(not(test))]
         let input_source = InputSourceService::start().ok();
         Self {
-            engine: RuleEngine::new(rules.clone()),
+            engine: RuleEngine::with_external_output_ownership(rules.clone()),
             active_rules: rules,
             software: HashMap::new(),
             output_ownership: OutputOwnership::default(),
             output_transaction: 0,
             adapter,
             input_source,
+            input_source_request_error: None,
             clipboard: None,
             diagnostics,
             external_keyboard_pending: Arc::new(AtomicBool::new(false)),
@@ -672,16 +795,12 @@ impl RuntimeController {
             self.reset_keyboard_continuity();
         }
         let mut releases = std::mem::take(&mut self.pending_releases);
-        let local = self.engine.release_all();
-        let mut all = self
-            .output_ownership
-            .filter(OutputOwner::Mapped(InputStream::Local), &local);
+        self.engine.clear_bindings();
+        let mut all = self.output_ownership.release_mapped(InputStream::Local);
         for (id, session) in &mut self.software {
             let stream = InputStream::Software(*id);
-            all.extend(
-                self.output_ownership
-                    .filter(OutputOwner::Mapped(stream), &session.engine.release_all()),
-            );
+            session.engine.clear_bindings();
+            all.extend(self.output_ownership.release_mapped(stream));
             all.extend(self.output_ownership.filter(
                 OutputOwner::ApplicationSwitch(stream),
                 &session.switcher.release(event_model::ModifierSet::NONE),
@@ -868,18 +987,7 @@ impl RuntimeController {
             return Decision::Pass;
         }
         if self.status != RuntimeStatus::Running {
-            self.output_ownership.native_pass(InputStream::Local, event);
-            self.diagnostics.record_passed();
-            return Decision::Pass;
-        }
-        if let Some(error) = self
-            .input_source
-            .as_ref()
-            .and_then(|service| service.take_last_error())
-        {
-            self.degrade_with(format!("输入源服务异常：{error:?}"), &mut inject);
-            self.diagnostics.record_passed();
-            return Decision::Pass;
+            return self.pass_local_event(event);
         }
         let pinyin_toggle_available = self
             .input_source
@@ -894,40 +1002,73 @@ impl RuntimeController {
             .unwrap_or(false);
         self.engine.set_pinyin_active(pinyin_toggle_available);
         let checkpoint = self.engine.checkpoint();
-        let decision = self.engine.handle(event);
+        let (decision, native_binding) = self
+            .engine
+            .handle_with_binding(event, KeyboardMappingPolicy::Full);
         match decision {
-            Decision::Pass => {
-                if !self.output_ownership.native_pass(InputStream::Local, event) {
-                    self.diagnostics.record_suppressed();
-                    return Decision::Suppress;
-                }
-                self.diagnostics.record_passed();
-                Decision::Pass
-            }
+            Decision::Pass => self.pass_local_event(event),
             Decision::Suppress => {
                 self.diagnostics.record_suppressed();
                 Decision::Suppress
             }
-            Decision::Emit(outputs) => match self.dispatch_outputs_for(
-                InputStream::Local,
-                OutputOwner::Mapped(InputStream::Local),
-                &outputs,
-                self.engine.modifiers_for_event(event),
-                &mut inject,
-            ) {
-                Ok(()) => {
-                    self.diagnostics.record_injected();
-                    self.diagnostics.record_suppressed();
-                    Decision::Suppress
+            Decision::Emit(outputs) => {
+                let stream = InputStream::Local;
+                let owner = if event.kind == event_model::EventKind::Scroll {
+                    self.next_transient_output(stream)
+                } else {
+                    OutputOwner::for_binding(stream, event.code, native_binding)
+                };
+                match self.dispatch_outputs_for(
+                    stream,
+                    owner,
+                    &outputs,
+                    self.engine.modifiers_for_event(event),
+                    &mut inject,
+                ) {
+                    Ok(()) => {
+                        self.diagnostics.record_injected();
+                        self.diagnostics.record_suppressed();
+                        Decision::Suppress
+                    }
+                    Err(error) => {
+                        self.engine.restore(checkpoint);
+                        self.degrade_with(format!("事件注入失败：{error}"), &mut inject);
+                        self.pass_local_event(event)
+                    }
                 }
-                Err(error) => {
-                    self.engine.restore(checkpoint);
-                    self.degrade_with(format!("事件注入失败：{error}"), &mut inject);
-                    self.diagnostics.record_passed();
-                    Decision::Pass
-                }
-            },
+            }
         }
+    }
+
+    fn pass_local_event(&mut self, event: &NormalizedEvent) -> Decision {
+        if self.output_ownership.native_pass(InputStream::Local, event) {
+            self.diagnostics.record_passed();
+            Decision::Pass
+        } else {
+            self.diagnostics.record_suppressed();
+            Decision::Suppress
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn pass_unmapped_local_keyboard<F>(
+        &mut self,
+        event: &NormalizedEvent,
+        inject: &mut F,
+    ) -> Decision
+    where
+        F: FnMut(&[OutputEvent], u64) -> Result<(), InjectionError>,
+    {
+        self.diagnostics.record_seen();
+        self.consume_external_keyboard_activity();
+        self.interrupt_keyboard_gestures();
+        let _ = self.close_software_switchers(None, inject);
+        self.pass_local_event(event)
+    }
+
+    fn next_transient_output(&mut self, stream: InputStream) -> OutputOwner {
+        self.output_transaction = self.output_transaction.wrapping_add(1);
+        OutputOwner::Transient(stream, self.output_transaction)
     }
 
     fn consume_external_keyboard_activity(&mut self) -> bool {
@@ -940,6 +1081,25 @@ impl RuntimeController {
         } else {
             false
         }
+    }
+
+    fn input_source_error(&self) -> Option<String> {
+        self.input_source_request_error.clone().or_else(|| {
+            self.input_source
+                .as_ref()?
+                .last_error()
+                .map(|error| format!("输入源切换提示：{error}"))
+        })
+    }
+
+    fn request_input_source(&mut self, command: InputSourceCommand) {
+        self.input_source_request_error = match &self.input_source {
+            Some(service) => service
+                .request(command)
+                .err()
+                .map(|error| format!("输入源切换失败：{error}")),
+            None => Some("输入源服务不可用".into()),
+        };
     }
 
     fn dispatch_outputs_for<F>(
@@ -956,66 +1116,41 @@ impl RuntimeController {
         let mut regular = Vec::new();
         let mut ownership = self.output_ownership.clone();
         let mut restore_modifiers = false;
-        let mut input_source_error = None;
+        let mut dispatch_error = None;
         for output in outputs {
             match output {
                 OutputEvent::SystemShortcut(SystemShortcut::SwitchInputSource) => {
-                    if let Some(service) = &self.input_source {
-                        if let Err(error) = service.request(InputSourceCommand::Next) {
-                            input_source_error = Some(InjectionError::Failed(format!(
-                                "input source switch failed: {error:?}"
-                            )));
-                        }
-                    } else {
-                        input_source_error = Some(InjectionError::Unavailable);
-                    }
+                    self.request_input_source(InputSourceCommand::Next);
                 }
                 OutputEvent::SystemShortcut(SystemShortcut::TogglePinyinEnglish) => {
-                    if let Some(service) = &self.input_source {
-                        if let Err(error) = service.request(InputSourceCommand::TogglePinyinEnglish)
-                        {
-                            input_source_error = Some(InjectionError::Failed(format!(
-                                "pinyin toggle failed: {error:?}"
-                            )));
-                        }
-                    } else {
-                        input_source_error = Some(InjectionError::Unavailable);
-                    }
+                    self.request_input_source(InputSourceCommand::TogglePinyinEnglish);
                 }
                 OutputEvent::SystemShortcut(SystemShortcut::ShowClipboard) => {
                     if let Some(manager) = &self.clipboard {
                         if !manager.try_show() {
-                            input_source_error = Some(InjectionError::Unavailable);
+                            dispatch_error = Some(InjectionError::Unavailable);
                         }
                     } else {
-                        input_source_error = Some(InjectionError::Unavailable);
+                        dispatch_error = Some(InjectionError::Unavailable);
                     }
                 }
                 OutputEvent::SystemShortcut(SystemShortcut::ShowDesktop) => {
                     restore_modifiers = true;
                     let config = self.config.clone().unwrap_or_default();
                     match config.show_desktop_output() {
-                        Ok(outputs) => {
-                            self.output_transaction = self.output_transaction.wrapping_add(1);
-                            regular.extend(ownership.filter(
-                                OutputOwner::Transient(stream, self.output_transaction),
-                                &outputs,
-                            ));
-                        }
+                        Ok(outputs) => regular
+                            .extend(ownership.filter(self.next_transient_output(stream), &outputs)),
                         Err(error) => {
-                            input_source_error = Some(InjectionError::Failed(error.to_string()))
+                            dispatch_error = Some(InjectionError::Failed(error.to_string()))
                         }
                     }
                 }
                 OutputEvent::SystemShortcut(shortcut) => {
                     restore_modifiers = true;
-                    self.output_transaction = self.output_transaction.wrapping_add(1);
                     match macos_adapter::expand_system_shortcut(*shortcut) {
-                        Ok(outputs) => regular.extend(ownership.filter(
-                            OutputOwner::Transient(stream, self.output_transaction),
-                            &outputs,
-                        )),
-                        Err(error) => input_source_error = Some(error),
+                        Ok(outputs) => regular
+                            .extend(ownership.filter(self.next_transient_output(stream), &outputs)),
+                        Err(error) => dispatch_error = Some(error),
                     }
                 }
                 other => {
@@ -1028,11 +1163,9 @@ impl RuntimeController {
                 ownership.modifiers_with_preserved(stream, restore_flags),
             ));
         }
-        if let Some(error) = input_source_error {
-            // The event tap must fall back to the original event when the
-            // worker cannot complete the TIS request. Do not inject the
-            // synthetic release collected alongside the shortcut, otherwise
-            // returning Pass below would duplicate that release.
+        if let Some(error) = dispatch_error {
+            // Give the original event back to the caller without posting
+            // any synthetic events from the rejected batch.
             Err(error)
         } else if !regular.is_empty() {
             inject(&regular, self.adapter.own_marker())?;
@@ -1138,9 +1271,18 @@ fn should_restore_main_window(has_visible_windows: bool) -> bool {
     !has_visible_windows
 }
 
-fn start_status_notifications(app: tauri::AppHandle) {
+fn mode_menu_label(status: &RuntimeStatus) -> &'static str {
+    if *status == RuntimeStatus::Running {
+        "暂停 Windows 模式"
+    } else {
+        "启用 Windows 模式"
+    }
+}
+
+fn start_status_notifications(app: tauri::AppHandle, toggle: tauri::menu::MenuItem<tauri::Wry>) {
     std::thread::spawn(move || {
         let mut previous = None;
+        let mut previous_menu_label = mode_menu_label(&RuntimeStatus::Disabled);
         loop {
             let state = app.state::<AppState>();
             if state.shutdown_started.load(Ordering::Acquire) {
@@ -1152,9 +1294,17 @@ fn start_status_notifications(app: tauri::AppHandle) {
                     r.status.clone(),
                     r.config_revision,
                     r.last_error.clone(),
+                    r.input_source_error(),
                     r.pending_releases.len(),
+                    state.event_runtime.last_start_error(),
                 )
             });
+            if let Some(current) = &current {
+                let label = mode_menu_label(&current.0);
+                if label != previous_menu_label && toggle.set_text(label).is_ok() {
+                    previous_menu_label = label;
+                }
+            }
             if current != previous {
                 previous = current;
                 let _ = app.emit("runtime-changed", ());
@@ -1216,6 +1366,7 @@ pub fn run() {
             commands::release_all,
             commands::emergency_disable,
             commands::add_rule,
+            commands::set_rule_recording,
             commands::export_config,
             commands::import_config,
             commands::reload_permissions,
@@ -1231,11 +1382,15 @@ pub fn run() {
             use tauri::tray::TrayIconBuilder;
             if let Some(main_window) = app.get_webview_window("main") {
                 let close_target = main_window.clone();
-                main_window.on_window_event(move |event| {
-                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                let recording = Arc::clone(&app.state::<AppState>().event_runtime.rule_recording);
+                main_window.on_window_event(move |event| match event {
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        recording.store(false, Ordering::Release);
                         api.prevent_close();
                         let _ = close_target.hide();
                     }
+                    tauri::WindowEvent::Focused(false) => recording.store(false, Ordering::Release),
+                    _ => {}
                 });
             }
             WebviewWindowBuilder::new(app, "clipboard", WebviewUrl::App("clipboard.html".into()))
@@ -1249,7 +1404,6 @@ pub fn run() {
                 .skip_taskbar(true)
                 .center()
                 .build()?;
-            start_status_notifications(app.handle().clone());
             let state = app.state::<AppState>();
             let manager = clipboard::ClipboardManager::start_with_marker(
                 app.handle().clone(),
@@ -1262,28 +1416,49 @@ pub fn run() {
                 .event_runtime
                 .start(Arc::clone(&state.runtime), Some(manager));
             let open = MenuItem::with_id(app, "open", "打开设置", true, None::<&str>)?;
-            let toggle = MenuItem::with_id(app, "toggle", "启用 Windows 模式", true, None::<&str>)?;
+            let toggle = MenuItem::with_id(
+                app,
+                "toggle",
+                mode_menu_label(&RuntimeStatus::Disabled),
+                true,
+                None::<&str>,
+            )?;
             let quit = MenuItem::with_id(app, "quit", "退出", true, None::<&str>)?;
             let menu = Menu::with_items(app, &[&open, &toggle, &quit])?;
-            TrayIconBuilder::new()
-                .menu(&menu)
-                .on_menu_event(|app, event| match event.id().as_ref() {
-                    "open" => {
-                        if let Some(window) = app.get_webview_window("main") {
-                            let _ = window.show();
-                            let _ = window.set_focus();
+            let tray = TrayIconBuilder::new().menu(&menu).tooltip("MacToWindows");
+            let tray = match app.default_window_icon() {
+                Some(icon) => tray.icon(icon.clone()),
+                None => tray.title("MacToWindows"),
+            };
+            tray.on_menu_event(|app, event| match event.id().as_ref() {
+                "open" => {
+                    if let Some(window) = app.get_webview_window("main") {
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                }
+                "toggle" => {
+                    let app = app.clone();
+                    std::thread::spawn(move || {
+                        let state = app.state::<AppState>();
+                        if let Err(error) = commands::toggle_mode_impl(&state) {
+                            if let Ok(mut runtime) = state.runtime.lock() {
+                                runtime.last_error.get_or_insert_with(|| {
+                                    format!("切换 Windows 模式失败：{error}")
+                                });
+                            }
+                            if let Some(window) = app.get_webview_window("main") {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
                         }
-                    }
-                    "toggle" => {
-                        let app = app.clone();
-                        std::thread::spawn(move || {
-                            let _ = commands::toggle_mode_impl(&app.state::<AppState>());
-                        });
-                    }
-                    "quit" => app.exit(0),
-                    _ => {}
-                })
-                .build(app)?;
+                    });
+                }
+                "quit" => app.exit(0),
+                _ => {}
+            })
+            .build(app)?;
+            start_status_notifications(app.handle().clone(), toggle);
             Ok(())
         })
         .build(tauri::generate_context!())
@@ -1349,7 +1524,9 @@ fn runtime_view(state: &AppState, runtime: &RuntimeController) -> RuntimeView {
         listen_access,
         post_access,
         event_runtime_started: state.event_runtime.is_started(),
+        event_runtime_error: state.event_runtime.last_start_error(),
         input_source,
+        input_source_error: runtime.input_source_error(),
         clipboard_status,
         last_error: runtime.last_error.clone(),
         pending_releases: runtime.pending_releases.len(),
@@ -1364,6 +1541,25 @@ pub mod commands {
         tauri::async_runtime::spawn_blocking(move || toggle_mode_impl(&app.state::<AppState>()))
             .await
             .map_err(|e| e.to_string())?
+    }
+
+    #[tauri::command]
+    pub fn set_rule_recording(
+        window: tauri::WebviewWindow,
+        state: tauri::State<'_, AppState>,
+        active: bool,
+    ) -> Result<(), String> {
+        if window.label() != "main" {
+            return Err("只有设置窗口可以录制按键".into());
+        }
+        if active && !window.is_focused().map_err(|error| error.to_string())? {
+            return Err("请先聚焦设置窗口".into());
+        }
+        state
+            .event_runtime
+            .rule_recording
+            .store(active, Ordering::Release);
+        Ok(())
     }
 
     pub(super) fn toggle_mode_impl(state: &AppState) -> Result<bool, String> {
@@ -1397,7 +1593,9 @@ pub mod commands {
                         .runtime
                         .lock()
                         .map_err(|_| "runtime lock poisoned".to_owned())?;
-                    let _ = runtime.apply(RuntimeCommand::Disable);
+                    if let Ok(outputs) = runtime.apply(RuntimeCommand::Disable) {
+                        let _ = flush_outputs(&mut runtime, &outputs);
+                    }
                     return Err(error);
                 }
                 Ok(true)
@@ -2583,6 +2781,98 @@ mod tests {
         let config = AppConfig::default();
         let state = AppState::from_config(config).unwrap();
         assert!(!state.event_runtime.is_started());
+    }
+
+    #[test]
+    fn input_source_unavailable_is_reported_without_disabling_mappings() {
+        let mut controller = controller_with_rule();
+        controller.status = RuntimeStatus::Running;
+        controller.request_input_source(InputSourceCommand::TogglePinyinEnglish);
+        assert!(controller.input_source_error().is_some());
+        assert_eq!(controller.status(), &RuntimeStatus::Running);
+        let mut outputs = Vec::new();
+        controller.process_event(&key(), |batch| {
+            outputs.extend_from_slice(batch);
+            Ok(())
+        });
+        assert!(matches!(
+            outputs.as_slice(),
+            [OutputEvent::Key {
+                code: PhysicalCode::Key(1),
+                phase: EventPhase::Down,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn recording_keeps_raw_key_tails_and_leaves_existing_bindings_to_the_runtime() {
+        let mut recording = RuleRecordingKeys::default();
+        let down = key();
+        let repeat = NormalizedEvent {
+            phase: EventPhase::Repeat,
+            ..down.clone()
+        };
+        let up = NormalizedEvent {
+            phase: EventPhase::Up,
+            ..down.clone()
+        };
+        assert!(!recording.forward(&down, true, true));
+        assert!(!recording.forward(&up, true, true));
+        assert!(recording.forward(&down, true, false));
+        assert!(recording.forward(&repeat, false, true));
+        assert!(recording.forward(&up, false, true));
+        assert!(!recording.forward(&down, false, false));
+
+        let option_down = keyboard_event(
+            58,
+            EventPhase::Changed,
+            ModifierSet::LEFT_OPTION,
+            EventKind::FlagsChanged,
+        );
+        let option_up = NormalizedEvent {
+            modifiers: ModifierSet::NONE,
+            ..option_down.clone()
+        };
+        assert!(recording.forward(&option_down, true, false));
+        assert!(recording.forward(&option_up, false, true));
+        assert!(recording.0.is_empty());
+    }
+
+    #[test]
+    fn rejected_clipboard_request_forwards_the_complete_key_sequence() {
+        use ClipboardHotkeyDelivery::{Forward, Suppress};
+        let mut latch = ClipboardHotkeyLatch::default();
+        let down = keyboard_event(
+            9,
+            EventPhase::Down,
+            ModifierSet::LEFT_OPTION,
+            EventKind::Keyboard,
+        );
+        let repeat = NormalizedEvent {
+            phase: EventPhase::Repeat,
+            ..down.clone()
+        };
+        let up = NormalizedEvent {
+            phase: EventPhase::Up,
+            modifiers: ModifierSet::NONE,
+            ..down.clone()
+        };
+
+        assert_eq!(latch.delivery(&down, || false), Some(Forward));
+        assert_eq!(
+            latch.delivery(&repeat, || panic!("retry before key Up")),
+            Some(Forward)
+        );
+        assert_eq!(
+            latch.delivery(&up, || panic!("retry on key Up")),
+            Some(Forward)
+        );
+        assert_eq!(latch.delivery(&down, || true), Some(Suppress));
+        assert_eq!(
+            latch.delivery(&up, || panic!("retry on key Up")),
+            Some(Suppress)
+        );
     }
 
     #[test]

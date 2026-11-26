@@ -560,7 +560,7 @@ mod deferred_tests {
 
 impl SoftwareSession {
     pub fn new(rules: CompiledRules, marker: u64, force_full: bool) -> Self {
-        let mut engine = RuleEngine::new(rules);
+        let mut engine = RuleEngine::with_external_output_ownership(rules);
         engine.set_software_input(true);
         Self {
             engine,
@@ -923,19 +923,16 @@ impl RuntimeController {
         for old in retired {
             if let Some(mut session) = self.software.remove(&old) {
                 let stream = InputStream::Software(old);
-                let checkpoint = session.engine.checkpoint();
-                let releases = session.engine.release_all();
-                if let Err(error) = self.dispatch_outputs_for(
-                    stream,
-                    OutputOwner::Mapped(stream),
-                    &releases,
-                    M::NONE,
-                    &mut *inject,
-                ) {
-                    session.engine.restore(checkpoint);
-                    self.software.insert(old, session);
-                    return Err(error);
+                let mut ownership = self.output_ownership.clone();
+                let releases = ownership.release_mapped(stream);
+                if !releases.is_empty() {
+                    if let Err(error) = inject(&releases, self.own_marker()) {
+                        self.software.insert(old, session);
+                        return Err(error);
+                    }
                 }
+                self.output_ownership = ownership;
+                session.engine.clear_bindings();
                 let checkpoint = session.switcher.clone();
                 let releases = session.switcher.release(M::NONE);
                 if let Err(error) = self.dispatch_outputs_for(
@@ -1097,17 +1094,6 @@ impl RuntimeController {
             self.diagnostics.record_passed();
             return pass();
         }
-        if self.status == RuntimeStatus::Running {
-            if let Some(error) = self
-                .input_source
-                .as_ref()
-                .and_then(|service| service.take_last_error())
-            {
-                self.degrade_with(format!("输入源服务异常：{error:?}"), &mut inject);
-                self.diagnostics.record_passed();
-                return self.software_fallback(id, event);
-            }
-        }
         let stream = InputStream::Software(id);
         let mut session = self.software.remove(&id).unwrap();
         session.last_used = std::time::Instant::now();
@@ -1127,7 +1113,7 @@ impl RuntimeController {
         });
         session.engine.set_pinyin_active(pinyin);
         let mut original_modifiers = None;
-        let mut owner = OutputOwner::Mapped(stream);
+        let mut owner = OutputOwner::Native(stream);
         let mut pass_after_effects = false;
         let mut decision = if let Some(rewrite_flags) = session.raw_keys.get(&event.code).copied() {
             original_modifiers = rewrite_flags.then(|| session.engine.modifiers_for_event(event));
@@ -1186,13 +1172,25 @@ impl RuntimeController {
                     return self.software_fallback(id, event);
                 }
             }
-            session.engine.handle_with_policy(event, policy)
+            let (decision, native_binding) = session.engine.handle_with_binding(event, policy);
+            owner = OutputOwner::for_binding(stream, event.code, native_binding);
+            decision
         };
         if let Decision::Emit(outputs) = &decision {
             let mut effects = outputs.clone();
             if event.phase == EventPhase::Up && self.output_ownership.has_native(stream, event.code)
             {
-                effects.retain(|output| !matches!(output, OutputEvent::Key {code,phase:EventPhase::Up,..} if *code == event.code));
+                effects.retain(|output| match output {
+                    OutputEvent::Key {
+                        code,
+                        phase: EventPhase::Up,
+                        modifiers,
+                    } if *code == event.code && owner == OutputOwner::Native(stream) => {
+                        original_modifiers = Some(*modifiers);
+                        false
+                    }
+                    _ => true,
+                });
                 pass_after_effects = true;
             }
             if let Err(error) = self.dispatch_outputs_for(

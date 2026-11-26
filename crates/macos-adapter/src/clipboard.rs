@@ -22,9 +22,48 @@ pub struct PasteboardChange {
     pub text: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ForegroundApplication {
     pub bundle_id: String,
+    #[cfg(target_os = "macos")]
+    instance: Option<objc2::rc::Retained<objc2_app_kit::NSRunningApplication>>,
+    #[cfg(target_os = "macos")]
+    pid: i32,
+}
+
+impl ForegroundApplication {
+    pub fn same_instance(&self, other: &Self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            use objc2_foundation::NSObjectProtocol;
+            self.pid > 0
+                && self.pid == other.pid
+                && self
+                    .instance
+                    .as_ref()
+                    .zip(other.instance.as_ref())
+                    .is_some_and(|(left, right)| !left.isTerminated() && left.isEqual(Some(right)))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = other;
+            false
+        }
+    }
+
+    /// Requests activation of the captured application instance on the main thread.
+    pub fn activate(&self) -> Result<(), PasteboardError> {
+        platform::activate_instance(self)
+    }
+
+    /// Posts the clipboard shortcut to this instance only while it is frontmost.
+    pub fn paste_if_frontmost(
+        &self,
+        marker: u64,
+        selection_is_current: impl FnOnce() -> bool,
+    ) -> Result<(), String> {
+        platform::paste_if_frontmost(self, marker, selection_is_current)
+    }
 }
 
 /// Reads the frontmost application using the platform's application APIs.
@@ -122,7 +161,13 @@ impl PasteboardService {
         Ok(self
             .backend
             .frontmost_bundle_id()?
-            .map(|bundle_id| ForegroundApplication { bundle_id }))
+            .map(|bundle_id| ForegroundApplication {
+                bundle_id,
+                #[cfg(target_os = "macos")]
+                instance: None,
+                #[cfg(target_os = "macos")]
+                pid: 0,
+            }))
     }
 
     pub fn activate_application(&mut self, bundle_id: &str) -> Result<(), PasteboardError> {
@@ -132,13 +177,14 @@ impl PasteboardService {
 
 #[cfg(target_os = "macos")]
 mod platform {
-    use super::{PasteboardBackend, PasteboardError};
-    use objc2::MainThreadMarker;
+    use super::{ForegroundApplication, PasteboardBackend, PasteboardError};
+    use event_model::{EventPhase, ModifierSet, OutputEvent, PhysicalCode};
+    use objc2::{sel, MainThreadMarker};
     use objc2_app_kit::{
         NSApplication, NSApplicationActivationOptions, NSPasteboard, NSPasteboardType,
         NSPasteboardTypeString, NSRunningApplication, NSWorkspace,
     };
-    use objc2_foundation::NSString;
+    use objc2_foundation::{NSObjectProtocol, NSString};
 
     pub struct PlatformPasteboard {
         pasteboard: objc2::rc::Retained<NSPasteboard>,
@@ -189,14 +235,16 @@ mod platform {
         }
     }
 
-    pub fn frontmost_application() -> Result<Option<super::ForegroundApplication>, PasteboardError>
-    {
-        Ok(NSWorkspace::sharedWorkspace()
-            .frontmostApplication()
-            .and_then(|application| application.bundleIdentifier())
-            .map(|bundle_id| super::ForegroundApplication {
+    pub fn frontmost_application() -> Result<Option<ForegroundApplication>, PasteboardError> {
+        let application = NSWorkspace::sharedWorkspace().frontmostApplication();
+        Ok(application.and_then(|instance| {
+            let bundle_id = instance.bundleIdentifier()?;
+            Some(ForegroundApplication {
                 bundle_id: bundle_id.to_string(),
-            }))
+                pid: instance.processIdentifier(),
+                instance: Some(instance),
+            })
+        }))
     }
 
     pub fn activate_application(bundle_id: &str) -> Result<(), PasteboardError> {
@@ -206,37 +254,84 @@ mod platform {
         let Some(application) = applications.firstObject() else {
             return Err(PasteboardError::ApplicationUnavailable);
         };
+        activate_running_application(&application)
+    }
+
+    pub fn activate_instance(target: &ForegroundApplication) -> Result<(), PasteboardError> {
+        let application = target
+            .instance
+            .as_deref()
+            .ok_or(PasteboardError::ApplicationUnavailable)?;
+        if target.pid <= 0 || target.pid != application.processIdentifier() {
+            return Err(PasteboardError::ApplicationUnavailable);
+        }
+        activate_running_application(application)
+    }
+
+    fn activate_running_application(
+        application: &NSRunningApplication,
+    ) -> Result<(), PasteboardError> {
         if application.isTerminated() {
             return Err(PasteboardError::ApplicationUnavailable);
         }
         let Some(mtm) = MainThreadMarker::new() else {
             return Err(PasteboardError::ApplicationUnavailable);
         };
-        let current = NSRunningApplication::currentApplication();
-        NSApplication::sharedApplication(mtm).yieldActivationToApplication(&application);
         let _ = application.unhide();
         #[allow(deprecated)]
         let options = NSApplicationActivationOptions::ActivateAllWindows
             | NSApplicationActivationOptions::ActivateIgnoringOtherApps;
-        if application.activateFromApplication_options(&current, options)
-            || application.activateWithOptions(options)
-            || application.isActive()
+        let owner = NSApplication::sharedApplication(mtm);
+        if owner.respondsToSelector(sel!(yieldActivationToApplication:))
+            && application.respondsToSelector(sel!(activateFromApplication:options:))
         {
-            return Ok(());
+            owner.yieldActivationToApplication(application);
+            let current = NSRunningApplication::currentApplication();
+            if application.activateFromApplication_options(&current, options) {
+                return Ok(());
+            }
         }
-        let _ = application.unhide();
-        let _ = application.activateFromApplication_options(&current, options);
         let _ = application.activateWithOptions(options);
         // Activation can complete asynchronously. The caller polls the
         // frontmost application before injecting Cmd+V, so a false return
         // here is not by itself an unavailable-application error.
         Ok(())
     }
+
+    pub fn paste_if_frontmost(
+        target: &ForegroundApplication,
+        marker: u64,
+        selection_is_current: impl FnOnce() -> bool,
+    ) -> Result<(), String> {
+        let foreground_changed = || "目标应用已离开前台，已取消自动粘贴".to_owned();
+        if MainThreadMarker::new().is_none() {
+            return Err(foreground_changed());
+        }
+        let application = target.instance.as_deref().ok_or_else(foreground_changed)?;
+        let outputs = [EventPhase::Down, EventPhase::Up].map(|phase| OutputEvent::Key {
+            code: PhysicalCode::key(9),
+            phase,
+            modifiers: ModifierSet::LEFT_COMMAND,
+        });
+        crate::platform::inject_outputs_to_application(&outputs, marker, || {
+            let frontmost = NSWorkspace::sharedWorkspace().frontmostApplication()?;
+            (target.pid > 0
+                && target.pid == application.processIdentifier()
+                && application.isEqual(Some(&frontmost))
+                && !application.isTerminated()
+                && selection_is_current())
+            .then_some(target.pid)
+        })
+        .map_err(|error| match error {
+            crate::InjectionError::InvalidEvent => foreground_changed(),
+            _ => format!("自动粘贴失败：{error}"),
+        })
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
 mod platform {
-    use super::{PasteboardBackend, PasteboardError};
+    use super::{ForegroundApplication, PasteboardBackend, PasteboardError};
 
     pub struct PlatformPasteboard;
 
@@ -271,6 +366,18 @@ mod platform {
 
     pub fn activate_application(_bundle_id: &str) -> Result<(), PasteboardError> {
         Err(PasteboardError::Unsupported)
+    }
+
+    pub fn activate_instance(_target: &ForegroundApplication) -> Result<(), PasteboardError> {
+        Err(PasteboardError::Unsupported)
+    }
+
+    pub fn paste_if_frontmost(
+        _target: &ForegroundApplication,
+        _marker: u64,
+        _selection_is_current: impl FnOnce() -> bool,
+    ) -> Result<(), String> {
+        Err(PasteboardError::Unsupported.to_string())
     }
 }
 

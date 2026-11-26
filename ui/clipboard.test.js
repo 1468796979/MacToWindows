@@ -1,6 +1,6 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { normalizeSnapshot, previewText, moveSelection, resetSelection } = require("./clipboard-core.js");
+const { normalizeSnapshot, previewText, moveSelection } = require("./clipboard-core.js");
 
 test("normalizeSnapshot supplies safe defaults for an empty history", () => {
   assert.deepEqual(normalizeSnapshot(), { entries: [], panelOpen: false, lastError: null, operationError: null });
@@ -17,10 +17,6 @@ test("moveSelection wraps around the history", () => {
   assert.equal(moveSelection(-1, -1, 3), 2);
   assert.equal(moveSelection(-1, 1, 3), 0);
   assert.equal(moveSelection(-1, 1, 0), -1);
-});
-
-test("resetSelection clears stale selection when panel opens", () => {
-  assert.equal(resetSelection(), -1);
 });
 
 // Exercise the shipped event handlers, including focus and the browser's
@@ -121,6 +117,25 @@ test("list navigation and Enter still select exactly one history item", async ()
   assert.equal((await ui.key("Enter")).defaultPrevented, true);
   assert.equal(ui.calls.filter((call) => call.command === "select_clipboard_item").length, 1);
   assert.equal(ui.calls.find((call) => call.command === "select_clipboard_item").args.id, 7);
+});
+
+test("background reordering keeps the selected history entry", async () => {
+  const ui = await clipboardUi();
+  await ui.key("ArrowDown");
+  ui.snapshot({ entries: [{ id: 8, text: "beta" }, { id: 7, text: "alpha" }], panel_open: true });
+  assert.equal((await ui.key("Enter")).defaultPrevented, true);
+  assert.equal(ui.calls.find(({ command }) => command === "select_clipboard_item").args.id, 7);
+});
+
+test("removing the selected entry leaves Enter idle until the user selects another", async () => {
+  const ui = await clipboardUi();
+  await ui.key("ArrowDown");
+  ui.snapshot({ entries: [{ id: 8, text: "beta" }], panel_open: true });
+  assert.equal((await ui.key("Enter")).defaultPrevented, false);
+  assert(!ui.calls.some(({ command }) => command === "select_clipboard_item"));
+  await ui.key("ArrowDown");
+  await ui.key("Enter");
+  assert.equal(ui.calls.find(({ command }) => command === "select_clipboard_item").args.id, 8);
 });
 
 test("interactive descendants and inputs retain their navigation keys", async () => {

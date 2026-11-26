@@ -401,6 +401,11 @@ where
         let action = parse_action(&input.action).ok_or_else(|| {
             ConfigError::InvalidRule(format!("profiles.{profile_id}.{category}[{index}].action"))
         })?;
+        if input.enabled && matches!(action, Action::InvertScroll) && !is_scroll_trigger(&trigger) {
+            return Err(ConfigError::InvalidRule(format!(
+                "profiles.{profile_id}.{category}[{index}].action: scroll reversal requires a scroll trigger"
+            )));
+        }
         if input.enabled
             && matches!(trigger, Trigger::ModifierChord { .. })
             && !matches!(&action, Action::Replace(outputs) if matches!(outputs.as_slice(), [OutputEvent::SystemShortcut(_)]))
@@ -456,6 +461,10 @@ fn parse_trigger(value: &str) -> Option<Trigger> {
         modifiers: ModifierMatcher::default(),
         phase: EventPhase::Down,
     })
+}
+
+fn is_scroll_trigger(trigger: &Trigger) -> bool {
+    matches!(trigger, Trigger::Scroll { .. })
 }
 
 fn parse_action(value: &str) -> Option<Action> {
@@ -704,11 +713,45 @@ pub fn default_config() -> AppConfig {
 }
 
 pub fn import_toml(input: &str) -> Result<AppConfig, ConfigError> {
+    let config = parse_toml(input)?;
+    config.validate()?;
+    Ok(config)
+}
+
+/// Load saved settings from releases that accepted scroll reversal on a key
+/// or button. Preserve those entries for editing without enabling them.
+pub fn import_saved_toml(input: &str) -> Result<(AppConfig, Vec<String>), ConfigError> {
+    let mut config = parse_toml(input)?;
+    let mut disabled = Vec::new();
+    for (profile_id, profile) in &mut config.profiles {
+        for (category, rules) in [
+            ("keyboard_rules", &mut profile.keyboard_rules),
+            ("mouse_rules", &mut profile.mouse_rules),
+            ("global_hotkeys", &mut profile.global_hotkeys),
+            ("app_rules", &mut profile.app_rules),
+            ("device_rules", &mut profile.device_rules),
+        ] {
+            for (index, rule) in rules.iter_mut().enumerate() {
+                if rule.enabled
+                    && rule.action == "invert_scroll"
+                    && parse_trigger(&rule.trigger)
+                        .is_some_and(|trigger| !is_scroll_trigger(&trigger))
+                {
+                    rule.enabled = false;
+                    disabled.push(format!("profiles.{profile_id}.{category}[{index}]"));
+                }
+            }
+        }
+    }
+    config.validate()?;
+    Ok((config, disabled))
+}
+
+fn parse_toml(input: &str) -> Result<AppConfig, ConfigError> {
     let mut config: AppConfig = toml::from_str(input)?;
     if config.schema_version == 1 {
         migrate_v1(&mut config);
     }
-    config.validate()?;
     Ok(config)
 }
 
